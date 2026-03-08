@@ -8,9 +8,20 @@ pub struct Tunnel {
     pub token: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Service {
+    pub name: String,
+    pub port: u16,
+    pub machine: String,
+    #[serde(default)]
+    pub tunnel: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     pub tunnels: Vec<Tunnel>,
+    #[serde(default)]
+    pub services: Vec<Service>,
 }
 
 impl Config {
@@ -79,6 +90,35 @@ impl Config {
             .with_context(|| format!("tunnel '{}' not found", name))?;
         t.token = token;
         self.save()
+    }
+
+    pub fn add_service(&mut self, name: String, port: u16, machine: String, tunnel: Option<String>) -> Result<()> {
+        if self.services.iter().any(|s| s.name == name && s.machine == machine) {
+            anyhow::bail!("service '{}' on '{}' already exists", name, machine);
+        }
+        self.services.push(Service { name, port, machine, tunnel });
+        self.save()
+    }
+
+    pub fn remove_service(&mut self, name: &str, machine: &str) -> Result<()> {
+        let len = self.services.len();
+        self.services.retain(|s| !(s.name == name && s.machine == machine));
+        if self.services.len() == len {
+            anyhow::bail!("service not found");
+        }
+        self.save()
+    }
+
+    pub fn update_service(&mut self, idx: usize, name: String, port: u16, machine: String, tunnel: Option<String>) -> Result<()> {
+        if let Some(s) = self.services.get_mut(idx) {
+            s.name = name;
+            s.port = port;
+            s.machine = machine;
+            s.tunnel = tunnel;
+            self.save()
+        } else {
+            anyhow::bail!("service index out of range")
+        }
     }
 }
 

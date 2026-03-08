@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{AddField, App, Mode};
+use crate::app::{AddField, App, Mode, ServiceField, Tab};
 use crate::launchd::Status;
 
 const CYAN: Color = Color::Cyan;
@@ -24,8 +24,11 @@ pub fn draw(f: &mut Frame, app: &App) {
     ])
     .split(f.area());
 
-    draw_header(f, chunks[0]);
-    draw_table(f, app, chunks[1]);
+    draw_header(f, app, chunks[0]);
+    match app.tab {
+        Tab::Tunnels => draw_table(f, app, chunks[1]),
+        Tab::Services => draw_services_table(f, app, chunks[1]),
+    }
     draw_status_bar(f, app, chunks[2]);
     draw_keybindings(f, app, chunks[3]);
 
@@ -49,6 +52,16 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Logs { name, content } => {
             draw_logs_dialog(f, name, content);
         }
+        Mode::AddingService { field, name, port, machine, tunnel } => {
+            draw_service_dialog(f, "Add Service", field, name, port, machine, tunnel);
+        }
+        Mode::EditingService { field, name, port, machine, tunnel, .. } => {
+            draw_service_dialog(f, "Edit Service", field, name, port, machine, tunnel);
+        }
+        Mode::ConfirmingServiceDelete { name, machine } => {
+            let label = format!("{} on {}", name, machine);
+            draw_confirm_dialog(f, "untrack", &label);
+        }
         Mode::Help => {
             draw_help(f);
         }
@@ -56,10 +69,23 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
 }
 
-fn draw_header(f: &mut Frame, area: Rect) {
+fn draw_header(f: &mut Frame, app: &App, area: Rect) {
+    let tab_style = |active: bool| {
+        if active {
+            Style::default().fg(CYAN).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(DIM)
+        }
+    };
+
     let header = Paragraph::new(Line::from(vec![
         Span::styled(" tunnels ", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
-        Span::styled("— cloudflared tunnel manager", Style::default().fg(DIM)),
+        Span::styled("  ", Style::default()),
+        Span::styled(" 1 ", Style::default().fg(Color::Black).bg(if app.tab == Tab::Tunnels { Color::Cyan } else { Color::Rgb(80, 90, 100) })),
+        Span::styled(" Tunnels ", tab_style(app.tab == Tab::Tunnels)),
+        Span::styled("  ", Style::default()),
+        Span::styled(" 2 ", Style::default().fg(Color::Black).bg(if app.tab == Tab::Services { Color::Cyan } else { Color::Rgb(80, 90, 100) })),
+        Span::styled(" Services ", tab_style(app.tab == Tab::Services)),
     ]))
     .block(
         Block::default()
@@ -86,8 +112,8 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
         Cell::from("NAME").style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
         Cell::from("STATUS").style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
         Cell::from("PID").style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
-        Cell::from("TUNNEL ID").style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
-        Cell::from("TOKEN").style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+        Cell::from("CF NAME").style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+        Cell::from("EDGE").style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
     ])
     .height(1)
     .bottom_margin(0);
@@ -114,12 +140,18 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
                 Style::default()
             };
 
+            let cf_conn_color = if row.cf_conns.starts_with("—") || row.cf_conns.starts_with("no ") {
+                DIM
+            } else {
+                GREEN
+            };
+
             Row::new(vec![
                 Cell::from(row.name.clone()),
                 Cell::from(status_text.0).style(Style::default().fg(status_text.1)),
                 Cell::from(status_color),
-                Cell::from(short_id(&row.tunnel_id)).style(Style::default().fg(DIM)),
-                Cell::from(row.token_preview.clone()).style(Style::default().fg(DIM)),
+                Cell::from(row.cf_name.clone()).style(Style::default().fg(DIM)),
+                Cell::from(row.cf_conns.clone()).style(Style::default().fg(cf_conn_color)),
             ])
             .style(style)
         })
@@ -131,8 +163,8 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
             Constraint::Length(18),
             Constraint::Length(10),
             Constraint::Length(8),
-            Constraint::Length(14),
-            Constraint::Min(20),
+            Constraint::Length(18),
+            Constraint::Min(30),
         ],
     )
     .header(header)
@@ -161,22 +193,39 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_keybindings(f: &mut Frame, app: &App, area: Rect) {
     let keys = match &app.mode {
+        Mode::Normal if app.tab == Tab::Services => vec![
+            ("1/2", "tabs"),
+            ("j/k", "navigate"),
+            ("S", "scan"),
+            ("a", "add"),
+            ("e", "edit"),
+            ("d", "untrack"),
+            ("?", "more"),
+            ("q", "quit"),
+        ],
         Mode::Normal => vec![
+            ("1/2", "tabs"),
             ("j/k", "navigate"),
             ("s", "start"),
             ("x", "stop"),
             ("r", "restart"),
+            ("R", "sync CF"),
             ("a", "add"),
             ("d", "delete"),
             ("?", "more"),
             ("q", "quit"),
+        ],
+        Mode::AddingService { .. } | Mode::EditingService { .. } => vec![
+            ("Tab", "next field"),
+            ("Enter", "confirm"),
+            ("Esc", "cancel"),
         ],
         Mode::Adding { .. } | Mode::Editing { .. } | Mode::Renaming { .. } => vec![
             ("Enter", "confirm"),
             ("Tab", "next field"),
             ("Esc", "cancel"),
         ],
-        Mode::Confirming { .. } | Mode::Migrating { .. } => vec![("y", "confirm"), ("n/Esc", "cancel")],
+        Mode::Confirming { .. } | Mode::Migrating { .. } | Mode::ConfirmingServiceDelete { .. } => vec![("y", "confirm"), ("n/Esc", "cancel")],
         Mode::Logs { .. } | Mode::Help => vec![("Esc/q", "close")],
     };
 
@@ -414,6 +463,10 @@ fn draw_help(f: &mut Frame) {
     let help_text = vec![
         Line::from(""),
         Line::from(vec![
+            Span::styled("  1/2   ", Style::default().fg(CYAN)),
+            Span::raw("Switch tabs"),
+        ]),
+        Line::from(vec![
             Span::styled("  j/↓  ", Style::default().fg(CYAN)),
             Span::raw("Move down"),
         ]),
@@ -422,6 +475,7 @@ fn draw_help(f: &mut Frame) {
             Span::raw("Move up"),
         ]),
         Line::from(""),
+        Line::from(Span::styled("  — Tunnels tab —", Style::default().fg(DIM))),
         Line::from(vec![
             Span::styled("  s     ", Style::default().fg(GREEN)),
             Span::raw("Start tunnel"),
@@ -434,7 +488,6 @@ fn draw_help(f: &mut Frame) {
             Span::styled("  r     ", Style::default().fg(YELLOW)),
             Span::raw("Restart tunnel"),
         ]),
-        Line::from(""),
         Line::from(vec![
             Span::styled("  a     ", Style::default().fg(CYAN)),
             Span::raw("Add new tunnel"),
@@ -445,16 +498,37 @@ fn draw_help(f: &mut Frame) {
         ]),
         Line::from(vec![
             Span::styled("  d     ", Style::default().fg(RED)),
-            Span::raw("Delete selected tunnel"),
+            Span::raw("Delete selected"),
         ]),
-        Line::from(""),
         Line::from(vec![
             Span::styled("  l     ", Style::default().fg(CYAN)),
             Span::raw("View logs"),
         ]),
         Line::from(vec![
+            Span::styled("  R     ", Style::default().fg(CYAN)),
+            Span::raw("Sync from Cloudflare"),
+        ]),
+        Line::from(vec![
             Span::styled("  I     ", Style::default().fg(CYAN)),
             Span::raw("Import existing plists"),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("  — Services tab —", Style::default().fg(DIM))),
+        Line::from(vec![
+            Span::styled("  S     ", Style::default().fg(GREEN)),
+            Span::raw("Scan listening ports"),
+        ]),
+        Line::from(vec![
+            Span::styled("  a     ", Style::default().fg(CYAN)),
+            Span::raw("Add service"),
+        ]),
+        Line::from(vec![
+            Span::styled("  e     ", Style::default().fg(CYAN)),
+            Span::raw("Edit service"),
+        ]),
+        Line::from(vec![
+            Span::styled("  d     ", Style::default().fg(RED)),
+            Span::raw("Delete service"),
         ]),
         Line::from(""),
         Line::from(vec![
@@ -466,6 +540,136 @@ fn draw_help(f: &mut Frame) {
     f.render_widget(
         Paragraph::new(help_text).style(Style::default().fg(Color::White)),
         inner,
+    );
+}
+
+fn draw_services_table(f: &mut Frame, app: &App, area: Rect) {
+    if app.service_rows.is_empty() {
+        let empty = Paragraph::new(Line::from(vec![
+            Span::styled("  No services. Press ", Style::default().fg(DIM)),
+            Span::styled("S", Style::default().fg(GREEN).add_modifier(Modifier::BOLD)),
+            Span::styled(" to scan or ", Style::default().fg(DIM)),
+            Span::styled("a", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+            Span::styled(" to add manually.", Style::default().fg(DIM)),
+        ]));
+        f.render_widget(empty, area);
+        return;
+    }
+
+    let header = Row::new(vec![
+        Cell::from("PROJECT").style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+        Cell::from("PORT").style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+        Cell::from("TUNNEL").style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+        Cell::from("STATUS").style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+        Cell::from("URL").style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+    ])
+    .height(1)
+    .bottom_margin(0);
+
+    let rows: Vec<Row> = app
+        .service_rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let status_color = match row.tunnel_status.as_str() {
+                "connected" | "running" => GREEN,
+                "stopped" | "no edge" => YELLOW,
+                _ => DIM,
+            };
+
+            let url_color = if row.url.starts_with("https://") { CYAN } else { DIM };
+
+            let style = if i == app.service_selected {
+                Style::default()
+                    .bg(Color::Rgb(30, 40, 55))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+
+            Row::new(vec![
+                Cell::from(row.name.clone()),
+                Cell::from(row.port.to_string()),
+                Cell::from(row.tunnel.clone()).style(Style::default().fg(DIM)),
+                Cell::from(row.tunnel_status.clone()).style(Style::default().fg(status_color)),
+                Cell::from(row.url.clone()).style(Style::default().fg(url_color)),
+            ])
+            .style(style)
+        })
+        .collect();
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(16),
+            Constraint::Length(7),
+            Constraint::Length(18),
+            Constraint::Length(12),
+            Constraint::Min(30),
+        ],
+    )
+    .header(header)
+    .row_highlight_style(Style::default().bg(Color::Rgb(30, 40, 55)));
+
+    f.render_widget(table, area);
+}
+
+fn draw_service_dialog(f: &mut Frame, title: &str, field: &ServiceField, name: &str, port: &str, machine: &str, tunnel: &str) {
+    let area = fixed_centered_rect(60, 13, f.area());
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(format!(" {} ", title))
+        .title_style(Style::default().fg(CYAN).bold())
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(CYAN));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+
+    let field_style = |f: ServiceField, active: &ServiceField| {
+        if f == *active {
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(DIM)
+        }
+    };
+    let cursor = |f: ServiceField, active: &ServiceField| {
+        if f == *active { "_" } else { "" }
+    };
+
+    f.render_widget(
+        Paragraph::new(format!("  Name:    {}{}", name, cursor(ServiceField::Name, field)))
+            .style(field_style(ServiceField::Name, field)),
+        chunks[1],
+    );
+    f.render_widget(
+        Paragraph::new(format!("  Port:    {}{}", port, cursor(ServiceField::Port, field)))
+            .style(field_style(ServiceField::Port, field)),
+        chunks[3],
+    );
+    f.render_widget(
+        Paragraph::new(format!("  Machine: {}{}", machine, cursor(ServiceField::Machine, field)))
+            .style(field_style(ServiceField::Machine, field)),
+        chunks[5],
+    );
+    f.render_widget(
+        Paragraph::new(format!("  Tunnel:  {}{}", tunnel, cursor(ServiceField::Tunnel, field)))
+            .style(field_style(ServiceField::Tunnel, field)),
+        chunks[7],
     );
 }
 
@@ -490,12 +694,4 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         Constraint::Percentage((100 - percent_x) / 2),
     ])
     .split(popup_layout[1])[1]
-}
-
-fn short_id(id: &str) -> String {
-    if id.len() > 8 {
-        format!("{}...", &id[..8])
-    } else {
-        id.to_string()
-    }
 }

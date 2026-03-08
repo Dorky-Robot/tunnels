@@ -1,10 +1,12 @@
 mod app;
+mod cloudflare;
 mod config;
 mod launchd;
+mod scan;
 mod ui;
 
 use anyhow::Result;
-use app::{AddField, App, Mode};
+use app::{AddField, App, Mode, ServiceField, Tab};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -60,12 +62,16 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mu
                 }
 
                 match &app.mode {
+                    Mode::Normal if app.tab == Tab::Services => handle_services_normal(app, key.code),
                     Mode::Normal => handle_normal(app, key.code),
                     Mode::Adding { .. } => handle_adding(app, key.code),
                     Mode::Editing { .. } => handle_editing(app, key.code),
                     Mode::Renaming { .. } => handle_renaming(app, key.code),
                     Mode::Confirming { .. } => handle_confirming(app, key.code),
                     Mode::Migrating { .. } => handle_migrating(app, key.code),
+                    Mode::AddingService { .. } => handle_adding_service(app, key.code),
+                    Mode::EditingService { .. } => handle_editing_service(app, key.code),
+                    Mode::ConfirmingServiceDelete { .. } => handle_confirming_service_delete(app, key.code),
                     Mode::Logs { .. } | Mode::Help => {
                         if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                             app.mode = Mode::Normal;
@@ -84,6 +90,8 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mu
 fn handle_normal(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+        KeyCode::Char('1') => app.tab = Tab::Tunnels,
+        KeyCode::Char('2') => app.tab = Tab::Services,
         KeyCode::Char('j') | KeyCode::Down => app.move_down(),
         KeyCode::Char('k') | KeyCode::Up => app.move_up(),
         KeyCode::Char('s') => app.start_selected(),
@@ -94,8 +102,141 @@ fn handle_normal(app: &mut App, code: KeyCode) {
         KeyCode::Char('n') => app.begin_rename(),
         KeyCode::Char('d') => app.confirm_delete(),
         KeyCode::Char('l') | KeyCode::Enter => app.show_logs(),
+        KeyCode::Char('R') => app.refresh_cf(),
         KeyCode::Char('I') => app.import_existing(),
         KeyCode::Char('?') => app.mode = Mode::Help,
+        _ => {}
+    }
+}
+
+fn handle_services_normal(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+        KeyCode::Char('1') => app.tab = Tab::Tunnels,
+        KeyCode::Char('2') => app.tab = Tab::Services,
+        KeyCode::Char('j') | KeyCode::Down => {
+            if !app.service_rows.is_empty() && app.service_selected < app.service_rows.len() - 1 {
+                app.service_selected += 1;
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            if app.service_selected > 0 {
+                app.service_selected -= 1;
+            }
+        }
+        KeyCode::Char('a') => app.begin_add_service(),
+        KeyCode::Char('e') => app.begin_edit_service(),
+        KeyCode::Char('d') => app.confirm_delete_service(),
+        KeyCode::Char('S') => app.scan_services(),
+        KeyCode::Char('?') => app.mode = Mode::Help,
+        _ => {}
+    }
+}
+
+fn handle_adding_service(app: &mut App, code: KeyCode) {
+    let Mode::AddingService { field, name, port, machine, tunnel } = &mut app.mode else {
+        return;
+    };
+
+    match code {
+        KeyCode::Esc => app.mode = Mode::Normal,
+        KeyCode::Tab | KeyCode::BackTab => {
+            *field = match field {
+                ServiceField::Name => ServiceField::Port,
+                ServiceField::Port => ServiceField::Machine,
+                ServiceField::Machine => ServiceField::Tunnel,
+                ServiceField::Tunnel => ServiceField::Name,
+            };
+        }
+        KeyCode::Enter => {
+            if !name.is_empty() && !port.is_empty() && !machine.is_empty() {
+                let (n, p, m, t) = (name.clone(), port.clone(), machine.clone(), tunnel.clone());
+                app.finish_add_service(n, p, m, t);
+            }
+        }
+        KeyCode::Backspace => {
+            let s = match field {
+                ServiceField::Name => name,
+                ServiceField::Port => port,
+                ServiceField::Machine => machine,
+                ServiceField::Tunnel => tunnel,
+            };
+            s.pop();
+        }
+        KeyCode::Char(c) => {
+            let s = match field {
+                ServiceField::Name => name,
+                ServiceField::Port => {
+                    if c.is_ascii_digit() { port } else { return; }
+                }
+                ServiceField::Machine => machine,
+                ServiceField::Tunnel => tunnel,
+            };
+            s.push(c);
+        }
+        _ => {}
+    }
+}
+
+fn handle_editing_service(app: &mut App, code: KeyCode) {
+    let Mode::EditingService { idx, field, name, port, machine, tunnel } = &mut app.mode else {
+        return;
+    };
+
+    match code {
+        KeyCode::Esc => app.mode = Mode::Normal,
+        KeyCode::Tab | KeyCode::BackTab => {
+            *field = match field {
+                ServiceField::Name => ServiceField::Port,
+                ServiceField::Port => ServiceField::Machine,
+                ServiceField::Machine => ServiceField::Tunnel,
+                ServiceField::Tunnel => ServiceField::Name,
+            };
+        }
+        KeyCode::Enter => {
+            if !name.is_empty() && !port.is_empty() && !machine.is_empty() {
+                let (i, n, p, m, t) = (*idx, name.clone(), port.clone(), machine.clone(), tunnel.clone());
+                app.finish_edit_service(i, n, p, m, t);
+            }
+        }
+        KeyCode::Backspace => {
+            let s = match field {
+                ServiceField::Name => name,
+                ServiceField::Port => port,
+                ServiceField::Machine => machine,
+                ServiceField::Tunnel => tunnel,
+            };
+            s.pop();
+        }
+        KeyCode::Char(c) => {
+            let s = match field {
+                ServiceField::Name => name,
+                ServiceField::Port => {
+                    if c.is_ascii_digit() { port } else { return; }
+                }
+                ServiceField::Machine => machine,
+                ServiceField::Tunnel => tunnel,
+            };
+            s.push(c);
+        }
+        _ => {}
+    }
+}
+
+fn handle_confirming_service_delete(app: &mut App, code: KeyCode) {
+    let Mode::ConfirmingServiceDelete { name, machine } = &app.mode else {
+        return;
+    };
+    let (name, machine) = (name.clone(), machine.clone());
+
+    match code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.delete_service(&name, &machine);
+            app.mode = Mode::Normal;
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            app.mode = Mode::Normal;
+        }
         _ => {}
     }
 }
