@@ -8,9 +8,9 @@ Two tabs: **Tunnels** manages your cloudflared instances via LaunchAgents. **Ser
  tunnels   1 Tunnels   2 Services
 ╶──────────────────────────────────────────────────────────────────────────────────╴
  PROJECT         PORT   TUNNEL             STATUS       URL
- dogtopia        3000   everyday-vet       connected    https://dogtopia.everyday.vet
- myapp           7070   my-tunnel          connected    https://myapp.example.com
- api-server      8080   —                  —            —
+ web-app         3000   prod-tunnel        connected    https://app.example.com
+ api-server      8080   prod-tunnel        connected    https://api.example.com
+ dev-tools       9090   —                  —            —
 ╶──────────────────────────────────────────────────────────────────────────────────╴
  1/2 tabs  j/k navigate  S scan  R sync CF  T CF tokens  a add  d untrack  ? more  q quit
 ```
