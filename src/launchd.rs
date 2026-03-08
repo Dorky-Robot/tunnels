@@ -1,11 +1,21 @@
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
-const PLIST_DIR: &str = "/Library/LaunchDaemons";
-const LOG_DIR: &str = "/Library/Logs";
 const CLOUDFLARED: &str = "/opt/homebrew/bin/cloudflared";
 const LABEL_PREFIX: &str = "com.cloudflare.cloudflared";
+
+fn plist_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Library/LaunchAgents")
+}
+
+fn log_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Library/Logs/tunnels")
+}
 
 pub fn label_for(name: &str) -> String {
     if name == "default" {
@@ -16,11 +26,13 @@ pub fn label_for(name: &str) -> String {
 }
 
 pub fn plist_path(name: &str) -> PathBuf {
-    Path::new(PLIST_DIR).join(format!("{}.plist", label_for(name)))
+    plist_dir().join(format!("{}.plist", label_for(name)))
 }
 
 fn generate_plist(name: &str, token: &str) -> String {
     let label = label_for(name);
+    let log_dir = log_dir();
+    let log_dir_str = log_dir.to_string_lossy();
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -44,9 +56,9 @@ fn generate_plist(name: &str, token: &str) -> String {
 		<false/>
 	</dict>
 	<key>StandardOutPath</key>
-	<string>{LOG_DIR}/{label}.out.log</string>
+	<string>{log_dir_str}/{label}.out.log</string>
 	<key>StandardErrorPath</key>
-	<string>{LOG_DIR}/{label}.err.log</string>
+	<string>{log_dir_str}/{label}.err.log</string>
 	<key>ThrottleInterval</key>
 	<integer>5</integer>
 </dict>
@@ -63,8 +75,8 @@ pub enum Status {
 
 pub fn status(name: &str) -> Status {
     let label = label_for(name);
-    let output = Command::new("sudo")
-        .args(["launchctl", "list", &label])
+    let output = Command::new("launchctl")
+        .args(["list", &label])
         .output();
 
     match output {
@@ -91,22 +103,17 @@ pub fn start(name: &str, token: &str) -> Result<()> {
     let path = plist_path(name);
     let plist = generate_plist(name, token);
 
-    // Write plist via sudo tee
-    let mut child = Command::new("sudo")
-        .args(["tee", &path.to_string_lossy()])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .spawn()
-        .context("sudo tee")?;
-
-    if let Some(ref mut stdin) = child.stdin {
-        use std::io::Write;
-        stdin.write_all(plist.as_bytes())?;
+    // Ensure directories exist
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
-    child.wait()?;
+    std::fs::create_dir_all(log_dir())?;
 
-    let out = Command::new("sudo")
-        .args(["launchctl", "load", &path.to_string_lossy()])
+    // Write plist directly — no sudo needed for ~/Library/LaunchAgents
+    std::fs::write(&path, plist)?;
+
+    let out = Command::new("launchctl")
+        .args(["load", &path.to_string_lossy()])
         .output()
         .context("launchctl load")?;
 
@@ -125,13 +132,11 @@ pub fn stop(name: &str) -> Result<()> {
         return Ok(());
     }
 
-    let _ = Command::new("sudo")
-        .args(["launchctl", "unload", &path.to_string_lossy()])
+    let _ = Command::new("launchctl")
+        .args(["unload", &path.to_string_lossy()])
         .output();
 
-    let _ = Command::new("sudo")
-        .args(["rm", "-f", &path.to_string_lossy()])
-        .output();
+    let _ = std::fs::remove_file(&path);
 
     Ok(())
 }
@@ -144,21 +149,21 @@ pub fn restart(name: &str, token: &str) -> Result<()> {
 /// Read recent log lines for a tunnel
 pub fn read_logs(name: &str, lines: usize) -> Result<String> {
     let label = label_for(name);
-    let err_log = format!("{}/{}.err.log", LOG_DIR, label);
-    let out_log = format!("{}/{}.out.log", LOG_DIR, label);
+    let log_dir = log_dir();
+    let err_log = log_dir.join(format!("{}.err.log", label));
+    let out_log = log_dir.join(format!("{}.out.log", label));
 
     let mut result = String::new();
 
     for (tag, path) in [("stderr", &err_log), ("stdout", &out_log)] {
-        let output = Command::new("sudo")
-            .args(["tail", &format!("-{}", lines), path])
-            .output();
-
-        if let Ok(o) = output {
-            if o.status.success() {
-                let text = String::from_utf8_lossy(&o.stdout);
-                if !text.trim().is_empty() {
-                    result.push_str(&format!("--- {} ---\n{}\n", tag, text));
+        if path.exists() {
+            let content = std::fs::read_to_string(path).unwrap_or_default();
+            let tail: Vec<&str> = content.lines().rev().take(lines).collect();
+            if !tail.is_empty() {
+                result.push_str(&format!("--- {} ---\n", tag));
+                for line in tail.into_iter().rev() {
+                    result.push_str(line);
+                    result.push('\n');
                 }
             }
         }
@@ -167,38 +172,44 @@ pub fn read_logs(name: &str, lines: usize) -> Result<String> {
     Ok(result)
 }
 
-/// Import existing plists from /Library/LaunchDaemons
+/// Import existing plists from both LaunchAgents and LaunchDaemons
 pub fn discover_existing() -> Vec<(String, String)> {
     let mut found = Vec::new();
-    let dir = Path::new(PLIST_DIR);
 
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let fname = entry.file_name().to_string_lossy().to_string();
-            if !fname.starts_with(LABEL_PREFIX) || !fname.ends_with(".plist") {
-                continue;
-            }
+    let dirs = [
+        plist_dir(),
+        PathBuf::from("/Library/LaunchDaemons"),
+    ];
 
-            let basename = fname.trim_end_matches(".plist");
-            let name = if basename == LABEL_PREFIX {
-                "default".to_string()
-            } else {
-                basename
-                    .strip_prefix(&format!("{}-", LABEL_PREFIX))
-                    .unwrap_or(basename)
-                    .to_string()
-            };
+    for dir in &dirs {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let fname = entry.file_name().to_string_lossy().to_string();
+                if !fname.starts_with(LABEL_PREFIX) || !fname.ends_with(".plist") {
+                    continue;
+                }
 
-            // Extract token via PlistBuddy
-            let output = Command::new("/usr/libexec/PlistBuddy")
-                .args(["-c", "Print :ProgramArguments:4", &entry.path().to_string_lossy()])
-                .output();
+                let basename = fname.trim_end_matches(".plist");
+                let name = if basename == LABEL_PREFIX {
+                    "default".to_string()
+                } else {
+                    basename
+                        .strip_prefix(&format!("{}-", LABEL_PREFIX))
+                        .unwrap_or(basename)
+                        .to_string()
+                };
 
-            if let Ok(o) = output {
-                if o.status.success() {
-                    let token = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                    if !token.is_empty() {
-                        found.push((name, token));
+                // Extract token via PlistBuddy
+                let output = Command::new("/usr/libexec/PlistBuddy")
+                    .args(["-c", "Print :ProgramArguments:4", &entry.path().to_string_lossy()])
+                    .output();
+
+                if let Ok(o) = output {
+                    if o.status.success() {
+                        let token = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                        if !token.is_empty() {
+                            found.push((name, token));
+                        }
                     }
                 }
             }
