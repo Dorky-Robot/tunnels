@@ -6,30 +6,26 @@ Two tabs: **Tunnels** manages your cloudflared instances via LaunchAgents. **Ser
 
 ```
  tunnels   1 Tunnels   2 Services
-╶──────────────────────────────────────────────────────────────────────────────╴
+╶──────────────────────────────────────────────────────────────────────────────────╴
  PROJECT         PORT   TUNNEL             STATUS       URL
- katulong        3001   mac-2024           connected    https://katulong-prime.felixflor.es
- abot            7070   —                  —            —
- levee           3333   —                  —            —
-╶──────────────────────────────────────────────────────────────────────────────╴
- 1/2 tabs  j/k navigate  S scan  a add  e edit  d untrack  ? more  q quit
+ dogtopia        3000   everyday-vet       connected    https://dogtopia.everyday.vet
+ myapp           7070   my-tunnel          connected    https://myapp.example.com
+ api-server      8080   —                  —            —
+╶──────────────────────────────────────────────────────────────────────────────────╴
+ 1/2 tabs  j/k navigate  S scan  R sync CF  T CF tokens  a add  d untrack  ? more  q quit
 ```
 
 ## Prerequisites
 
 - **macOS** (uses LaunchAgents and `lsof` for service discovery)
 - **cloudflared** — `brew install cloudflared`
-- **Cloudflare API access** (optional, for ingress route resolution):
+- **Cloudflare API tokens** (optional, for ingress route resolution):
 
-  Add a CF API token per account to your config (`~/.config/tunnels/config.json`):
-  ```json
-  { "cf_api_tokens": ["token-for-account-1", "token-for-account-2"], "tunnels": [...] }
-  ```
-  Create tokens at [dash.cloudflare.com/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens) with **Account.Cloudflare Tunnel:Read** permission. One token per CF account. The account IDs are extracted automatically from your tunnel tokens.
+  Press `T` in the TUI to add tokens — paste any token and it auto-matches to the right CF account. Supports multiple accounts.
 
-  Alternatively, `cloudflared tunnel login` (creates `~/.cloudflared/cert.pem`) works for a single account.
+  Create tokens at [dash.cloudflare.com/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens) with **Account > Cloudflare Tunnel > Read** permission.
 
-  Without either, everything still works — you just won't see auto-resolved tunnel names or URLs in the Services tab.
+  Without tokens, everything still works — you just won't see tunnel names, connection status, or URLs in the Services tab.
 
 ## Install
 
@@ -72,6 +68,7 @@ Manages cloudflared tunnel instances as macOS LaunchAgents. Each tunnel auto-sta
 | `d` | Delete tunnel |
 | `l` | View logs |
 | `R` | Sync from Cloudflare API |
+| `T` | Add CF API token |
 | `I` | Import existing plists |
 
 ### 2 — Services
@@ -81,6 +78,8 @@ Tracks what's running on your machine and links it to Cloudflare tunnels.
 | Key | Action |
 |-----|--------|
 | `S` | Scan listening ports |
+| `R` | Sync from Cloudflare API |
+| `T` | Add CF API token |
 | `a` | Add service manually |
 | `e` | Edit service |
 | `d` | Untrack service |
@@ -92,7 +91,7 @@ Press `S` to scan — it uses `lsof` to find all listening TCP ports, resolves t
 - **Config** stored at `~/.config/tunnels/config.json`
 - **Plists** generated in `~/Library/LaunchAgents/`
 - **Logs** written to `~/Library/Logs/tunnels/`
-- **Cloudflare API** credentials from config `cf_api_tokens` (multi-account) or `~/.cloudflared/cert.pem`
+- **Cloudflare API** tokens stored in config (supports multiple CF accounts)
 - Tunnels **auto-start at login** via `RunAtLoad`
 
 ### Adding a tunnel
