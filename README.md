@@ -1,5 +1,13 @@
 # tunnels
 
+<div align="center">
+
+<img src="tunnels.jpg" alt="tunnels" width="300">
+
+*A k9s-style TUI for managing cloudflared tunnels and local services.*
+
+</div>
+
 A [k9s](https://k9scli.io/)-style TUI for managing [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/) tunnels and local services on macOS.
 
 Two tabs: **Tunnels** manages your cloudflared instances via LaunchAgents. **Services** auto-discovers what's running on your machine, matches it to Cloudflare ingress routes, and shows you the public URL.
