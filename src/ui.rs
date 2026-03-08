@@ -167,12 +167,8 @@ fn draw_keybindings(f: &mut Frame, app: &App, area: Rect) {
             ("x", "stop"),
             ("r", "restart"),
             ("a", "add"),
-            ("e", "edit token"),
-            ("n", "rename"),
             ("d", "delete"),
-            ("l", "logs"),
-            ("I", "import"),
-            ("?", "help"),
+            ("?", "more"),
             ("q", "quit"),
         ],
         Mode::Adding { .. } | Mode::Editing { .. } | Mode::Renaming { .. } => vec![
