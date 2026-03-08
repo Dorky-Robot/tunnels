@@ -2,7 +2,20 @@
 
 A [k9s](https://k9scli.io/)-style TUI for managing multiple [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/) tunnel instances on macOS.
 
-![tunnels TUI](screenshot.png)
+```
+ tunnels — cloudflared tunnel manager
+╶──────────────────────────────────────────────────────────────────────╴
+ NAME             STATUS     PID      TUNNEL ID      TOKEN
+ ──────────────── ────────── ──────── ────────────── ──────────────────
+ production       running    41023    a3f8c92d...    eyJhIjoiM2Y4...
+ staging          running    41087    7bf2e61a...    eyJhIjoiZWYz...
+ dev              stopped    -        c4d9a7b3...    eyJhIjoiNDFk...
+╶──────────────────────────────────────────────────────────────────────╴
+
+╶──────────────────────────────────────────────────────────────────────╴
+ j/k navigate  s start  x stop  r restart  a add  e edit  n rename
+ d delete  l logs  I import  ? help  q quit
+```
 
 ## Install
 
@@ -54,7 +67,7 @@ Each tunnel is a cloudflared instance managed via macOS LaunchAgents (`~/Library
 
 ## Adding a tunnel
 
-1. Go to [Cloudflare Zero Trust](https://one.dash.cloudflare.com/) > Networks > Tunnels
+1. Go to [Cloudflare Zero Trust](https://one.dash.cloudflare.com/) → Networks → Tunnels
 2. Create a tunnel and copy the token
 3. In the TUI, press `a`, enter a name and paste the token
 4. Press `s` to start
