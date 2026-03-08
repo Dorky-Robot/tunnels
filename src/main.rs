@@ -65,6 +65,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mu
                     Mode::Editing { .. } => handle_editing(app, key.code),
                     Mode::Renaming { .. } => handle_renaming(app, key.code),
                     Mode::Confirming { .. } => handle_confirming(app, key.code),
+                    Mode::Migrating { .. } => handle_migrating(app, key.code),
                     Mode::Logs { .. } | Mode::Help => {
                         if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                             app.mode = Mode::Normal;
@@ -191,6 +192,24 @@ fn handle_renaming(app: &mut App, code: KeyCode) {
     }
 }
 
+fn handle_migrating(app: &mut App, code: KeyCode) {
+    let Mode::Migrating { daemon_plists } = &app.mode else {
+        return;
+    };
+    let plists = daemon_plists.clone();
+
+    match code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.do_migrate(plists);
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            app.status_msg = Some("Imported — old daemon plists left in place".into());
+            app.mode = Mode::Normal;
+        }
+        _ => {}
+    }
+}
+
 fn handle_confirming(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -236,10 +255,10 @@ fn cli_import() -> Result<()> {
     let mut config = config::Config::load()?;
     let found = launchd::discover_existing();
     let mut count = 0;
-    for (name, token) in found {
-        if !config.tunnels.iter().any(|t| t.name == name) {
-            println!("  Imported '{}'", name);
-            config.add(name, token)?;
+    for d in found {
+        if !config.tunnels.iter().any(|t| t.name == d.name) {
+            println!("  Imported '{}'", d.name);
+            config.add(d.name, d.token)?;
             count += 1;
         }
     }

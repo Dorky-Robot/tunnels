@@ -172,16 +172,26 @@ pub fn read_logs(name: &str, lines: usize) -> Result<String> {
     Ok(result)
 }
 
-/// Import existing plists from both LaunchAgents and LaunchDaemons
-pub fn discover_existing() -> Vec<(String, String)> {
-    let mut found = Vec::new();
+/// A discovered plist with its source location
+#[derive(Debug, Clone)]
+pub struct DiscoveredTunnel {
+    pub name: String,
+    pub token: String,
+    pub is_daemon: bool,
+    pub plist_path: PathBuf,
+}
 
-    let dirs = [
-        plist_dir(),
-        PathBuf::from("/Library/LaunchDaemons"),
+/// Import existing plists from both LaunchAgents and LaunchDaemons
+pub fn discover_existing() -> Vec<DiscoveredTunnel> {
+    let mut found = Vec::new();
+    let daemon_dir = PathBuf::from("/Library/LaunchDaemons");
+
+    let dirs: Vec<(PathBuf, bool)> = vec![
+        (plist_dir(), false),
+        (daemon_dir, true),
     ];
 
-    for dir in &dirs {
+    for (dir, is_daemon) in &dirs {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let fname = entry.file_name().to_string_lossy().to_string();
@@ -208,7 +218,12 @@ pub fn discover_existing() -> Vec<(String, String)> {
                     if o.status.success() {
                         let token = String::from_utf8_lossy(&o.stdout).trim().to_string();
                         if !token.is_empty() {
-                            found.push((name, token));
+                            found.push(DiscoveredTunnel {
+                                name,
+                                token,
+                                is_daemon: *is_daemon,
+                                plist_path: entry.path(),
+                            });
                         }
                     }
                 }
@@ -217,4 +232,27 @@ pub fn discover_existing() -> Vec<(String, String)> {
     }
 
     found
+}
+
+
+/// Migrate a daemon plist: sudo unload + sudo rm, then start as LaunchAgent
+pub fn migrate_daemon(plist: &std::path::Path) -> Result<()> {
+    let path_str = plist.to_string_lossy();
+
+    // Unload from system domain
+    let _ = Command::new("sudo")
+        .args(["launchctl", "unload", &path_str])
+        .output();
+
+    // Remove the plist
+    let out = Command::new("sudo")
+        .args(["rm", "-f", &path_str])
+        .output()
+        .context("sudo rm")?;
+
+    if !out.status.success() {
+        anyhow::bail!("failed to remove {}", path_str);
+    }
+
+    Ok(())
 }

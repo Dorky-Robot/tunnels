@@ -9,6 +9,7 @@ pub enum Mode {
     Renaming { old_name: String, new_name: String },
     Confirming { action: String, target: String },
     Logs { name: String, content: String },
+    Migrating { daemon_plists: Vec<std::path::PathBuf> },
     Help,
 }
 
@@ -230,14 +231,57 @@ impl App {
     pub fn import_existing(&mut self) {
         let found = launchd::discover_existing();
         let mut count = 0;
-        for (name, token) in found {
-            if !self.config.tunnels.iter().any(|t| t.name == name) {
-                if self.config.add(name, token).is_ok() {
+        let mut daemon_plists = Vec::new();
+
+        for d in &found {
+            if !self.config.tunnels.iter().any(|t| t.name == d.name) {
+                if self.config.add(d.name.clone(), d.token.clone()).is_ok() {
                     count += 1;
+                }
+                if d.is_daemon {
+                    daemon_plists.push(d.plist_path.clone());
                 }
             }
         }
-        self.status_msg = Some(format!("Imported {} tunnel(s)", count));
+
+        if daemon_plists.is_empty() {
+            self.status_msg = Some(format!("Imported {} tunnel(s)", count));
+        } else {
+            self.status_msg = Some(format!(
+                "Imported {} tunnel(s) — {} from system LaunchDaemons",
+                count, daemon_plists.len()
+            ));
+            self.mode = Mode::Migrating { daemon_plists };
+            self.refresh();
+            return;
+        }
+        self.refresh();
+    }
+
+    pub fn do_migrate(&mut self, plists: Vec<std::path::PathBuf>) {
+        let mut migrated = 0;
+        let mut errors = Vec::new();
+
+        for plist in &plists {
+            match launchd::migrate_daemon(plist) {
+                Ok(()) => migrated += 1,
+                Err(e) => errors.push(format!("{}", e)),
+            }
+        }
+
+        // Restart imported tunnels as LaunchAgents
+        for t in &self.config.tunnels {
+            if !matches!(launchd::status(&t.name), launchd::Status::Running { .. }) {
+                let _ = launchd::start(&t.name, &t.token);
+            }
+        }
+
+        if errors.is_empty() {
+            self.status_msg = Some(format!("Migrated {} plist(s) to user-level", migrated));
+        } else {
+            self.status_msg = Some(format!("Migrated {} — errors: {}", migrated, errors.join(", ")));
+        }
+        self.mode = Mode::Normal;
         self.refresh();
     }
 }

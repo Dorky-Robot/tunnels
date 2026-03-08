@@ -43,6 +43,9 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Confirming { action, target } => {
             draw_confirm_dialog(f, action, target);
         }
+        Mode::Migrating { daemon_plists } => {
+            draw_migrate_dialog(f, daemon_plists.len());
+        }
         Mode::Logs { name, content } => {
             draw_logs_dialog(f, name, content);
         }
@@ -177,7 +180,7 @@ fn draw_keybindings(f: &mut Frame, app: &App, area: Rect) {
             ("Tab", "next field"),
             ("Esc", "cancel"),
         ],
-        Mode::Confirming { .. } => vec![("y", "confirm"), ("n/Esc", "cancel")],
+        Mode::Confirming { .. } | Mode::Migrating { .. } => vec![("y", "confirm"), ("n/Esc", "cancel")],
         Mode::Logs { .. } | Mode::Help => vec![("Esc/q", "close")],
     };
 
@@ -312,6 +315,45 @@ fn draw_rename_dialog(f: &mut Frame, old_name: &str, new_name: &str) {
         Paragraph::new(format!("  > {}_", new_name))
             .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
         chunks[2],
+    );
+}
+
+fn draw_migrate_dialog(f: &mut Frame, count: usize) {
+    let area = fixed_centered_rect(60, 9, f.area());
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" Migrate to user-level? ")
+        .title_style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(CYAN));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+
+    f.render_widget(
+        Paragraph::new(format!("  Found {} tunnel(s) in /Library/LaunchDaemons/", count))
+            .style(Style::default().fg(Color::White)),
+        chunks[0],
+    );
+    f.render_widget(
+        Paragraph::new("  Migrate to ~/Library/LaunchAgents? (no more sudo)")
+            .style(Style::default().fg(DIM)),
+        chunks[2],
+    );
+    f.render_widget(
+        Paragraph::new("  This will sudo unload + remove the old plists.")
+            .style(Style::default().fg(YELLOW)),
+        chunks[4],
     );
 }
 
