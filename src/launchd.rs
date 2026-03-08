@@ -86,7 +86,7 @@ pub fn status(name: &str) -> Status {
                 .lines()
                 .find(|l| l.contains("PID"))
                 .and_then(|l| l.split_whitespace().last())
-                .and_then(|s| s.parse::<u32>().ok());
+                .and_then(|s| s.trim_end_matches(";").parse::<u32>().ok());
             Status::Running { pid }
         }
         _ => {
