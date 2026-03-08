@@ -197,6 +197,7 @@ fn draw_keybindings(f: &mut Frame, app: &App, area: Rect) {
             ("1/2", "tabs"),
             ("j/k", "navigate"),
             ("S", "scan"),
+            ("R", "sync CF"),
             ("a", "add"),
             ("e", "edit"),
             ("d", "untrack"),

@@ -128,6 +128,7 @@ fn handle_services_normal(app: &mut App, code: KeyCode) {
         KeyCode::Char('e') => app.begin_edit_service(),
         KeyCode::Char('d') => app.confirm_delete_service(),
         KeyCode::Char('S') => app.scan_services(),
+        KeyCode::Char('R') => app.refresh_cf(),
         KeyCode::Char('?') => app.mode = Mode::Help,
         _ => {}
     }
