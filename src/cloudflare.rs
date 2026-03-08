@@ -3,16 +3,8 @@ use std::collections::HashMap;
 use std::process::Command;
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct CfTunnel {
-    pub id: String,
-    pub name: String,
-    #[serde(default)]
-    pub connections: Vec<CfConnection>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct CfConnection {
-    pub colo_name: String,
+struct CfConnection {
+    colo_name: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -40,6 +32,28 @@ struct CfIngress {
     pub service: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct CfTunnelResponse {
+    success: bool,
+    #[serde(default)]
+    result: Option<CfTunnelDetail>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CfTunnelDetail {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    connections: Vec<CfConnection>,
+}
+
+/// Tunnel info fetched from CF API
+#[derive(Debug, Clone)]
+pub struct TunnelInfo {
+    pub cf_name: String,
+    pub connections: String,
+}
+
 /// An ingress rule resolved to a port
 #[derive(Debug, Clone)]
 pub struct IngressRoute {
@@ -48,54 +62,32 @@ pub struct IngressRoute {
     pub tunnel_id: String,
 }
 
-/// API credentials for Cloudflare (scoped to one account)
-struct ApiCreds {
-    account_id: String,
-    api_token: String,
+/// An account that needs an API token
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreachedAccount {
+    pub account_id: String,
+    pub tunnel_names: Vec<String>,
+    pub tunnel_id: String,
 }
 
 /// Result of a CF sync operation
 pub struct SyncResult {
-    pub tunnels: Vec<CfTunnel>,
+    /// tunnel_id -> TunnelInfo (CF name + connection status)
+    pub tunnel_info: HashMap<String, TunnelInfo>,
     pub ingress_routes: HashMap<u16, Vec<IngressRoute>>,
     pub status: String,
+    pub unreached: Vec<UnreachedAccount>,
 }
 
-/// Query `cloudflared tunnel list --output json` for live tunnel data.
-pub fn list_tunnels() -> Vec<CfTunnel> {
-    let output = Command::new("cloudflared")
-        .args(["tunnel", "list", "--output", "json"])
-        .output();
-
-    let output = match output {
-        Ok(o) if o.status.success() => o.stdout,
-        _ => return Vec::new(),
-    };
-
-    serde_json::from_slice(&output).unwrap_or_default()
+/// Verify an API token works for a given account/tunnel
+pub fn verify_token(api_token: &str, account_id: &str, tunnel_id: &str) -> bool {
+    fetch_tunnel_config_check(api_token, account_id, tunnel_id)
 }
 
-/// Summarize connection status for a tunnel
-pub fn connection_summary(tunnel: &CfTunnel) -> String {
-    if tunnel.connections.is_empty() {
-        return "no connections".to_string();
-    }
-
-    let colos: Vec<&str> = tunnel.connections.iter().map(|c| c.colo_name.as_str()).collect();
-    format!("{}x edge ({})", colos.len(), colos.join(", "))
-}
-
-/// Find a CF tunnel by its ID
-pub fn find_by_id<'a>(tunnels: &'a [CfTunnel], tunnel_id: &str) -> Option<&'a CfTunnel> {
-    tunnels.iter().find(|t| t.id == tunnel_id)
-}
-
-/// Full sync: list tunnels + fetch ingress routes across all accounts.
+/// Sync: fetch ingress routes for all accounts using configured API tokens.
 /// cf_api_tokens: user-configured API tokens (one per CF account)
 /// tunnel_tokens: Vec<(config_name, base64_token)>
 pub fn sync(cf_api_tokens: &[&str], tunnel_tokens: &[(String, String)]) -> SyncResult {
-    let cf_tunnels = list_tunnels();
-
     // Decode all tunnel tokens to get (name, account_id, tunnel_id) triples
     let decoded: Vec<(String, String, String)> = tunnel_tokens.iter()
         .filter_map(|(name, tok)| {
@@ -105,86 +97,93 @@ pub fn sync(cf_api_tokens: &[&str], tunnel_tokens: &[(String, String)]) -> SyncR
         })
         .collect();
 
-    // Collect all available API tokens: user-configured + cert.pem
-    let mut api_tokens: Vec<String> = cf_api_tokens.iter()
-        .filter(|t| !t.is_empty())
-        .map(|t| t.to_string())
-        .collect();
-    if let Some(cert_creds) = load_api_creds_from_cert() {
-        if !api_tokens.iter().any(|t| t == &cert_creds.api_token) {
-            api_tokens.push(cert_creds.api_token);
-        }
-    }
-
-    if api_tokens.is_empty() {
-        let status = if cf_tunnels.is_empty() {
-            "No CF auth — set cf_api_tokens in config (one per account)".to_string()
-        } else {
-            format!("Synced {} tunnel(s) — set cf_api_tokens for ingress routes", cf_tunnels.len())
-        };
-        return SyncResult { tunnels: cf_tunnels, ingress_routes: HashMap::new(), status };
-    }
-
-    // Group tunnels by account_id for multi-account support
-    let mut accounts: HashMap<String, Vec<(String, String)>> = HashMap::new(); // account_id -> [(name, tunnel_id)]
+    // Group tunnels by account_id
+    let mut accounts: HashMap<String, Vec<(String, String)>> = HashMap::new();
     for (name, account_id, tunnel_id) in &decoded {
         accounts.entry(account_id.clone())
             .or_default()
             .push((name.clone(), tunnel_id.clone()));
     }
 
-    // Also add tunnels from `cloudflared tunnel list` that aren't in our config
-    // (they're from the cert.pem account)
-    if let Some(cert_creds) = load_api_creds_from_cert() {
-        let entry = accounts.entry(cert_creds.account_id).or_default();
-        for cf in &cf_tunnels {
-            if !entry.iter().any(|(_, id)| id == &cf.id) {
-                entry.push((cf.name.clone(), cf.id.clone()));
-            }
-        }
+    if accounts.is_empty() {
+        return SyncResult {
+            tunnel_info: HashMap::new(),
+            ingress_routes: HashMap::new(),
+            status: "No tunnels configured".into(),
+            unreached: Vec::new(),
+        };
+    }
+
+    let api_tokens: Vec<&str> = cf_api_tokens.iter()
+        .filter(|t| !t.is_empty())
+        .copied()
+        .collect();
+
+    // If no API tokens at all, every account is unreached
+    if api_tokens.is_empty() {
+        let unreached: Vec<UnreachedAccount> = accounts.iter()
+            .map(|(account_id, tunnels)| UnreachedAccount {
+                account_id: account_id.clone(),
+                tunnel_names: tunnels.iter().map(|(n, _)| n.clone()).collect(),
+                tunnel_id: tunnels.first().map(|(_, id)| id.clone()).unwrap_or_default(),
+            })
+            .collect();
+        return SyncResult {
+            tunnel_info: HashMap::new(),
+            ingress_routes: HashMap::new(),
+            status: format!("{} account(s) need API tokens — press T", unreached.len()),
+            unreached,
+        };
     }
 
     let mut port_map: HashMap<u16, Vec<IngressRoute>> = HashMap::new();
+    let mut tunnel_info: HashMap<String, TunnelInfo> = HashMap::new();
     let mut total_routes = 0;
     let mut accounts_reached = 0;
-    let mut unreached_accounts = 0;
+    let mut unreached = Vec::new();
 
     for (account_id, tunnels) in &accounts {
-        // Try each API token until one succeeds for this account
         let mut account_ok = false;
-        for api_token in &api_tokens {
-            let creds = ApiCreds {
-                account_id: account_id.clone(),
-                api_token: api_token.clone(),
-            };
 
-            // Probe: try the first tunnel to check if this token has access
+        for api_token in &api_tokens {
             let probe_ok = tunnels.first()
-                .map(|(_, id)| fetch_tunnel_config_check(&creds, id))
+                .map(|(_, id)| fetch_tunnel_config_check(api_token, account_id, id))
                 .unwrap_or(false);
 
             if !probe_ok {
-                continue; // this token can't access this account, try next
+                continue;
             }
 
-            // This token works — fetch ingress for all tunnels in this account
             for (name, tunnel_id) in tunnels {
-                let ingress = fetch_tunnel_config(&creds, tunnel_id);
+                // Fetch tunnel details (name, connections)
+                if let Some(detail) = fetch_tunnel_detail(api_token, account_id, tunnel_id) {
+                    let conns = if detail.connections.is_empty() {
+                        "no connections".to_string()
+                    } else {
+                        let colos: Vec<&str> = detail.connections.iter()
+                            .map(|c| c.colo_name.as_str()).collect();
+                        format!("{}x edge ({})", colos.len(), colos.join(", "))
+                    };
+                    tunnel_info.insert(tunnel_id.clone(), TunnelInfo {
+                        cf_name: detail.name,
+                        connections: conns,
+                    });
+                }
+
+                // Fetch ingress routes
+                let ingress = fetch_tunnel_config(api_token, account_id, tunnel_id);
                 for rule in ingress {
                     let hostname = match rule.hostname {
                         Some(h) => h,
                         None => continue,
                     };
-
-                    let route = IngressRoute {
-                        hostname,
-                        tunnel_name: name.clone(),
-                        tunnel_id: tunnel_id.clone(),
-                    };
-
                     if let Some(p) = parse_port_from_service(&rule.service) {
                         total_routes += 1;
-                        port_map.entry(p).or_default().push(route);
+                        port_map.entry(p).or_default().push(IngressRoute {
+                            hostname,
+                            tunnel_name: name.clone(),
+                            tunnel_id: tunnel_id.clone(),
+                        });
                     }
                 }
             }
@@ -195,26 +194,26 @@ pub fn sync(cf_api_tokens: &[&str], tunnel_tokens: &[(String, String)]) -> SyncR
         }
 
         if !account_ok {
-            unreached_accounts += 1;
+            unreached.push(UnreachedAccount {
+                account_id: account_id.clone(),
+                tunnel_names: tunnels.iter().map(|(n, _)| n.clone()).collect(),
+                tunnel_id: tunnels.first().map(|(_, id)| id.clone()).unwrap_or_default(),
+            });
         }
     }
 
-    let status = if unreached_accounts > 0 {
+    let status = if !unreached.is_empty() {
         format!(
-            "Synced {} route(s) from {} account(s) — {} account(s) need cf_api_tokens",
-            total_routes, accounts_reached, unreached_accounts,
+            "Synced {} route(s) from {} account(s) — {} need tokens (T)",
+            total_routes, accounts_reached, unreached.len(),
         )
     } else {
-        format!(
-            "Synced {} route(s) from {} account(s)",
-            total_routes, accounts_reached,
-        )
+        format!("Synced {} route(s) from {} account(s)", total_routes, accounts_reached)
     };
 
-    SyncResult { tunnels: cf_tunnels, ingress_routes: port_map, status }
+    SyncResult { tunnel_info, ingress_routes: port_map, status, unreached }
 }
 
-/// Parse port from a service URL like "http://localhost:3001" or "ssh://localhost:22"
 fn parse_port_from_service(service: &str) -> Option<u16> {
     service
         .rsplit(':')
@@ -222,91 +221,57 @@ fn parse_port_from_service(service: &str) -> Option<u16> {
         .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
 }
 
-/// Check if an API token has access to a tunnel's account (returns true if API responds with success)
-fn fetch_tunnel_config_check(creds: &ApiCreds, tunnel_id: &str) -> bool {
+fn fetch_tunnel_config_check(api_token: &str, account_id: &str, tunnel_id: &str) -> bool {
     let url = format!(
         "https://api.cloudflare.com/client/v4/accounts/{}/cfd_tunnel/{}/configurations",
-        creds.account_id, tunnel_id
+        account_id, tunnel_id
     );
-
     let output = Command::new("curl")
-        .args(["-s", &url, "-H", &format!("Authorization: Bearer {}", creds.api_token)])
+        .args(["-s", &url, "-H", &format!("Authorization: Bearer {}", api_token)])
         .output();
-
     let output = match output {
         Ok(o) if o.status.success() => o.stdout,
         _ => return false,
     };
-
-    // Just check if the API returned success (vs auth error)
     serde_json::from_slice::<CfConfigResponse>(&output)
         .map(|r| r.success)
         .unwrap_or(false)
 }
 
-/// Fetch ingress config for a single tunnel via the CF API
-fn fetch_tunnel_config(creds: &ApiCreds, tunnel_id: &str) -> Vec<CfIngress> {
+fn fetch_tunnel_detail(api_token: &str, account_id: &str, tunnel_id: &str) -> Option<CfTunnelDetail> {
+    let url = format!(
+        "https://api.cloudflare.com/client/v4/accounts/{}/cfd_tunnel/{}",
+        account_id, tunnel_id
+    );
+    let output = Command::new("curl")
+        .args(["-s", &url, "-H", &format!("Authorization: Bearer {}", api_token)])
+        .output();
+    let output = match output {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return None,
+    };
+    let resp: CfTunnelResponse = serde_json::from_slice(&output).ok()?;
+    if resp.success { resp.result } else { None }
+}
+
+fn fetch_tunnel_config(api_token: &str, account_id: &str, tunnel_id: &str) -> Vec<CfIngress> {
     let url = format!(
         "https://api.cloudflare.com/client/v4/accounts/{}/cfd_tunnel/{}/configurations",
-        creds.account_id, tunnel_id
+        account_id, tunnel_id
     );
-
     let output = Command::new("curl")
-        .args([
-            "-s",
-            &url,
-            "-H",
-            &format!("Authorization: Bearer {}", creds.api_token),
-        ])
+        .args(["-s", &url, "-H", &format!("Authorization: Bearer {}", api_token)])
         .output();
-
     let output = match output {
         Ok(o) if o.status.success() => o.stdout,
         _ => return Vec::new(),
     };
-
     let resp: CfConfigResponse = match serde_json::from_slice(&output) {
         Ok(r) => r,
         Err(_) => return Vec::new(),
     };
-
     if !resp.success {
         return Vec::new();
     }
-
-    resp.result
-        .map(|r| r.config.ingress)
-        .unwrap_or_default()
-}
-
-/// Load API credentials from ~/.cloudflared/cert.pem (Argo Tunnel Token)
-fn load_api_creds_from_cert() -> Option<ApiCreds> {
-    let cert_path = dirs::home_dir()?.join(".cloudflared/cert.pem");
-    let content = std::fs::read_to_string(&cert_path).ok()?;
-
-    let start = content.find("-----BEGIN ARGO TUNNEL TOKEN-----")?;
-    let end = content.find("-----END ARGO TUNNEL TOKEN-----")?;
-
-    let token_start = start + "-----BEGIN ARGO TUNNEL TOKEN-----".len();
-    let token_b64: String = content[token_start..end]
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
-
-    use base64::Engine;
-    let bytes = base64::engine::general_purpose::STANDARD.decode(&token_b64).ok()?;
-
-    #[derive(Deserialize)]
-    struct ArgoToken {
-        #[serde(rename = "accountID")]
-        account_id: String,
-        #[serde(rename = "apiToken")]
-        api_token: String,
-    }
-
-    let token: ArgoToken = serde_json::from_slice(&bytes).ok()?;
-    Some(ApiCreds {
-        account_id: token.account_id,
-        api_token: token.api_token,
-    })
+    resp.result.map(|r| r.config.ingress).unwrap_or_default()
 }

@@ -58,9 +58,12 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::EditingService { field, name, port, machine, tunnel, .. } => {
             draw_service_dialog(f, "Edit Service", field, name, port, machine, tunnel);
         }
-        Mode::ConfirmingServiceDelete { name, machine } => {
-            let label = format!("{} on {}", name, machine);
+        Mode::ConfirmingServiceDelete { name, port, machine } => {
+            let label = format!("{} :{} on {}", name, port, machine);
             draw_confirm_dialog(f, "untrack", &label);
+        }
+        Mode::AddingApiToken { input } => {
+            draw_add_api_token_dialog(f, &app.unreached, input);
         }
         Mode::Help => {
             draw_help(f);
@@ -198,6 +201,7 @@ fn draw_keybindings(f: &mut Frame, app: &App, area: Rect) {
             ("j/k", "navigate"),
             ("S", "scan"),
             ("R", "sync CF"),
+            ("T", "CF tokens"),
             ("a", "add"),
             ("e", "edit"),
             ("d", "untrack"),
@@ -211,6 +215,7 @@ fn draw_keybindings(f: &mut Frame, app: &App, area: Rect) {
             ("x", "stop"),
             ("r", "restart"),
             ("R", "sync CF"),
+            ("T", "CF tokens"),
             ("a", "add"),
             ("d", "delete"),
             ("?", "more"),
@@ -219,6 +224,10 @@ fn draw_keybindings(f: &mut Frame, app: &App, area: Rect) {
         Mode::AddingService { .. } | Mode::EditingService { .. } => vec![
             ("Tab", "next field"),
             ("Enter", "confirm"),
+            ("Esc", "cancel"),
+        ],
+        Mode::AddingApiToken { .. } => vec![
+            ("Enter", "save"),
             ("Esc", "cancel"),
         ],
         Mode::Adding { .. } | Mode::Editing { .. } | Mode::Renaming { .. } => vec![
@@ -510,6 +519,10 @@ fn draw_help(f: &mut Frame) {
             Span::raw("Sync from Cloudflare"),
         ]),
         Line::from(vec![
+            Span::styled("  T     ", Style::default().fg(CYAN)),
+            Span::raw("Add CF API token"),
+        ]),
+        Line::from(vec![
             Span::styled("  I     ", Style::default().fg(CYAN)),
             Span::raw("Import existing plists"),
         ]),
@@ -613,6 +626,81 @@ fn draw_services_table(f: &mut Frame, app: &App, area: Rect) {
     .row_highlight_style(Style::default().bg(Color::Rgb(30, 40, 55)));
 
     f.render_widget(table, area);
+}
+
+fn draw_add_api_token_dialog(
+    f: &mut Frame,
+    unreached: &[crate::cloudflare::UnreachedAccount],
+    input: &str,
+) {
+    let num_accounts = unreached.len();
+    // List all unreached tunnel names
+    let all_names: Vec<String> = unreached.iter()
+        .flat_map(|a| a.tunnel_names.iter().cloned())
+        .collect();
+    let names_display = all_names.join(", ");
+
+    let area = fixed_centered_rect(70, 13, f.area());
+    f.render_widget(Clear, area);
+
+    let title = format!(" Add CF API Token ({} account(s) need tokens) ", num_accounts);
+
+    let block = Block::default()
+        .title(title)
+        .title_style(Style::default().fg(CYAN).bold())
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(CYAN));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+
+    f.render_widget(
+        Paragraph::new(format!("  Needs: {}", names_display))
+            .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        chunks[1],
+    );
+    f.render_widget(
+        Paragraph::new("  Paste a token — we'll match it to the right account")
+            .style(Style::default().fg(DIM)),
+        chunks[3],
+    );
+    f.render_widget(
+        Paragraph::new("  Create at: dash.cloudflare.com/profile/api-tokens")
+            .style(Style::default().fg(DIM)),
+        chunks[5],
+    );
+    f.render_widget(
+        Paragraph::new("  Permission: Account > Cloudflare Tunnel > Read")
+            .style(Style::default().fg(DIM)),
+        chunks[6],
+    );
+
+    let display = if input.is_empty() {
+        "_".to_string()
+    } else if input.len() > 40 {
+        format!("...{}_", &input[input.len() - 37..])
+    } else {
+        format!("{}_", input)
+    };
+
+    f.render_widget(
+        Paragraph::new(format!("  Token: {}", display))
+            .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        chunks[8],
+    );
 }
 
 fn draw_service_dialog(f: &mut Frame, title: &str, field: &ServiceField, name: &str, port: &str, machine: &str, tunnel: &str) {

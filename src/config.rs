@@ -71,6 +71,13 @@ impl Config {
         Ok(())
     }
 
+    pub fn add_api_token(&mut self, token: String) -> Result<()> {
+        if !self.cf_api_tokens.iter().any(|t| t == &token) {
+            self.cf_api_tokens.push(token);
+        }
+        self.save()
+    }
+
     pub fn add(&mut self, name: String, token: String) -> Result<()> {
         if self.tunnels.iter().any(|t| t.name == name) {
             anyhow::bail!("tunnel '{}' already exists", name);
@@ -112,16 +119,16 @@ impl Config {
     }
 
     pub fn add_service(&mut self, name: String, port: u16, machine: String, tunnel: Option<String>) -> Result<()> {
-        if self.services.iter().any(|s| s.name == name && s.machine == machine) {
-            anyhow::bail!("service '{}' on '{}' already exists", name, machine);
+        if self.services.iter().any(|s| s.port == port && s.machine == machine) {
+            anyhow::bail!("port {} on '{}' already tracked", port, machine);
         }
         self.services.push(Service { name, port, machine, tunnel });
         self.save()
     }
 
-    pub fn remove_service(&mut self, name: &str, machine: &str) -> Result<()> {
+    pub fn remove_service(&mut self, name: &str, port: u16, machine: &str) -> Result<()> {
         let len = self.services.len();
-        self.services.retain(|s| !(s.name == name && s.machine == machine));
+        self.services.retain(|s| !(s.name == name && s.port == port && s.machine == machine));
         if self.services.len() == len {
             anyhow::bail!("service not found");
         }

@@ -1,4 +1,4 @@
-use crate::cloudflare::{self, CfTunnel, IngressRoute};
+use crate::cloudflare::{self, IngressRoute, TunnelInfo, UnreachedAccount};
 use crate::config::{self, Config, Tunnel};
 use crate::launchd;
 use crate::scan;
@@ -21,7 +21,10 @@ pub enum Mode {
     Migrating { daemon_plists: Vec<std::path::PathBuf> },
     AddingService { field: ServiceField, name: String, port: String, machine: String, tunnel: String },
     EditingService { idx: usize, field: ServiceField, name: String, port: String, machine: String, tunnel: String },
-    ConfirmingServiceDelete { name: String, machine: String },
+    ConfirmingServiceDelete { name: String, port: u16, machine: String },
+    AddingApiToken {
+        input: String,
+    },
     Help,
 }
 
@@ -61,8 +64,9 @@ pub struct App {
     pub tab: Tab,
     pub rows: Vec<TunnelRow>,
     pub service_rows: Vec<ServiceRow>,
-    pub cf_tunnels: Vec<CfTunnel>,
+    pub tunnel_info: HashMap<String, TunnelInfo>,
     pub ingress_routes: HashMap<u16, Vec<IngressRoute>>,
+    pub unreached: Vec<UnreachedAccount>,
     pub selected: usize,
     pub service_selected: usize,
     pub mode: Mode,
@@ -83,8 +87,9 @@ impl App {
             tab: Tab::Tunnels,
             rows: Vec::new(),
             service_rows: Vec::new(),
-            cf_tunnels: sync.tunnels,
+            tunnel_info: sync.tunnel_info,
             ingress_routes: sync.ingress_routes,
+            unreached: sync.unreached,
             selected: 0,
             service_selected: 0,
             mode: Mode::Normal,
@@ -106,8 +111,8 @@ impl App {
                     .map(|p| p.tunnel_id)
                     .unwrap_or_default();
 
-                let (cf_name, cf_conns) = cloudflare::find_by_id(&self.cf_tunnels, &tunnel_id)
-                    .map(|cf| (cf.name.clone(), cloudflare::connection_summary(cf)))
+                let (cf_name, cf_conns) = self.tunnel_info.get(&tunnel_id)
+                    .map(|info| (info.cf_name.clone(), info.connections.clone()))
                     .unwrap_or_else(|| ("—".into(), "—".into()));
 
                 TunnelRow {
@@ -139,18 +144,18 @@ impl App {
                     // Pick the route whose tunnel has active connections, or first
                     let best = routes.iter()
                         .find(|r| {
-                            cloudflare::find_by_id(&self.cf_tunnels, &r.tunnel_id)
-                                .map_or(false, |t| !t.connections.is_empty())
+                            self.tunnel_info.get(&r.tunnel_id)
+                                .map_or(false, |info| !info.connections.starts_with("no "))
                         })
                         .or(routes.first());
 
                     if let Some(route) = best {
-                        let cf = cloudflare::find_by_id(&self.cf_tunnels, &route.tunnel_id);
-                        let status = if cf.map_or(false, |t| !t.connections.is_empty()) {
-                            "connected".to_string()
-                        } else {
-                            "no edge".to_string()
-                        };
+                        let status = self.tunnel_info.get(&route.tunnel_id)
+                            .map(|info| {
+                                if info.connections.starts_with("no ") { "no edge" } else { "connected" }
+                            })
+                            .unwrap_or("—")
+                            .to_string();
                         (
                             route.tunnel_name.clone(),
                             status,
@@ -193,10 +198,16 @@ impl App {
             .collect();
         let cf_tokens = self.config.all_cf_api_tokens();
         let sync = cloudflare::sync(&cf_tokens, &tunnel_tokens);
-        self.cf_tunnels = sync.tunnels;
+        self.tunnel_info = sync.tunnel_info;
         self.ingress_routes = sync.ingress_routes;
+        self.unreached = sync.unreached;
         self.status_msg = Some(sync.status);
         self.refresh();
+
+        // Auto-prompt if accounts need tokens
+        if !self.unreached.is_empty() {
+            self.begin_add_api_token();
+        }
     }
 
     pub fn selected_tunnel(&self) -> Option<&Tunnel> {
@@ -471,13 +482,14 @@ impl App {
         if let Some(s) = self.config.services.get(self.service_selected) {
             self.mode = Mode::ConfirmingServiceDelete {
                 name: s.name.clone(),
+                port: s.port,
                 machine: s.machine.clone(),
             };
         }
     }
 
-    pub fn delete_service(&mut self, name: &str, machine: &str) {
-        match self.config.remove_service(name, machine) {
+    pub fn delete_service(&mut self, name: &str, port: u16, machine: &str) {
+        match self.config.remove_service(name, port, machine) {
             Ok(()) => self.status_msg = Some(format!("Untracked '{}'", name)),
             Err(e) => self.status_msg = Some(format!("Error: {}", e)),
         }
@@ -509,6 +521,62 @@ impl App {
         }
         self.mode = Mode::Normal;
         self.refresh();
+    }
+
+    // --- CF API Token methods ---
+
+    pub fn begin_add_api_token(&mut self) {
+        if self.unreached.is_empty() {
+            self.status_msg = Some("All accounts have tokens".into());
+            return;
+        }
+        self.mode = Mode::AddingApiToken {
+            input: String::new(),
+        };
+    }
+
+    pub fn finish_add_api_token(&mut self, token: String) {
+        // Try the token against all unreached accounts
+        let matched: Option<&UnreachedAccount> = self.unreached.iter().find(|a| {
+            cloudflare::verify_token(&token, &a.account_id, &a.tunnel_id)
+        });
+
+        let matched_names = match matched {
+            Some(a) => a.tunnel_names.join(", "),
+            None => {
+                self.status_msg = Some("Token rejected — doesn't match any unreached account".into());
+                return;
+            }
+        };
+
+        // Save it
+        match self.config.add_api_token(token) {
+            Ok(()) => {
+                self.status_msg = Some(format!("Token added for {}", matched_names));
+            }
+            Err(e) => {
+                self.status_msg = Some(format!("Error: {}", e));
+            }
+        }
+
+        // Re-sync
+        let tunnel_tokens: Vec<(String, String)> = self.config.tunnels.iter()
+            .map(|t| (t.name.clone(), t.token.clone()))
+            .collect();
+        let cf_tokens = self.config.all_cf_api_tokens();
+        let sync = cloudflare::sync(&cf_tokens, &tunnel_tokens);
+        self.tunnel_info = sync.tunnel_info;
+        self.ingress_routes = sync.ingress_routes;
+        self.unreached = sync.unreached.clone();
+        self.refresh();
+
+        if sync.unreached.is_empty() {
+            self.mode = Mode::Normal;
+        } else {
+            self.mode = Mode::AddingApiToken {
+                input: String::new(),
+            };
+        }
     }
 }
 

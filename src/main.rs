@@ -72,6 +72,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mu
                     Mode::AddingService { .. } => handle_adding_service(app, key.code),
                     Mode::EditingService { .. } => handle_editing_service(app, key.code),
                     Mode::ConfirmingServiceDelete { .. } => handle_confirming_service_delete(app, key.code),
+                    Mode::AddingApiToken { .. } => handle_adding_api_token(app, key.code),
                     Mode::Logs { .. } | Mode::Help => {
                         if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                             app.mode = Mode::Normal;
@@ -104,6 +105,7 @@ fn handle_normal(app: &mut App, code: KeyCode) {
         KeyCode::Char('l') | KeyCode::Enter => app.show_logs(),
         KeyCode::Char('R') => app.refresh_cf(),
         KeyCode::Char('I') => app.import_existing(),
+        KeyCode::Char('T') => app.begin_add_api_token(),
         KeyCode::Char('?') => app.mode = Mode::Help,
         _ => {}
     }
@@ -129,6 +131,7 @@ fn handle_services_normal(app: &mut App, code: KeyCode) {
         KeyCode::Char('d') => app.confirm_delete_service(),
         KeyCode::Char('S') => app.scan_services(),
         KeyCode::Char('R') => app.refresh_cf(),
+        KeyCode::Char('T') => app.begin_add_api_token(),
         KeyCode::Char('?') => app.mode = Mode::Help,
         _ => {}
     }
@@ -225,18 +228,43 @@ fn handle_editing_service(app: &mut App, code: KeyCode) {
 }
 
 fn handle_confirming_service_delete(app: &mut App, code: KeyCode) {
-    let Mode::ConfirmingServiceDelete { name, machine } = &app.mode else {
+    let Mode::ConfirmingServiceDelete { name, port, machine } = &app.mode else {
         return;
     };
-    let (name, machine) = (name.clone(), machine.clone());
+    let (name, port, machine) = (name.clone(), *port, machine.clone());
 
     match code {
         KeyCode::Char('y') | KeyCode::Char('Y') => {
-            app.delete_service(&name, &machine);
+            app.delete_service(&name, port, &machine);
             app.mode = Mode::Normal;
         }
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
             app.mode = Mode::Normal;
+        }
+        _ => {}
+    }
+}
+
+fn handle_adding_api_token(app: &mut App, code: KeyCode) {
+    let Mode::AddingApiToken { input } = &mut app.mode else {
+        return;
+    };
+
+    match code {
+        KeyCode::Esc => {
+            app.mode = Mode::Normal;
+        }
+        KeyCode::Enter => {
+            if !input.is_empty() {
+                let token = input.clone();
+                app.finish_add_api_token(token);
+            }
+        }
+        KeyCode::Backspace => {
+            input.pop();
+        }
+        KeyCode::Char(c) => {
+            input.push(c);
         }
         _ => {}
     }
