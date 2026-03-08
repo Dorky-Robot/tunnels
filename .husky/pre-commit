@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# .husky/pre-commit — fast, deterministic checks before every commit
+#
+# Hook chain:
+#   1. Secrets scan   (gitleaks — BLOCKING)
+#   2. Spell check    (typos — BLOCKING)
+#   3. Formatting     (cargo fmt — BLOCKING)
+#   4. Lint           (cargo clippy — BLOCKING)
+#
+# Activate once per clone:
+#   git config core.hooksPath .husky
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+warn() { echo "  WARN  $*" >&2; }
+fail() { echo "  ERROR $*" >&2; exit 1; }
+step() { echo ""; echo "==> $*"; }
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  pre-commit checks"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# ── 1. Secrets scan (BLOCKING) ────────────────────────────────────────────────
+step "[1/4] Secrets scan (gitleaks)"
+if command -v gitleaks >/dev/null 2>&1; then
+    if ! gitleaks git --pre-commit --no-banner --verbose; then
+        fail "Secrets detected — commit blocked. Remove secrets before committing."
+    fi
+    echo "      OK  No secrets detected"
+else
+    warn "gitleaks not installed — skipping secrets scan."
+    warn "Install: https://github.com/gitleaks/gitleaks#installing"
+fi
+
+# ── 2. Spell check (BLOCKING) ────────────────────────────────────────────────
+step "[2/4] Spell check (typos)"
+if command -v typos >/dev/null 2>&1; then
+    if ! typos; then
+        fail "Spelling errors found — commit blocked. Fix typos before committing."
+    fi
+    echo "      OK  No spelling errors"
+else
+    warn "typos not installed — skipping spell check."
+    warn "Install: cargo install typos-cli  OR  brew install typos-cli"
+fi
+
+# ── 3. Formatting (BLOCKING) ─────────────────────────────────────────────────
+step "[3/4] Formatting (cargo fmt)"
+if command -v cargo >/dev/null 2>&1; then
+    if ! cargo fmt --all -- --check 2>/dev/null; then
+        fail "Formatting errors — commit blocked. Run 'cargo fmt --all' to fix."
+    fi
+    echo "      OK  All files formatted"
+else
+    warn "cargo not found — skipping format check."
+fi
+
+# ── 4. Lint (BLOCKING) ───────────────────────────────────────────────────────
+step "[4/4] Lint (cargo clippy)"
+if command -v cargo >/dev/null 2>&1; then
+    if ! cargo clippy --all-targets -- -D warnings 2>/dev/null; then
+        fail "Clippy warnings — commit blocked. Fix lint issues before committing."
+    fi
+    echo "      OK  No lint warnings"
+else
+    warn "cargo not found — skipping lint check."
+fi
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  All pre-commit checks passed — proceeding with commit."
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

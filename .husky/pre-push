@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# .husky/pre-push — full validation before push
+#
+# Hook chain:
+#   1. Build          (cargo build — BLOCKING)
+#   2. Test suite     (cargo test — BLOCKING)
+#   3. Secrets scan   (gitleaks — BLOCKING)
+#
+# Activate once per clone:
+#   git config core.hooksPath .husky
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+warn() { echo "  WARN  $*" >&2; }
+fail() { echo "  ERROR $*" >&2; exit 1; }
+step() { echo ""; echo "==> $*"; }
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  pre-push checks"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# ── 1. Build (BLOCKING) ─────────────────────────────────────────────────────
+step "[1/3] Build (cargo build)"
+if ! cargo build 2>&1; then
+    fail "Build failed — push blocked. Fix compilation errors before pushing."
+fi
+echo "      OK  Build succeeded"
+
+# ── 2. Test suite (BLOCKING) ─────────────────────────────────────────────────
+step "[2/3] Test suite (cargo test)"
+if ! cargo test --workspace 2>&1; then
+    fail "Tests failed — push blocked. Fix failing tests before pushing."
+fi
+echo "      OK  All tests passed"
+
+# ── 3. Secrets scan (BLOCKING) ───────────────────────────────────────────────
+step "[3/3] Secrets scan (gitleaks)"
+if command -v gitleaks >/dev/null 2>&1; then
+    if ! gitleaks git --no-banner --verbose; then
+        fail "Secrets detected — push blocked. Remove secrets before pushing."
+    fi
+    echo "      OK  No secrets detected"
+else
+    warn "gitleaks not installed — skipping secrets scan."
+    warn "Install: https://github.com/gitleaks/gitleaks#installing"
+fi
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  All pre-push checks passed — proceeding with push."
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

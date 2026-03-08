@@ -75,9 +75,7 @@ pub enum Status {
 
 pub fn status(name: &str) -> Status {
     let label = label_for(name);
-    let output = Command::new("launchctl")
-        .args(["list", &label])
-        .output();
+    let output = Command::new("launchctl").args(["list", &label]).output();
 
     match output {
         Ok(o) if o.status.success() => {
@@ -132,11 +130,28 @@ pub fn stop(name: &str) -> Result<()> {
         return Ok(());
     }
 
-    let _ = Command::new("launchctl")
-        .args(["unload", &path.to_string_lossy()])
+    let label = label_for(name);
+    let path_str = path.to_string_lossy().to_string();
+
+    // Try launchctl unload
+    let unload = Command::new("launchctl")
+        .args(["unload", &path_str])
         .output();
 
-    let _ = std::fs::remove_file(&path);
+    let unloaded = matches!(unload, Ok(ref o) if o.status.success());
+
+    if !unloaded {
+        // Verify the service is actually gone despite the unload error
+        let list = Command::new("launchctl").args(["list", &label]).output();
+        if matches!(list, Ok(ref o) if o.status.success()) {
+            anyhow::bail!(
+                "failed to stop '{}': launchctl unload failed and service is still loaded",
+                name
+            );
+        }
+    }
+
+    std::fs::remove_file(&path).ok();
 
     Ok(())
 }
@@ -186,10 +201,7 @@ pub fn discover_existing() -> Vec<DiscoveredTunnel> {
     let mut found = Vec::new();
     let daemon_dir = PathBuf::from("/Library/LaunchDaemons");
 
-    let dirs: Vec<(PathBuf, bool)> = vec![
-        (plist_dir(), false),
-        (daemon_dir, true),
-    ];
+    let dirs: Vec<(PathBuf, bool)> = vec![(plist_dir(), false), (daemon_dir, true)];
 
     for (dir, is_daemon) in &dirs {
         if let Ok(entries) = std::fs::read_dir(dir) {
@@ -211,20 +223,24 @@ pub fn discover_existing() -> Vec<DiscoveredTunnel> {
 
                 // Extract token via PlistBuddy
                 let output = Command::new("/usr/libexec/PlistBuddy")
-                    .args(["-c", "Print :ProgramArguments:4", &entry.path().to_string_lossy()])
+                    .args([
+                        "-c",
+                        "Print :ProgramArguments:4",
+                        &entry.path().to_string_lossy(),
+                    ])
                     .output();
 
-                if let Ok(o) = output {
-                    if o.status.success() {
-                        let token = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                        if !token.is_empty() {
-                            found.push(DiscoveredTunnel {
-                                name,
-                                token,
-                                is_daemon: *is_daemon,
-                                plist_path: entry.path(),
-                            });
-                        }
+                if let Ok(o) = output
+                    && o.status.success()
+                {
+                    let token = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if !token.is_empty() {
+                        found.push(DiscoveredTunnel {
+                            name,
+                            token,
+                            is_daemon: *is_daemon,
+                            plist_path: entry.path(),
+                        });
                     }
                 }
             }
@@ -233,7 +249,6 @@ pub fn discover_existing() -> Vec<DiscoveredTunnel> {
 
     found
 }
-
 
 /// Migrate a daemon plist: sudo unload + sudo rm, then start as LaunchAgent
 pub fn migrate_daemon(plist: &std::path::Path) -> Result<()> {

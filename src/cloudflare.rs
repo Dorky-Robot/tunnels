@@ -84,25 +84,29 @@ pub fn verify_token(api_token: &str, account_id: &str, tunnel_id: &str) -> bool 
     fetch_tunnel_config_check(api_token, account_id, tunnel_id)
 }
 
-/// Sync: fetch ingress routes for all accounts using configured API tokens.
-/// cf_api_tokens: user-configured API tokens (one per CF account)
-/// tunnel_tokens: Vec<(config_name, base64_token)>
-pub fn sync(cf_api_tokens: &[&str], tunnel_tokens: &[(String, String)]) -> SyncResult {
-    // Decode all tunnel tokens to get (name, account_id, tunnel_id) triples
-    let decoded: Vec<(String, String, String)> = tunnel_tokens.iter()
-        .filter_map(|(name, tok)| {
-            crate::config::decode_token(tok).ok().map(|p| {
-                (name.clone(), p.account_id, p.tunnel_id)
-            })
-        })
-        .collect();
+/// Pre-decoded tunnel data for sync
+pub struct TunnelSyncInput {
+    pub name: String,
+    pub account_id: String,
+    pub tunnel_id: String,
+    pub api_token: Option<String>,
+}
 
+/// Sync: fetch ingress routes using per-tunnel API tokens.
+pub fn sync(tunnels: &[TunnelSyncInput]) -> SyncResult {
     // Group tunnels by account_id
-    let mut accounts: HashMap<String, Vec<(String, String)>> = HashMap::new();
-    for (name, account_id, tunnel_id) in &decoded {
-        accounts.entry(account_id.clone())
-            .or_default()
-            .push((name.clone(), tunnel_id.clone()));
+    let mut accounts: HashMap<String, Vec<(String, String, Option<String>)>> = HashMap::new();
+    for t in tunnels {
+        if t.account_id.is_empty() {
+            continue;
+        }
+        let (name, account_id, tunnel_id, api) =
+            (&t.name, &t.account_id, &t.tunnel_id, &t.api_token);
+        accounts.entry(account_id.clone()).or_default().push((
+            name.clone(),
+            tunnel_id.clone(),
+            api.clone(),
+        ));
     }
 
     if accounts.is_empty() {
@@ -114,28 +118,6 @@ pub fn sync(cf_api_tokens: &[&str], tunnel_tokens: &[(String, String)]) -> SyncR
         };
     }
 
-    let api_tokens: Vec<&str> = cf_api_tokens.iter()
-        .filter(|t| !t.is_empty())
-        .copied()
-        .collect();
-
-    // If no API tokens at all, every account is unreached
-    if api_tokens.is_empty() {
-        let unreached: Vec<UnreachedAccount> = accounts.iter()
-            .map(|(account_id, tunnels)| UnreachedAccount {
-                account_id: account_id.clone(),
-                tunnel_names: tunnels.iter().map(|(n, _)| n.clone()).collect(),
-                tunnel_id: tunnels.first().map(|(_, id)| id.clone()).unwrap_or_default(),
-            })
-            .collect();
-        return SyncResult {
-            tunnel_info: HashMap::new(),
-            ingress_routes: HashMap::new(),
-            status: format!("{} account(s) need API tokens — press T", unreached.len()),
-            unreached,
-        };
-    }
-
     let mut port_map: HashMap<u16, Vec<IngressRoute>> = HashMap::new();
     let mut tunnel_info: HashMap<String, TunnelInfo> = HashMap::new();
     let mut total_routes = 0;
@@ -143,75 +125,85 @@ pub fn sync(cf_api_tokens: &[&str], tunnel_tokens: &[(String, String)]) -> SyncR
     let mut unreached = Vec::new();
 
     for (account_id, tunnels) in &accounts {
-        let mut account_ok = false;
+        // Find an API token from any tunnel in this account
+        let api_token = tunnels
+            .iter()
+            .filter_map(|(_, _, api)| api.as_deref())
+            .find(|t| !t.is_empty());
 
-        for api_token in &api_tokens {
-            let probe_ok = tunnels.first()
-                .map(|(_, id)| fetch_tunnel_config_check(api_token, account_id, id))
-                .unwrap_or(false);
-
-            if !probe_ok {
-                continue;
-            }
-
-            for (name, tunnel_id) in tunnels {
-                // Fetch tunnel details (name, connections)
-                if let Some(detail) = fetch_tunnel_detail(api_token, account_id, tunnel_id) {
-                    let conns = if detail.connections.is_empty() {
-                        "no connections".to_string()
-                    } else {
-                        let colos: Vec<&str> = detail.connections.iter()
-                            .map(|c| c.colo_name.as_str()).collect();
-                        format!("{}x edge ({})", colos.len(), colos.join(", "))
-                    };
-                    tunnel_info.insert(tunnel_id.clone(), TunnelInfo {
-                        cf_name: detail.name,
-                        connections: conns,
-                    });
-                }
-
-                // Fetch ingress routes
-                let ingress = fetch_tunnel_config(api_token, account_id, tunnel_id);
-                for rule in ingress {
-                    let hostname = match rule.hostname {
-                        Some(h) => h,
-                        None => continue,
-                    };
-                    if let Some(p) = parse_port_from_service(&rule.service) {
-                        total_routes += 1;
-                        port_map.entry(p).or_default().push(IngressRoute {
-                            hostname,
-                            tunnel_name: name.clone(),
-                            tunnel_id: tunnel_id.clone(),
-                        });
-                    }
-                }
-            }
-
-            account_ok = true;
-            accounts_reached += 1;
-            break;
-        }
-
-        if !account_ok {
+        let Some(api_token) = api_token else {
             unreached.push(UnreachedAccount {
                 account_id: account_id.clone(),
-                tunnel_names: tunnels.iter().map(|(n, _)| n.clone()).collect(),
-                tunnel_id: tunnels.first().map(|(_, id)| id.clone()).unwrap_or_default(),
+                tunnel_names: tunnels.iter().map(|(n, _, _)| n.clone()).collect(),
+                tunnel_id: tunnels
+                    .first()
+                    .map(|(_, id, _)| id.clone())
+                    .unwrap_or_default(),
             });
+            continue;
+        };
+
+        for (name, tunnel_id, _) in tunnels {
+            if let Some(detail) = fetch_tunnel_detail(api_token, account_id, tunnel_id) {
+                let conns = if detail.connections.is_empty() {
+                    "no connections".to_string()
+                } else {
+                    let colos: Vec<&str> = detail
+                        .connections
+                        .iter()
+                        .map(|c| c.colo_name.as_str())
+                        .collect();
+                    format!("{}x edge ({})", colos.len(), colos.join(", "))
+                };
+                tunnel_info.insert(
+                    tunnel_id.clone(),
+                    TunnelInfo {
+                        cf_name: detail.name,
+                        connections: conns,
+                    },
+                );
+            }
+
+            let ingress = fetch_tunnel_config(api_token, account_id, tunnel_id);
+            for rule in ingress {
+                let hostname = match rule.hostname {
+                    Some(h) => h,
+                    None => continue,
+                };
+                if let Some(p) = parse_port_from_service(&rule.service) {
+                    total_routes += 1;
+                    port_map.entry(p).or_default().push(IngressRoute {
+                        hostname,
+                        tunnel_name: name.clone(),
+                        tunnel_id: tunnel_id.clone(),
+                    });
+                }
+            }
         }
+
+        accounts_reached += 1;
     }
 
     let status = if !unreached.is_empty() {
         format!(
-            "Synced {} route(s) from {} account(s) — {} need tokens (T)",
-            total_routes, accounts_reached, unreached.len(),
+            "Synced {} route(s) from {} account(s) — {} need API tokens",
+            total_routes,
+            accounts_reached,
+            unreached.len(),
         )
     } else {
-        format!("Synced {} route(s) from {} account(s)", total_routes, accounts_reached)
+        format!(
+            "Synced {} route(s) from {} account(s)",
+            total_routes, accounts_reached
+        )
     };
 
-    SyncResult { tunnel_info, ingress_routes: port_map, status, unreached }
+    SyncResult {
+        tunnel_info,
+        ingress_routes: port_map,
+        status,
+        unreached,
+    }
 }
 
 fn parse_port_from_service(service: &str) -> Option<u16> {
@@ -227,7 +219,12 @@ fn fetch_tunnel_config_check(api_token: &str, account_id: &str, tunnel_id: &str)
         account_id, tunnel_id
     );
     let output = Command::new("curl")
-        .args(["-s", &url, "-H", &format!("Authorization: Bearer {}", api_token)])
+        .args([
+            "-s",
+            &url,
+            "-H",
+            &format!("Authorization: Bearer {}", api_token),
+        ])
         .output();
     let output = match output {
         Ok(o) if o.status.success() => o.stdout,
@@ -238,13 +235,22 @@ fn fetch_tunnel_config_check(api_token: &str, account_id: &str, tunnel_id: &str)
         .unwrap_or(false)
 }
 
-fn fetch_tunnel_detail(api_token: &str, account_id: &str, tunnel_id: &str) -> Option<CfTunnelDetail> {
+fn fetch_tunnel_detail(
+    api_token: &str,
+    account_id: &str,
+    tunnel_id: &str,
+) -> Option<CfTunnelDetail> {
     let url = format!(
         "https://api.cloudflare.com/client/v4/accounts/{}/cfd_tunnel/{}",
         account_id, tunnel_id
     );
     let output = Command::new("curl")
-        .args(["-s", &url, "-H", &format!("Authorization: Bearer {}", api_token)])
+        .args([
+            "-s",
+            &url,
+            "-H",
+            &format!("Authorization: Bearer {}", api_token),
+        ])
         .output();
     let output = match output {
         Ok(o) if o.status.success() => o.stdout,
@@ -260,7 +266,12 @@ fn fetch_tunnel_config(api_token: &str, account_id: &str, tunnel_id: &str) -> Ve
         account_id, tunnel_id
     );
     let output = Command::new("curl")
-        .args(["-s", &url, "-H", &format!("Authorization: Bearer {}", api_token)])
+        .args([
+            "-s",
+            &url,
+            "-H",
+            &format!("Authorization: Bearer {}", api_token),
+        ])
         .output();
     let output = match output {
         Ok(o) if o.status.success() => o.stdout,

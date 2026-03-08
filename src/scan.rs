@@ -93,6 +93,11 @@ pub fn scan_services() -> Vec<DiscoveredService> {
     results
 }
 
+/// Quick check: return the set of ports currently listening on this machine.
+pub fn listening_ports() -> HashSet<u16> {
+    scan_services().into_iter().map(|s| s.port).collect()
+}
+
 /// Use lsof to find the cwd for a PID, then extract the last path component as project name.
 /// The `-a` flag is critical — it ANDs the -p and -d filters together.
 fn project_name_from_pid(pid: u32) -> Option<String> {
