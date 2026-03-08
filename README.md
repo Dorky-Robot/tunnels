@@ -13,8 +13,7 @@ A [k9s](https://k9scli.io/)-style TUI for managing multiple [cloudflared](https:
 ╶──────────────────────────────────────────────────────────────────────╴
 
 ╶──────────────────────────────────────────────────────────────────────╴
- j/k navigate  s start  x stop  r restart  a add  e edit  n rename
- d delete  l logs  I import  ? help  q quit
+ j/k navigate  s start  x stop  r restart  a add  d delete  ? more  q quit
 ```
 
 ## Install
@@ -27,7 +26,10 @@ brew install dorky-robot/tap/tunnels
 Or build from source:
 
 ```bash
-cargo install --path .
+git clone https://github.com/Dorky-Robot/tunnels.git
+cd tunnels
+cargo build --release
+cp target/release/tunnels ~/.local/bin/
 ```
 
 ## Usage
@@ -36,6 +38,13 @@ cargo install --path .
 tunnels          # Launch TUI
 tunnels list     # List tunnels (non-interactive)
 tunnels import   # Import existing cloudflared plists
+```
+
+## Development
+
+```bash
+cargo run          # Run locally
+cargo run --release  # Run with optimizations
 ```
 
 ## TUI Keybindings
@@ -63,7 +72,10 @@ Each tunnel is a cloudflared instance managed via macOS LaunchAgents (`~/Library
 - **Plists** generated in `~/Library/LaunchAgents/`
 - **Logs** written to `~/Library/Logs/tunnels/`
 - Tunnels **auto-start at login** via `RunAtLoad`
-- Import discovers existing plists from both `~/Library/LaunchAgents/` and `/Library/LaunchDaemons/`
+
+### Migrating from system-level LaunchDaemons
+
+If cloudflared was installed via `cloudflared service install`, it runs as a root-owned LaunchDaemon. Press `I` to import — if daemon plists are found, the TUI will offer to migrate them to user-level LaunchAgents (one-time sudo, then never again).
 
 ## Adding a tunnel
 
