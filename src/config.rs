@@ -22,6 +22,11 @@ pub struct Config {
     pub tunnels: Vec<Tunnel>,
     #[serde(default)]
     pub services: Vec<Service>,
+    /// Optional Cloudflare API token — avoids needing `cloudflared tunnel login`.
+    /// Create one at https://dash.cloudflare.com/profile/api-tokens with
+    /// "Account.Cloudflare Tunnel:Read" permission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cf_api_token: Option<String>,
 }
 
 impl Config {

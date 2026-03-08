@@ -73,15 +73,17 @@ pub struct App {
 impl App {
     pub fn new() -> Self {
         let config = Config::load().unwrap_or_default();
-        let cf_tunnels = cloudflare::list_tunnels();
-        let ingress_routes = cloudflare::fetch_ingress_routes(&cf_tunnels);
+        let tunnel_tokens: Vec<(String, String)> = config.tunnels.iter()
+            .map(|t| (t.name.clone(), t.token.clone()))
+            .collect();
+        let sync = cloudflare::sync(config.cf_api_token.as_deref(), &tunnel_tokens);
         let mut app = Self {
             config,
             tab: Tab::Tunnels,
             rows: Vec::new(),
             service_rows: Vec::new(),
-            cf_tunnels,
-            ingress_routes,
+            cf_tunnels: sync.tunnels,
+            ingress_routes: sync.ingress_routes,
             selected: 0,
             service_selected: 0,
             mode: Mode::Normal,
@@ -185,13 +187,13 @@ impl App {
     }
 
     pub fn refresh_cf(&mut self) {
-        self.cf_tunnels = cloudflare::list_tunnels();
-        self.ingress_routes = cloudflare::fetch_ingress_routes(&self.cf_tunnels);
-        self.status_msg = Some(format!(
-            "Synced {} tunnel(s), {} route(s) from Cloudflare",
-            self.cf_tunnels.len(),
-            self.ingress_routes.len()
-        ));
+        let tunnel_tokens: Vec<(String, String)> = self.config.tunnels.iter()
+            .map(|t| (t.name.clone(), t.token.clone()))
+            .collect();
+        let sync = cloudflare::sync(self.config.cf_api_token.as_deref(), &tunnel_tokens);
+        self.cf_tunnels = sync.tunnels;
+        self.ingress_routes = sync.ingress_routes;
+        self.status_msg = Some(sync.status);
         self.refresh();
     }
 

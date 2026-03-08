@@ -48,10 +48,17 @@ pub struct IngressRoute {
     pub tunnel_id: String,
 }
 
-/// API credentials extracted from cert.pem
+/// API credentials for Cloudflare
 struct ApiCreds {
     account_id: String,
     api_token: String,
+}
+
+/// Result of a CF sync operation
+pub struct SyncResult {
+    pub tunnels: Vec<CfTunnel>,
+    pub ingress_routes: HashMap<u16, Vec<IngressRoute>>,
+    pub status: String,
 }
 
 /// Query `cloudflared tunnel list --output json` for live tunnel data.
@@ -83,18 +90,50 @@ pub fn find_by_id<'a>(tunnels: &'a [CfTunnel], tunnel_id: &str) -> Option<&'a Cf
     tunnels.iter().find(|t| t.id == tunnel_id)
 }
 
-/// Fetch all ingress routes for all known tunnels.
-/// Returns a map of local port -> Vec<IngressRoute> since multiple tunnels can serve the same port.
-pub fn fetch_ingress_routes(tunnels: &[CfTunnel]) -> HashMap<u16, Vec<IngressRoute>> {
-    let creds = match load_api_creds() {
-        Some(c) => c,
-        None => return HashMap::new(),
-    };
+/// Full sync: list tunnels + fetch ingress routes, trying all available auth methods.
+/// Takes an optional CF API token from config and tunnel tokens for account_id extraction.
+pub fn sync(cf_api_token: Option<&str>, tunnel_tokens: &[(String, String)]) -> SyncResult {
+    let cf_tunnels = list_tunnels();
 
+    // Try to get API credentials from multiple sources
+    let creds = load_api_creds_multi(cf_api_token, tunnel_tokens);
+
+    match creds {
+        Some(creds) => {
+            let ingress_routes = fetch_all_ingress(&creds, &cf_tunnels);
+            let route_count: usize = ingress_routes.values().map(|v| v.len()).sum();
+            let status = format!(
+                "Synced {} tunnel(s), {} route(s) from Cloudflare",
+                cf_tunnels.len(),
+                route_count,
+            );
+            SyncResult { tunnels: cf_tunnels, ingress_routes, status }
+        }
+        None => {
+            if cf_tunnels.is_empty() {
+                SyncResult {
+                    tunnels: cf_tunnels,
+                    ingress_routes: HashMap::new(),
+                    status: "No CF auth — run 'cloudflared tunnel login' or set cf_api_token in config".into(),
+                }
+            } else {
+                // We got tunnels (cert.pem exists for list) but no API creds for routes
+                let status = format!(
+                    "Synced {} tunnel(s) — no ingress routes (set cf_api_token in config)",
+                    cf_tunnels.len(),
+                );
+                SyncResult { tunnels: cf_tunnels, ingress_routes: HashMap::new(), status }
+            }
+        }
+    }
+}
+
+/// Fetch all ingress routes for all known tunnels.
+fn fetch_all_ingress(creds: &ApiCreds, tunnels: &[CfTunnel]) -> HashMap<u16, Vec<IngressRoute>> {
     let mut port_map: HashMap<u16, Vec<IngressRoute>> = HashMap::new();
 
     for tunnel in tunnels {
-        let ingress = fetch_tunnel_config(&creds, &tunnel.id);
+        let ingress = fetch_tunnel_config(creds, &tunnel.id);
         for rule in ingress {
             let hostname = match rule.hostname {
                 Some(h) => h,
@@ -118,7 +157,6 @@ pub fn fetch_ingress_routes(tunnels: &[CfTunnel]) -> HashMap<u16, Vec<IngressRou
 
 /// Parse port from a service URL like "http://localhost:3001" or "ssh://localhost:22"
 fn parse_port_from_service(service: &str) -> Option<u16> {
-    // service is like "http://localhost:3001", "ssh://localhost:22", "http_status:404"
     service
         .rsplit(':')
         .next()
@@ -160,8 +198,34 @@ fn fetch_tunnel_config(creds: &ApiCreds, tunnel_id: &str) -> Vec<CfIngress> {
         .unwrap_or_default()
 }
 
+/// Try multiple sources for API credentials:
+/// 1. Config file cf_api_token + account_id from tunnel tokens
+/// 2. cert.pem from `cloudflared tunnel login`
+fn load_api_creds_multi(cf_api_token: Option<&str>, tunnel_tokens: &[(String, String)]) -> Option<ApiCreds> {
+    // Method 1: cf_api_token from config + account_id from any tunnel token
+    if let Some(token) = cf_api_token {
+        if !token.is_empty() {
+            // Extract account_id from the first tunnel token that decodes
+            let account_id = tunnel_tokens.iter()
+                .filter_map(|(_, tok)| crate::config::decode_token(tok).ok())
+                .map(|p| p.account_id)
+                .next();
+
+            if let Some(account_id) = account_id {
+                return Some(ApiCreds {
+                    account_id,
+                    api_token: token.to_string(),
+                });
+            }
+        }
+    }
+
+    // Method 2: cert.pem
+    load_api_creds_from_cert()
+}
+
 /// Load API credentials from ~/.cloudflared/cert.pem (Argo Tunnel Token)
-fn load_api_creds() -> Option<ApiCreds> {
+fn load_api_creds_from_cert() -> Option<ApiCreds> {
     let cert_path = dirs::home_dir()?.join(".cloudflared/cert.pem");
     let content = std::fs::read_to_string(&cert_path).ok()?;
 

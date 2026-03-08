@@ -19,11 +19,15 @@ Two tabs: **Tunnels** manages your cloudflared instances via LaunchAgents. **Ser
 
 - **macOS** (uses LaunchAgents and `lsof` for service discovery)
 - **cloudflared** — `brew install cloudflared`
-- **Cloudflare login** (optional, for ingress route resolution):
-  ```bash
-  cloudflared tunnel login
-  ```
-  This creates `~/.cloudflared/cert.pem` which tunnels reads (read-only) to fetch your tunnel configurations from the Cloudflare API. Without it, the Tunnels tab still works — you just won't see CF names, edge status, or auto-resolved URLs in the Services tab.
+- **Cloudflare API access** (optional, for ingress route resolution) — pick one:
+  - **Option A** — Add a CF API token to your config (`~/.config/tunnels/config.json`):
+    ```json
+    { "cf_api_token": "your-token-here", "tunnels": [...] }
+    ```
+    Create one at [dash.cloudflare.com/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens) with **Account.Cloudflare Tunnel:Read** permission. The account ID is extracted automatically from your tunnel tokens.
+  - **Option B** — Run `cloudflared tunnel login` (creates `~/.cloudflared/cert.pem`, used automatically).
+
+  Without either, everything still works — you just won't see tunnel names, edge status, or auto-resolved URLs in the Services tab.
 
 ## Install
 
@@ -86,7 +90,7 @@ Press `S` to scan — it uses `lsof` to find all listening TCP ports, resolves t
 - **Config** stored at `~/.config/tunnels/config.json`
 - **Plists** generated in `~/Library/LaunchAgents/`
 - **Logs** written to `~/Library/Logs/tunnels/`
-- **Cloudflare API** credentials read from `~/.cloudflared/cert.pem` (created by `cloudflared tunnel login`)
+- **Cloudflare API** credentials from config `cf_api_token` or `~/.cloudflared/cert.pem`
 - Tunnels **auto-start at login** via `RunAtLoad`
 
 ### Adding a tunnel

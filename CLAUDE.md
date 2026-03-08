@@ -6,7 +6,7 @@ A k9s-style TUI for managing cloudflared tunnels and local services on macOS.
 
 - **config.rs** — JSON config at `~/.config/tunnels/config.json`, tunnel + service CRUD, token decode
 - **launchd.rs** — LaunchAgent plist generation, start/stop/status via `launchctl`, plist discovery/migration
-- **cloudflare.rs** — CF API integration: tunnel list via `cloudflared` CLI, ingress route fetch via REST API, cert.pem credential extraction
+- **cloudflare.rs** — CF API integration: tunnel list via `cloudflared` CLI, ingress route fetch via REST API, multi-source auth (config cf_api_token > cert.pem), graceful degradation
 - **scan.rs** — Service discovery via `lsof`: find listening TCP ports, resolve project names from process cwd
 - **app.rs** — App state, tab system (Tunnels/Services), mode machine, CF + scan integration
 - **ui.rs** — ratatui rendering: tab header, tunnel/service tables, dialogs, keybinding bar
