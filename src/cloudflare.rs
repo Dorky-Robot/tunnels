@@ -48,7 +48,7 @@ pub struct IngressRoute {
     pub tunnel_id: String,
 }
 
-/// API credentials for Cloudflare
+/// API credentials for Cloudflare (scoped to one account)
 struct ApiCreds {
     account_id: String,
     api_token: String,
@@ -90,69 +90,121 @@ pub fn find_by_id<'a>(tunnels: &'a [CfTunnel], tunnel_id: &str) -> Option<&'a Cf
     tunnels.iter().find(|t| t.id == tunnel_id)
 }
 
-/// Full sync: list tunnels + fetch ingress routes, trying all available auth methods.
-/// Takes an optional CF API token from config and tunnel tokens for account_id extraction.
+/// Full sync: list tunnels + fetch ingress routes across all accounts.
+/// tunnel_tokens: Vec<(config_name, base64_token)>
 pub fn sync(cf_api_token: Option<&str>, tunnel_tokens: &[(String, String)]) -> SyncResult {
     let cf_tunnels = list_tunnels();
 
-    // Try to get API credentials from multiple sources
-    let creds = load_api_creds_multi(cf_api_token, tunnel_tokens);
+    // Decode all tunnel tokens to get (name, account_id, tunnel_id) triples
+    let decoded: Vec<(String, String, String)> = tunnel_tokens.iter()
+        .filter_map(|(name, tok)| {
+            crate::config::decode_token(tok).ok().map(|p| {
+                (name.clone(), p.account_id, p.tunnel_id)
+            })
+        })
+        .collect();
 
-    match creds {
-        Some(creds) => {
-            let ingress_routes = fetch_all_ingress(&creds, &cf_tunnels);
-            let route_count: usize = ingress_routes.values().map(|v| v.len()).sum();
-            let status = format!(
-                "Synced {} tunnel(s), {} route(s) from Cloudflare",
-                cf_tunnels.len(),
-                route_count,
-            );
-            SyncResult { tunnels: cf_tunnels, ingress_routes, status }
+    // Collect all available API tokens: cert.pem + cf_api_token from config
+    let mut api_tokens: Vec<String> = Vec::new();
+    if let Some(token) = cf_api_token {
+        if !token.is_empty() {
+            api_tokens.push(token.to_string());
         }
-        None => {
-            if cf_tunnels.is_empty() {
-                SyncResult {
-                    tunnels: cf_tunnels,
-                    ingress_routes: HashMap::new(),
-                    status: "No CF auth — run 'cloudflared tunnel login' or set cf_api_token in config".into(),
-                }
-            } else {
-                // We got tunnels (cert.pem exists for list) but no API creds for routes
-                let status = format!(
-                    "Synced {} tunnel(s) — no ingress routes (set cf_api_token in config)",
-                    cf_tunnels.len(),
-                );
-                SyncResult { tunnels: cf_tunnels, ingress_routes: HashMap::new(), status }
+    }
+    if let Some(cert_creds) = load_api_creds_from_cert() {
+        api_tokens.push(cert_creds.api_token);
+    }
+
+    if api_tokens.is_empty() {
+        let status = if cf_tunnels.is_empty() {
+            "No CF auth — run 'cloudflared tunnel login' or set cf_api_token in config".to_string()
+        } else {
+            format!("Synced {} tunnel(s) — set cf_api_token for ingress routes", cf_tunnels.len())
+        };
+        return SyncResult { tunnels: cf_tunnels, ingress_routes: HashMap::new(), status };
+    }
+
+    // Group tunnels by account_id for multi-account support
+    let mut accounts: HashMap<String, Vec<(String, String)>> = HashMap::new(); // account_id -> [(name, tunnel_id)]
+    for (name, account_id, tunnel_id) in &decoded {
+        accounts.entry(account_id.clone())
+            .or_default()
+            .push((name.clone(), tunnel_id.clone()));
+    }
+
+    // Also add tunnels from `cloudflared tunnel list` that aren't in our config
+    // (they're from the cert.pem account)
+    if let Some(cert_creds) = load_api_creds_from_cert() {
+        let entry = accounts.entry(cert_creds.account_id).or_default();
+        for cf in &cf_tunnels {
+            if !entry.iter().any(|(_, id)| id == &cf.id) {
+                entry.push((cf.name.clone(), cf.id.clone()));
             }
         }
     }
-}
 
-/// Fetch all ingress routes for all known tunnels.
-fn fetch_all_ingress(creds: &ApiCreds, tunnels: &[CfTunnel]) -> HashMap<u16, Vec<IngressRoute>> {
     let mut port_map: HashMap<u16, Vec<IngressRoute>> = HashMap::new();
+    let mut total_routes = 0;
+    let mut accounts_reached = 0;
 
-    for tunnel in tunnels {
-        let ingress = fetch_tunnel_config(creds, &tunnel.id);
-        for rule in ingress {
-            let hostname = match rule.hostname {
-                Some(h) => h,
-                None => continue, // skip catch-all
+    for (account_id, tunnels) in &accounts {
+        // Try each API token until one works for this account
+        let mut got_routes = false;
+        for api_token in &api_tokens {
+            let creds = ApiCreds {
+                account_id: account_id.clone(),
+                api_token: api_token.clone(),
             };
 
-            let route = IngressRoute {
-                hostname,
-                tunnel_name: tunnel.name.clone(),
-                tunnel_id: tunnel.id.clone(),
-            };
+            // Try the first tunnel to see if this token works for this account
+            if let Some((_, first_id)) = tunnels.first() {
+                let test = fetch_tunnel_config(&creds, first_id);
+                // If we get an empty result, the token might not have access — but it could
+                // also be a tunnel with no ingress. We proceed optimistically.
+                let _ = test; // we'll collect below
+            }
 
-            if let Some(p) = parse_port_from_service(&rule.service) {
-                port_map.entry(p).or_default().push(route);
+            // Fetch ingress for all tunnels in this account
+            for (name, tunnel_id) in tunnels {
+                let ingress = fetch_tunnel_config(&creds, tunnel_id);
+                if ingress.is_empty() {
+                    continue;
+                }
+                got_routes = true;
+                for rule in ingress {
+                    let hostname = match rule.hostname {
+                        Some(h) => h,
+                        None => continue,
+                    };
+
+                    let route = IngressRoute {
+                        hostname,
+                        tunnel_name: name.clone(),
+                        tunnel_id: tunnel_id.clone(),
+                    };
+
+                    if let Some(p) = parse_port_from_service(&rule.service) {
+                        total_routes += 1;
+                        port_map.entry(p).or_default().push(route);
+                    }
+                }
+            }
+
+            if got_routes {
+                accounts_reached += 1;
+                break; // this token worked for this account
             }
         }
     }
 
-    port_map
+    let status = format!(
+        "Synced {} tunnel(s), {} route(s) from {} account(s)",
+        cf_tunnels.len(),
+        total_routes,
+        accounts_reached,
+    );
+
+    SyncResult { tunnels: cf_tunnels, ingress_routes: port_map, status }
 }
 
 /// Parse port from a service URL like "http://localhost:3001" or "ssh://localhost:22"
@@ -198,38 +250,11 @@ fn fetch_tunnel_config(creds: &ApiCreds, tunnel_id: &str) -> Vec<CfIngress> {
         .unwrap_or_default()
 }
 
-/// Try multiple sources for API credentials:
-/// 1. Config file cf_api_token + account_id from tunnel tokens
-/// 2. cert.pem from `cloudflared tunnel login`
-fn load_api_creds_multi(cf_api_token: Option<&str>, tunnel_tokens: &[(String, String)]) -> Option<ApiCreds> {
-    // Method 1: cf_api_token from config + account_id from any tunnel token
-    if let Some(token) = cf_api_token {
-        if !token.is_empty() {
-            // Extract account_id from the first tunnel token that decodes
-            let account_id = tunnel_tokens.iter()
-                .filter_map(|(_, tok)| crate::config::decode_token(tok).ok())
-                .map(|p| p.account_id)
-                .next();
-
-            if let Some(account_id) = account_id {
-                return Some(ApiCreds {
-                    account_id,
-                    api_token: token.to_string(),
-                });
-            }
-        }
-    }
-
-    // Method 2: cert.pem
-    load_api_creds_from_cert()
-}
-
 /// Load API credentials from ~/.cloudflared/cert.pem (Argo Tunnel Token)
 fn load_api_creds_from_cert() -> Option<ApiCreds> {
     let cert_path = dirs::home_dir()?.join(".cloudflared/cert.pem");
     let content = std::fs::read_to_string(&cert_path).ok()?;
 
-    // Extract base64 block between ARGO TUNNEL TOKEN markers
     let start = content.find("-----BEGIN ARGO TUNNEL TOKEN-----")?;
     let end = content.find("-----END ARGO TUNNEL TOKEN-----")?;
 
