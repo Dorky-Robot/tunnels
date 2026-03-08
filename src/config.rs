@@ -22,14 +22,28 @@ pub struct Config {
     pub tunnels: Vec<Tunnel>,
     #[serde(default)]
     pub services: Vec<Service>,
-    /// Optional Cloudflare API token — avoids needing `cloudflared tunnel login`.
-    /// Create one at https://dash.cloudflare.com/profile/api-tokens with
+    /// Cloudflare API tokens — one per CF account.
+    /// Create at https://dash.cloudflare.com/profile/api-tokens with
     /// "Account.Cloudflare Tunnel:Read" permission.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cf_api_tokens: Vec<String>,
+    /// Backward compat: single token (deprecated, use cf_api_tokens)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cf_api_token: Option<String>,
 }
 
 impl Config {
+    /// All configured CF API tokens (merges cf_api_tokens + legacy cf_api_token)
+    pub fn all_cf_api_tokens(&self) -> Vec<&str> {
+        let mut tokens: Vec<&str> = self.cf_api_tokens.iter().map(|s| s.as_str()).collect();
+        if let Some(ref t) = self.cf_api_token {
+            if !t.is_empty() && !tokens.iter().any(|existing| existing == &t.as_str()) {
+                tokens.push(t.as_str());
+            }
+        }
+        tokens
+    }
+
     pub fn path() -> PathBuf {
         dirs::home_dir().map(|h| h.join(".config"))
             .unwrap_or_else(|| PathBuf::from("."))

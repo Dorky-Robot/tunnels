@@ -91,8 +91,9 @@ pub fn find_by_id<'a>(tunnels: &'a [CfTunnel], tunnel_id: &str) -> Option<&'a Cf
 }
 
 /// Full sync: list tunnels + fetch ingress routes across all accounts.
+/// cf_api_tokens: user-configured API tokens (one per CF account)
 /// tunnel_tokens: Vec<(config_name, base64_token)>
-pub fn sync(cf_api_token: Option<&str>, tunnel_tokens: &[(String, String)]) -> SyncResult {
+pub fn sync(cf_api_tokens: &[&str], tunnel_tokens: &[(String, String)]) -> SyncResult {
     let cf_tunnels = list_tunnels();
 
     // Decode all tunnel tokens to get (name, account_id, tunnel_id) triples
@@ -104,22 +105,22 @@ pub fn sync(cf_api_token: Option<&str>, tunnel_tokens: &[(String, String)]) -> S
         })
         .collect();
 
-    // Collect all available API tokens: cert.pem + cf_api_token from config
-    let mut api_tokens: Vec<String> = Vec::new();
-    if let Some(token) = cf_api_token {
-        if !token.is_empty() {
-            api_tokens.push(token.to_string());
-        }
-    }
+    // Collect all available API tokens: user-configured + cert.pem
+    let mut api_tokens: Vec<String> = cf_api_tokens.iter()
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .collect();
     if let Some(cert_creds) = load_api_creds_from_cert() {
-        api_tokens.push(cert_creds.api_token);
+        if !api_tokens.iter().any(|t| t == &cert_creds.api_token) {
+            api_tokens.push(cert_creds.api_token);
+        }
     }
 
     if api_tokens.is_empty() {
         let status = if cf_tunnels.is_empty() {
-            "No CF auth — run 'cloudflared tunnel login' or set cf_api_token in config".to_string()
+            "No CF auth — set cf_api_tokens in config (one per account)".to_string()
         } else {
-            format!("Synced {} tunnel(s) — set cf_api_token for ingress routes", cf_tunnels.len())
+            format!("Synced {} tunnel(s) — set cf_api_tokens for ingress routes", cf_tunnels.len())
         };
         return SyncResult { tunnels: cf_tunnels, ingress_routes: HashMap::new(), status };
     }
@@ -146,31 +147,29 @@ pub fn sync(cf_api_token: Option<&str>, tunnel_tokens: &[(String, String)]) -> S
     let mut port_map: HashMap<u16, Vec<IngressRoute>> = HashMap::new();
     let mut total_routes = 0;
     let mut accounts_reached = 0;
+    let mut unreached_accounts = 0;
 
     for (account_id, tunnels) in &accounts {
-        // Try each API token until one works for this account
-        let mut got_routes = false;
+        // Try each API token until one succeeds for this account
+        let mut account_ok = false;
         for api_token in &api_tokens {
             let creds = ApiCreds {
                 account_id: account_id.clone(),
                 api_token: api_token.clone(),
             };
 
-            // Try the first tunnel to see if this token works for this account
-            if let Some((_, first_id)) = tunnels.first() {
-                let test = fetch_tunnel_config(&creds, first_id);
-                // If we get an empty result, the token might not have access — but it could
-                // also be a tunnel with no ingress. We proceed optimistically.
-                let _ = test; // we'll collect below
+            // Probe: try the first tunnel to check if this token has access
+            let probe_ok = tunnels.first()
+                .map(|(_, id)| fetch_tunnel_config_check(&creds, id))
+                .unwrap_or(false);
+
+            if !probe_ok {
+                continue; // this token can't access this account, try next
             }
 
-            // Fetch ingress for all tunnels in this account
+            // This token works — fetch ingress for all tunnels in this account
             for (name, tunnel_id) in tunnels {
                 let ingress = fetch_tunnel_config(&creds, tunnel_id);
-                if ingress.is_empty() {
-                    continue;
-                }
-                got_routes = true;
                 for rule in ingress {
                     let hostname = match rule.hostname {
                         Some(h) => h,
@@ -190,19 +189,27 @@ pub fn sync(cf_api_token: Option<&str>, tunnel_tokens: &[(String, String)]) -> S
                 }
             }
 
-            if got_routes {
-                accounts_reached += 1;
-                break; // this token worked for this account
-            }
+            account_ok = true;
+            accounts_reached += 1;
+            break;
+        }
+
+        if !account_ok {
+            unreached_accounts += 1;
         }
     }
 
-    let status = format!(
-        "Synced {} tunnel(s), {} route(s) from {} account(s)",
-        cf_tunnels.len(),
-        total_routes,
-        accounts_reached,
-    );
+    let status = if unreached_accounts > 0 {
+        format!(
+            "Synced {} route(s) from {} account(s) — {} account(s) need cf_api_tokens",
+            total_routes, accounts_reached, unreached_accounts,
+        )
+    } else {
+        format!(
+            "Synced {} route(s) from {} account(s)",
+            total_routes, accounts_reached,
+        )
+    };
 
     SyncResult { tunnels: cf_tunnels, ingress_routes: port_map, status }
 }
@@ -213,6 +220,28 @@ fn parse_port_from_service(service: &str) -> Option<u16> {
         .rsplit(':')
         .next()
         .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
+}
+
+/// Check if an API token has access to a tunnel's account (returns true if API responds with success)
+fn fetch_tunnel_config_check(creds: &ApiCreds, tunnel_id: &str) -> bool {
+    let url = format!(
+        "https://api.cloudflare.com/client/v4/accounts/{}/cfd_tunnel/{}/configurations",
+        creds.account_id, tunnel_id
+    );
+
+    let output = Command::new("curl")
+        .args(["-s", &url, "-H", &format!("Authorization: Bearer {}", creds.api_token)])
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return false,
+    };
+
+    // Just check if the API returned success (vs auth error)
+    serde_json::from_slice::<CfConfigResponse>(&output)
+        .map(|r| r.success)
+        .unwrap_or(false)
 }
 
 /// Fetch ingress config for a single tunnel via the CF API

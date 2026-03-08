@@ -76,7 +76,8 @@ impl App {
         let tunnel_tokens: Vec<(String, String)> = config.tunnels.iter()
             .map(|t| (t.name.clone(), t.token.clone()))
             .collect();
-        let sync = cloudflare::sync(config.cf_api_token.as_deref(), &tunnel_tokens);
+        let cf_tokens = config.all_cf_api_tokens();
+        let sync = cloudflare::sync(&cf_tokens, &tunnel_tokens);
         let mut app = Self {
             config,
             tab: Tab::Tunnels,
@@ -190,7 +191,8 @@ impl App {
         let tunnel_tokens: Vec<(String, String)> = self.config.tunnels.iter()
             .map(|t| (t.name.clone(), t.token.clone()))
             .collect();
-        let sync = cloudflare::sync(self.config.cf_api_token.as_deref(), &tunnel_tokens);
+        let cf_tokens = self.config.all_cf_api_tokens();
+        let sync = cloudflare::sync(&cf_tokens, &tunnel_tokens);
         self.cf_tunnels = sync.tunnels;
         self.ingress_routes = sync.ingress_routes;
         self.status_msg = Some(sync.status);
