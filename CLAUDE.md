@@ -10,7 +10,7 @@ A k9s-style TUI for managing cloudflared tunnels and local services on macOS.
 - **scan.rs** — Service discovery via `lsof`: find listening TCP ports, resolve project names from process cwd
 - **app.rs** — App state, tab system (Services/Tunnels), mode machine, CF + scan integration, submenu toggle
 - **ui.rs** — ratatui rendering: tab header, tunnel/service tables, dialogs, two-level keybinding bar
-- **main.rs** — crossterm event loop, key handlers per mode, CLI subcommands (`list`, `import`, `routes`, `route add/rm`)
+- **main.rs** — crossterm event loop, key handlers per mode, full CLI subcommands (tunnel lifecycle, routes, services, tokens, sync)
 
 ## Build & Install
 
@@ -35,6 +35,7 @@ Or via Homebrew: `brew install dorky-robot/tap/tunnels`
 | j/k | Navigate |
 | a | Add service |
 | e | Edit service |
+| m | Rename URL (subdomain) |
 | d | Untrack service |
 | . | Toggle secondary actions |
 | q | Quit |
@@ -70,10 +71,35 @@ Or via Homebrew: `brew install dorky-robot/tap/tunnels`
 ## CLI Subcommands
 
 ```
-tunnels                    # Launch TUI
-tunnels list [--json]      # List tunnels
-tunnels routes [TUNNEL]    # List ingress routes
-tunnels route add <hostname> <port> --tunnel <name>  # Idempotent
-tunnels route rm <hostname> --tunnel <name>
-tunnels import             # Import existing plists
+# TUI
+tunnels                              # Launch TUI
+
+# Tunnel lifecycle
+tunnels list [--json]                # List tunnels
+tunnels start <name>                 # Start a tunnel
+tunnels stop <name>                  # Stop a tunnel
+tunnels restart <name>               # Restart a tunnel
+tunnels logs <name> [--lines N]      # View tunnel logs
+tunnels add <name> --token <token>   # Add a new tunnel
+tunnels rm <name>                    # Delete a tunnel
+tunnels rename <old> <new>           # Rename a tunnel
+tunnels import                       # Import existing plists
+
+# Routes
+tunnels routes [TUNNEL] [--json]     # List ingress routes
+tunnels route add <host> <port> --tunnel <name>  # Idempotent
+tunnels route rm <host> --tunnel <name>
+tunnels route mv <old> <new> --tunnel <name>
+
+# Services
+tunnels service list [--json]        # List tracked services
+tunnels service add <name> --port <p> [--tunnel <t>] [--memo <m>]
+tunnels service rm <name>            # Remove a service
+tunnels service edit <name> [--port <p>] [--tunnel <t>] [--memo <m>]
+tunnels service scan                 # Scan for listening ports
+
+# Tokens & sync
+tunnels token add <token>            # Add CF API token
+tunnels token edit <tunnel> --token <token>  # Set per-tunnel token
+tunnels sync                         # Sync from Cloudflare API
 ```

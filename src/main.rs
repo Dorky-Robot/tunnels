@@ -27,7 +27,7 @@ fn main() -> Result<()> {
             "routes" => return cli_routes(args.get(2).map(|s| s.as_str()), json_flag),
             "route" => {
                 if args.len() < 3 {
-                    eprintln!("Usage: tunnels route <add|rm|fix> [args]");
+                    eprintln!("Usage: tunnels route <add|rm|mv> [args]");
                     std::process::exit(1);
                 }
                 match args[2].as_str() {
@@ -40,20 +40,47 @@ fn main() -> Result<()> {
                     }
                 }
             }
+            "start" => return cli_start(args.get(2).map(|s| s.as_str())),
+            "stop" => return cli_stop(args.get(2).map(|s| s.as_str())),
+            "restart" => return cli_restart(args.get(2).map(|s| s.as_str())),
+            "logs" => return cli_logs(args.get(2).map(|s| s.as_str()), &args[2..]),
+            "add" => return cli_add(&args[2..]),
+            "rm" | "remove" => return cli_rm(args.get(2).map(|s| s.as_str())),
+            "rename" => return cli_rename(&args[2..]),
+            "token" => {
+                if args.len() < 3 {
+                    eprintln!("Usage: tunnels token <add|edit> [args]");
+                    std::process::exit(1);
+                }
+                match args[2].as_str() {
+                    "add" => return cli_token_add(args.get(3).map(|s| s.as_str())),
+                    "edit" => return cli_token_edit(&args[3..]),
+                    _ => {
+                        eprintln!("Unknown token command: {}", args[2]);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            "service" => {
+                if args.len() < 3 {
+                    eprintln!("Usage: tunnels service <list|add|rm|edit|scan> [args]");
+                    std::process::exit(1);
+                }
+                match args[2].as_str() {
+                    "list" | "ls" => return cli_service_list(json_flag),
+                    "add" => return cli_service_add(&args[3..]),
+                    "rm" | "remove" => return cli_service_rm(&args[3..]),
+                    "edit" => return cli_service_edit(&args[3..]),
+                    "scan" => return cli_service_scan(),
+                    _ => {
+                        eprintln!("Unknown service command: {}", args[2]);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            "sync" => return cli_sync(),
             "help" | "--help" | "-h" => {
-                println!("tunnels — cloudflared tunnel manager");
-                println!();
-                println!("  tunnels              Launch TUI");
-                println!("  tunnels list [--json] List tunnels");
-                println!("  tunnels routes [TUNNEL] [--json]");
-                println!("                       List ingress routes (all or for a tunnel)");
-                println!("  tunnels route add <hostname> <port|service> --tunnel <name>");
-                println!("                       Add a subdomain mapping (idempotent, retries DNS)");
-                println!("  tunnels route rm <hostname> --tunnel <name>");
-                println!("                       Remove a subdomain mapping");
-                println!("  tunnels route mv <old-hostname> <new-hostname> --tunnel <name>");
-                println!("                       Rename a subdomain (keeps same service)");
-                println!("  tunnels import       Import existing plists");
+                print_help();
                 return Ok(());
             }
             _ => {}
@@ -887,4 +914,337 @@ fn parse_flag(args: &[String], flag: &str) -> Option<String> {
         .position(|a| a == flag)
         .and_then(|i| args.get(i + 1))
         .cloned()
+}
+
+fn print_help() {
+    println!("tunnels — k9s-style TUI for managing cloudflared tunnels and local services");
+    println!();
+    println!("USAGE:");
+    println!("  tunnels                              Launch TUI");
+    println!("  tunnels <command> [args]              Run a CLI command");
+    println!();
+    println!("TUNNEL COMMANDS:");
+    println!("  list [--json]                         List tunnels");
+    println!("  start <name>                          Start a tunnel");
+    println!("  stop <name>                           Stop a tunnel");
+    println!("  restart <name>                        Restart a tunnel");
+    println!("  logs <name> [--lines N]               View tunnel logs (default 50 lines)");
+    println!("  add <name> --token <token>            Add a new tunnel");
+    println!("  rm <name>                             Delete a tunnel");
+    println!("  rename <old> <new>                    Rename a tunnel");
+    println!("  import                                Import existing cloudflared plists");
+    println!();
+    println!("ROUTE COMMANDS:");
+    println!("  routes [tunnel] [--json]              List ingress routes");
+    println!("  route add <host> <port> --tunnel <n>  Add a route (idempotent)");
+    println!("  route rm <host> --tunnel <name>       Remove a route");
+    println!("  route mv <old> <new> --tunnel <name>  Rename a route");
+    println!();
+    println!("SERVICE COMMANDS:");
+    println!("  service list [--json]                 List tracked services");
+    println!("  service add <name> --port <p> [--tunnel <t>] [--memo <m>]");
+    println!("                                        Add a service");
+    println!("  service rm <name>                     Remove a service");
+    println!("  service edit <name> [--port <p>] [--tunnel <t>] [--memo <m>]");
+    println!("                                        Edit a service");
+    println!("  service scan                          Scan for listening ports");
+    println!();
+    println!("TOKEN COMMANDS:");
+    println!("  token add <token>                     Add a Cloudflare API token");
+    println!("  token edit <tunnel> --token <token>   Set per-tunnel token");
+    println!();
+    println!("OTHER:");
+    println!("  sync                                  Sync from Cloudflare API");
+    println!("  help                                  Show this help");
+}
+
+fn cli_start(name: Option<&str>) -> Result<()> {
+    let name = name.ok_or_else(|| anyhow::anyhow!("Usage: tunnels start <name>"))?;
+    let config = config::Config::load()?;
+    let tunnel = config.tunnels.iter()
+        .find(|t| t.name == name)
+        .ok_or_else(|| anyhow::anyhow!("tunnel '{}' not found", name))?;
+
+    launchd::start(name, &tunnel.token)?;
+    println!("✓ Started {}", name);
+    Ok(())
+}
+
+fn cli_stop(name: Option<&str>) -> Result<()> {
+    let name = name.ok_or_else(|| anyhow::anyhow!("Usage: tunnels stop <name>"))?;
+    let config = config::Config::load()?;
+    if !config.tunnels.iter().any(|t| t.name == name) {
+        anyhow::bail!("tunnel '{}' not found", name);
+    }
+
+    launchd::stop(name)?;
+    println!("✓ Stopped {}", name);
+    Ok(())
+}
+
+fn cli_restart(name: Option<&str>) -> Result<()> {
+    let name = name.ok_or_else(|| anyhow::anyhow!("Usage: tunnels restart <name>"))?;
+    let config = config::Config::load()?;
+    let tunnel = config.tunnels.iter()
+        .find(|t| t.name == name)
+        .ok_or_else(|| anyhow::anyhow!("tunnel '{}' not found", name))?;
+
+    launchd::restart(name, &tunnel.token)?;
+    println!("✓ Restarted {}", name);
+    Ok(())
+}
+
+fn cli_logs(name: Option<&str>, args: &[String]) -> Result<()> {
+    let name = name.ok_or_else(|| anyhow::anyhow!("Usage: tunnels logs <name> [--lines N]"))?;
+    let config = config::Config::load()?;
+    if !config.tunnels.iter().any(|t| t.name == name) {
+        anyhow::bail!("tunnel '{}' not found", name);
+    }
+
+    let lines: usize = parse_flag(args, "--lines")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
+
+    let output = launchd::read_logs(name, lines)?;
+    if output.is_empty() {
+        println!("No logs found for '{}'.", name);
+    } else {
+        print!("{}", output);
+    }
+    Ok(())
+}
+
+fn cli_add(args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        eprintln!("Usage: tunnels add <name> --token <token>");
+        std::process::exit(1);
+    }
+
+    let name = &args[0];
+    let token = parse_flag(args, "--token")
+        .ok_or_else(|| anyhow::anyhow!("--token <token> is required"))?;
+
+    let mut config = config::Config::load()?;
+    config.add(name.clone(), token)?;
+    println!("✓ Added tunnel '{}'", name);
+    Ok(())
+}
+
+fn cli_rm(name: Option<&str>) -> Result<()> {
+    let name = name.ok_or_else(|| anyhow::anyhow!("Usage: tunnels rm <name>"))?;
+    let mut config = config::Config::load()?;
+
+    // Stop if running
+    launchd::stop(name)?;
+
+    config.remove(name)?;
+    println!("✓ Removed tunnel '{}'", name);
+    Ok(())
+}
+
+fn cli_rename(args: &[String]) -> Result<()> {
+    if args.len() < 2 {
+        eprintln!("Usage: tunnels rename <old-name> <new-name>");
+        std::process::exit(1);
+    }
+
+    let old_name = &args[0];
+    let new_name = &args[1];
+
+    let mut config = config::Config::load()?;
+
+    // If running, restart with new name
+    let was_running = matches!(launchd::status(old_name), launchd::Status::Running { .. });
+    if was_running {
+        launchd::stop(old_name)?;
+    }
+
+    let token = config.tunnels.iter()
+        .find(|t| t.name == *old_name)
+        .map(|t| t.token.clone())
+        .ok_or_else(|| anyhow::anyhow!("tunnel '{}' not found", old_name))?;
+
+    config.rename(old_name, new_name.clone())?;
+
+    if was_running {
+        launchd::start(new_name, &token)?;
+    }
+
+    println!("✓ Renamed '{}' → '{}'", old_name, new_name);
+    Ok(())
+}
+
+fn cli_token_add(token: Option<&str>) -> Result<()> {
+    let token = token.ok_or_else(|| anyhow::anyhow!("Usage: tunnels token add <token>"))?;
+    let mut config = config::Config::load()?;
+    config.add_api_token(token.to_string())?;
+    println!("✓ API token added");
+    Ok(())
+}
+
+fn cli_token_edit(args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        eprintln!("Usage: tunnels token edit <tunnel-name> --token <token>");
+        std::process::exit(1);
+    }
+
+    let tunnel_name = &args[0];
+    let token = parse_flag(args, "--token")
+        .ok_or_else(|| anyhow::anyhow!("--token <token> is required"))?;
+
+    let mut config = config::Config::load()?;
+    config.update_token(tunnel_name, token)?;
+    println!("✓ Token updated for '{}'", tunnel_name);
+    Ok(())
+}
+
+fn cli_service_list(json: bool) -> Result<()> {
+    let config = config::Config::load()?;
+    if config.services.is_empty() {
+        if json {
+            println!("[]");
+        } else {
+            println!("No services tracked.");
+        }
+        return Ok(());
+    }
+
+    if json {
+        let items: Vec<serde_json::Value> = config.services.iter().map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "port": s.port,
+                "tunnel": s.tunnel,
+                "memo": s.memo,
+            })
+        }).collect();
+        println!("{}", serde_json::to_string_pretty(&items)?);
+    } else {
+        println!("{:<20} {:<8} {:<18} {}", "NAME", "PORT", "TUNNEL", "MEMO");
+        println!("{:<20} {:<8} {:<18} {}", "────────────────────", "────────", "──────────────────", "────────────────");
+        for s in &config.services {
+            println!("{:<20} {:<8} {:<18} {}",
+                s.name,
+                s.port,
+                s.tunnel.as_deref().unwrap_or("—"),
+                s.memo.as_deref().unwrap_or(""),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cli_service_add(args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        eprintln!("Usage: tunnels service add <name> --port <port> [--tunnel <tunnel>] [--memo <memo>]");
+        std::process::exit(1);
+    }
+
+    let name = &args[0];
+    let port: u16 = parse_flag(args, "--port")
+        .ok_or_else(|| anyhow::anyhow!("--port <port> is required"))?
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid port number"))?;
+    let tunnel = parse_flag(args, "--tunnel");
+    let memo = parse_flag(args, "--memo");
+
+    let mut config = config::Config::load()?;
+    config.add_service(name.clone(), port, tunnel, memo)?;
+    println!("✓ Added service '{}' on port {}", name, port);
+    Ok(())
+}
+
+fn cli_service_rm(args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        eprintln!("Usage: tunnels service rm <name>");
+        std::process::exit(1);
+    }
+
+    let name = &args[0];
+    let mut config = config::Config::load()?;
+    let idx = config.services.iter().position(|s| s.name == *name)
+        .ok_or_else(|| anyhow::anyhow!("service '{}' not found", name))?;
+    config.remove_service_by_idx(idx)?;
+    println!("✓ Removed service '{}'", name);
+    Ok(())
+}
+
+fn cli_service_edit(args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        eprintln!("Usage: tunnels service edit <name> [--port <port>] [--tunnel <tunnel>] [--memo <memo>]");
+        std::process::exit(1);
+    }
+
+    let name = &args[0];
+    let mut config = config::Config::load()?;
+    let idx = config.services.iter().position(|s| s.name == *name)
+        .ok_or_else(|| anyhow::anyhow!("service '{}' not found", name))?;
+
+    let existing = &config.services[idx];
+    let port: u16 = parse_flag(args, "--port")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(existing.port);
+    let tunnel = parse_flag(args, "--tunnel").or_else(|| existing.tunnel.clone());
+    let memo = parse_flag(args, "--memo").or_else(|| existing.memo.clone());
+
+    config.update_service(idx, name.clone(), port, tunnel, memo)?;
+    println!("✓ Updated service '{}'", name);
+    Ok(())
+}
+
+fn cli_service_scan() -> Result<()> {
+    let discovered = scan::scan_services();
+    if discovered.is_empty() {
+        println!("No listening services found.");
+        return Ok(());
+    }
+
+    println!("{:<20} {}", "NAME", "PORT");
+    println!("{:<20} {}", "────────────────────", "────────");
+    for s in &discovered {
+        println!("{:<20} {}", s.name, s.port);
+    }
+    println!();
+    println!("{} service(s) found. Use 'tunnels service add' to track them.", discovered.len());
+    Ok(())
+}
+
+fn cli_sync() -> Result<()> {
+    let config = config::Config::load()?;
+    let api_tokens = config.all_cf_api_tokens();
+
+    if api_tokens.is_empty() {
+        eprintln!("No API tokens configured. Add one with: tunnels token add <token>");
+        std::process::exit(1);
+    }
+
+    let tunnel_tokens: Vec<(String, String)> = config.tunnels.iter()
+        .map(|t| (t.name.clone(), t.token.clone()))
+        .collect();
+
+    println!("Syncing from Cloudflare...");
+    let result = cloudflare::sync(&api_tokens, &tunnel_tokens);
+    println!("{}", result.status);
+
+    if !result.unreached.is_empty() {
+        println!();
+        for u in &result.unreached {
+            println!("  ⚠ Account {} — tunnels: {}", &u.account_id[..8.min(u.account_id.len())], u.tunnel_names.join(", "));
+        }
+    }
+
+    if !result.ingress_routes.is_empty() {
+        println!();
+        println!("{:<8} {:<35} {}", "PORT", "HOSTNAME", "TUNNEL");
+        println!("{:<8} {:<35} {}", "────────", "───────────────────────────────────", "────────────────");
+        let mut routes: Vec<_> = result.ingress_routes.iter().collect();
+        routes.sort_by_key(|(port, _)| *port);
+        for (port, entries) in routes {
+            for entry in entries {
+                println!("{:<8} {:<35} {}", port, entry.hostname, entry.tunnel_name);
+            }
+        }
+    }
+
+    Ok(())
 }
