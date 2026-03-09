@@ -79,6 +79,10 @@ fn main() -> Result<()> {
                 }
             }
             "sync" => return cli_sync(),
+            "--version" | "-v" | "-V" => {
+                println!("tunnels {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
             "help" | "--help" | "-h" => {
                 print_help();
                 return Ok(());
@@ -955,7 +959,8 @@ fn print_help() {
     println!();
     println!("OTHER:");
     println!("  sync                                  Sync from Cloudflare API");
-    println!("  help                                  Show this help");
+    println!("  help, --help, -h                      Show this help");
+    println!("  --version, -v                         Show version");
 }
 
 fn cli_start(name: Option<&str>) -> Result<()> {
