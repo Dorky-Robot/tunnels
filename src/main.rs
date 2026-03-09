@@ -33,6 +33,7 @@ fn main() -> Result<()> {
                 match args[2].as_str() {
                     "add" => return cli_route_add(&args[3..]),
                     "rm" | "remove" => return cli_route_rm(&args[3..]),
+                    "mv" | "rename" => return cli_route_mv(&args[3..]),
                     _ => {
                         eprintln!("Unknown route command: {}", args[2]);
                         std::process::exit(1);
@@ -50,6 +51,8 @@ fn main() -> Result<()> {
                 println!("                       Add a subdomain mapping (idempotent, retries DNS)");
                 println!("  tunnels route rm <hostname> --tunnel <name>");
                 println!("                       Remove a subdomain mapping");
+                println!("  tunnels route mv <old-hostname> <new-hostname> --tunnel <name>");
+                println!("                       Rename a subdomain (keeps same service)");
                 println!("  tunnels import       Import existing plists");
                 return Ok(());
             }
@@ -97,6 +100,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mu
                     Mode::AddingApiToken { .. } => handle_adding_api_token(app, key.code),
                     Mode::Routes { .. } => handle_routes(app, key.code),
                     Mode::AddingRoute { .. } => handle_adding_route(app, key.code),
+                    Mode::RenamingRoute { .. } => handle_renaming_route(app, key.code),
                     Mode::ConfirmingRouteDelete { .. } => handle_confirming_route_delete(app, key.code),
                     Mode::Logs { .. } | Mode::Help => {
                         if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
@@ -451,6 +455,9 @@ fn handle_routes(app: &mut App, code: KeyCode) {
         KeyCode::Char('a') => {
             app.begin_add_route();
         }
+        KeyCode::Char('n') => {
+            app.begin_rename_route();
+        }
         KeyCode::Char('d') => {
             app.confirm_delete_route();
         }
@@ -494,6 +501,34 @@ fn handle_adding_route(app: &mut App, code: KeyCode) {
                 RouteField::Service => service,
             };
             s.push(c);
+        }
+        _ => {}
+    }
+}
+
+fn handle_renaming_route(app: &mut App, code: KeyCode) {
+    let Mode::RenamingRoute { tunnel_name, api_token, account_id, tunnel_id, old_hostname, service, new_hostname } = &mut app.mode else {
+        return;
+    };
+
+    match code {
+        KeyCode::Esc => app.mode = Mode::Normal,
+        KeyCode::Enter => {
+            if !new_hostname.is_empty() {
+                let (tn, at, ai, ti, oh, svc, nh) = (
+                    tunnel_name.clone(), api_token.clone(),
+                    account_id.clone(), tunnel_id.clone(),
+                    old_hostname.clone(), service.clone(),
+                    new_hostname.clone(),
+                );
+                app.finish_rename_route(tn, at, ai, ti, oh, svc, nh);
+            }
+        }
+        KeyCode::Backspace => {
+            new_hostname.pop();
+        }
+        KeyCode::Char(c) => {
+            new_hostname.push(c);
         }
         _ => {}
     }
@@ -774,6 +809,70 @@ fn cli_route_rm(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn cli_route_mv(args: &[String]) -> Result<()> {
+    if args.len() < 2 {
+        eprintln!("Usage: tunnels route mv <old-hostname> <new-hostname> --tunnel <name>");
+        std::process::exit(1);
+    }
+
+    let old_hostname = &args[0];
+    let new_hostname = &args[1];
+    let tunnel_name = parse_flag(args, "--tunnel")
+        .ok_or_else(|| anyhow::anyhow!("--tunnel <name> is required"))?;
+
+    let config = config::Config::load()?;
+    let (api_token, account_id, tunnel_id) = resolve_tunnel(&config, &tunnel_name)?;
+
+    // Find the existing route's service
+    let routes = cloudflare::list_routes(&api_token, &account_id, &tunnel_id);
+    let old_route = routes.iter()
+        .find(|r| r.hostname.as_deref() == Some(old_hostname.as_str()))
+        .ok_or_else(|| anyhow::anyhow!("route '{}' not found on tunnel '{}'", old_hostname, tunnel_name))?;
+    let service = old_route.service.clone();
+
+    println!("Renaming {} → {}", old_hostname, new_hostname);
+    println!("  Service: {}", service);
+    println!();
+
+    // Add new route first (idempotent)
+    match cloudflare::add_route(&api_token, &account_id, &tunnel_id, new_hostname, &service) {
+        Ok(cloudflare::RouteResult::Ok) => {
+            println!("✓ {} created (route + DNS)", new_hostname);
+        }
+        Ok(cloudflare::RouteResult::AlreadyExists) => {
+            println!("✓ {} already exists", new_hostname);
+        }
+        Ok(cloudflare::RouteResult::DnsFailure(ref e)) => {
+            println!("⚠ {} route ok, DNS failed: {}", new_hostname, e);
+            println!("  Re-run to retry DNS.");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("✗ Failed to create {}: {}", new_hostname, e);
+            std::process::exit(1);
+        }
+    }
+
+    // Remove old route
+    match cloudflare::remove_route(&api_token, &account_id, &tunnel_id, old_hostname) {
+        Ok(cloudflare::RouteResult::Ok) => {
+            println!("✓ {} removed (route + DNS)", old_hostname);
+        }
+        Ok(cloudflare::RouteResult::DnsFailure(ref e)) => {
+            println!("⚠ {} route removed, DNS cleanup failed: {}", old_hostname, e);
+        }
+        Ok(cloudflare::RouteResult::AlreadyExists) => unreachable!(),
+        Err(e) => {
+            eprintln!("⚠ New route ok but failed to remove old: {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    println!();
+    println!("✓ Renamed {} → {}", old_hostname, new_hostname);
+
+    Ok(())
+}
 
 fn parse_flag(args: &[String], flag: &str) -> Option<String> {
     args.iter()

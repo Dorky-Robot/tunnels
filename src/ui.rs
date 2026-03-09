@@ -71,6 +71,9 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::AddingRoute { tunnel_name, field, hostname, service, .. } => {
             draw_add_route_dialog(f, tunnel_name, field, hostname, service);
         }
+        Mode::RenamingRoute { old_hostname, new_hostname, .. } => {
+            draw_rename_route_dialog(f, old_hostname, new_hostname);
+        }
         Mode::ConfirmingRouteDelete { hostname, .. } => {
             draw_confirm_dialog(f, "remove route", hostname);
         }
@@ -241,9 +244,14 @@ fn draw_keybindings(f: &mut Frame, app: &App, area: Rect) {
         ],
         Mode::Routes { .. } => vec![
             ("j/k", "nav"),
-            ("a", "add route"),
-            ("d", "delete route"),
+            ("a", "add"),
+            ("n", "rename"),
+            ("d", "delete"),
             ("Esc", "back"),
+        ],
+        Mode::RenamingRoute { .. } => vec![
+            ("Enter", "confirm"),
+            ("Esc", "cancel"),
         ],
         Mode::AddingRoute { .. } => vec![
             ("Tab", "next field"),
@@ -778,6 +786,37 @@ fn draw_add_route_dialog(f: &mut Frame, tunnel_name: &str, field: &RouteField, h
         Paragraph::new(format!("  Service:  {}{}", service, cursor(RouteField::Service, field)))
             .style(field_style(RouteField::Service, field)),
         chunks[3],
+    );
+}
+
+fn draw_rename_route_dialog(f: &mut Frame, old_hostname: &str, new_hostname: &str) {
+    let area = fixed_centered_rect(65, 7, f.area());
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(format!(" Rename '{}' ", old_hostname))
+        .title_style(Style::default().fg(CYAN).bold())
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(CYAN));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+
+    f.render_widget(
+        Paragraph::new("  New hostname:").style(Style::default().fg(DIM)),
+        chunks[0],
+    );
+    f.render_widget(
+        Paragraph::new(format!("  > {}_", new_hostname))
+            .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        chunks[2],
     );
 }
 

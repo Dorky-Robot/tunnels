@@ -42,6 +42,15 @@ pub enum Mode {
         hostname: String,
         service: String,
     },
+    RenamingRoute {
+        tunnel_name: String,
+        api_token: String,
+        account_id: String,
+        tunnel_id: String,
+        old_hostname: String,
+        service: String,
+        new_hostname: String,
+    },
     ConfirmingRouteDelete {
         tunnel_name: String,
         api_token: String,
@@ -662,6 +671,66 @@ impl App {
             hostname: String::new(),
             service: "http://localhost:".into(),
         };
+    }
+
+    pub fn begin_rename_route(&mut self) {
+        let Mode::Routes { tunnel_name, api_token, account_id, tunnel_id, routes, selected } = &self.mode else {
+            return;
+        };
+        if let Some(route) = routes.get(*selected) {
+            if route.hostname == "(catch-all)" {
+                self.status_msg = Some("Cannot rename catch-all route".into());
+                return;
+            }
+            self.mode = Mode::RenamingRoute {
+                tunnel_name: tunnel_name.clone(),
+                api_token: api_token.clone(),
+                account_id: account_id.clone(),
+                tunnel_id: tunnel_id.clone(),
+                old_hostname: route.hostname.clone(),
+                service: route.service.clone(),
+                new_hostname: route.hostname.clone(),
+            };
+        }
+    }
+
+    pub fn finish_rename_route(&mut self, tunnel_name: String, api_token: String, account_id: String, tunnel_id: String, old_hostname: String, service: String, new_hostname: String) {
+        if old_hostname == new_hostname {
+            self.status_msg = Some("Name unchanged".into());
+            self.reload_routes(tunnel_name, api_token, account_id, tunnel_id);
+            return;
+        }
+
+        // Add new route first
+        match cloudflare::add_route(&api_token, &account_id, &tunnel_id, &new_hostname, &service) {
+            Ok(cloudflare::RouteResult::Ok | cloudflare::RouteResult::AlreadyExists) => {}
+            Ok(cloudflare::RouteResult::DnsFailure(ref e)) => {
+                self.status_msg = Some(format!("⚠ New route ok, DNS failed: {} — re-run m to fix", e));
+                self.reload_routes(tunnel_name, api_token, account_id, tunnel_id);
+                return;
+            }
+            Err(e) => {
+                self.status_msg = Some(format!("✗ Failed to create {}: {}", new_hostname, e));
+                self.mode = Mode::Normal;
+                return;
+            }
+        }
+
+        // Remove old route
+        match cloudflare::remove_route(&api_token, &account_id, &tunnel_id, &old_hostname) {
+            Ok(cloudflare::RouteResult::Ok) => {
+                self.status_msg = Some(format!("✓ Renamed {} → {}", old_hostname, new_hostname));
+            }
+            Ok(cloudflare::RouteResult::DnsFailure(ref e)) => {
+                self.status_msg = Some(format!("⚠ Renamed, old DNS cleanup failed: {}", e));
+            }
+            Ok(cloudflare::RouteResult::AlreadyExists) => unreachable!(),
+            Err(e) => {
+                self.status_msg = Some(format!("⚠ New route ok, old removal failed: {}", e));
+            }
+        }
+
+        self.reload_routes(tunnel_name, api_token, account_id, tunnel_id);
     }
 
     pub fn confirm_delete_route(&mut self) {
