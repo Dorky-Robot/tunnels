@@ -6,7 +6,7 @@ mod scan;
 mod ui;
 
 use anyhow::Result;
-use app::{AddField, App, Mode, ServiceField, Tab};
+use app::{AddField, App, Mode, RouteField, ServiceField, Tab};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -20,15 +20,37 @@ fn main() -> Result<()> {
     // Handle CLI args for non-interactive use
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 {
+        let json_flag = args.iter().any(|a| a == "--json" || a == "-j");
         match args[1].as_str() {
-            "list" | "ls" => return cli_list(),
+            "list" | "ls" => return cli_list(json_flag),
             "import" => return cli_import(),
+            "routes" => return cli_routes(args.get(2).map(|s| s.as_str()), json_flag),
+            "route" => {
+                if args.len() < 3 {
+                    eprintln!("Usage: tunnels route <add|rm|fix> [args]");
+                    std::process::exit(1);
+                }
+                match args[2].as_str() {
+                    "add" => return cli_route_add(&args[3..]),
+                    "rm" | "remove" => return cli_route_rm(&args[3..]),
+                    _ => {
+                        eprintln!("Unknown route command: {}", args[2]);
+                        std::process::exit(1);
+                    }
+                }
+            }
             "help" | "--help" | "-h" => {
                 println!("tunnels — cloudflared tunnel manager");
                 println!();
-                println!("  tunnels          Launch TUI");
-                println!("  tunnels list     List tunnels");
-                println!("  tunnels import   Import existing plists");
+                println!("  tunnels              Launch TUI");
+                println!("  tunnels list [--json] List tunnels");
+                println!("  tunnels routes [TUNNEL] [--json]");
+                println!("                       List ingress routes (all or for a tunnel)");
+                println!("  tunnels route add <hostname> <port|service> --tunnel <name>");
+                println!("                       Add a subdomain mapping (idempotent, retries DNS)");
+                println!("  tunnels route rm <hostname> --tunnel <name>");
+                println!("                       Remove a subdomain mapping");
+                println!("  tunnels import       Import existing plists");
                 return Ok(());
             }
             _ => {}
@@ -62,8 +84,8 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mu
                 }
 
                 match &app.mode {
-                    Mode::Normal if app.tab == Tab::Services => handle_services_normal(app, key.code),
-                    Mode::Normal => handle_normal(app, key.code),
+                    Mode::Normal if app.tab == Tab::Tunnels => handle_normal(app, key.code),
+                    Mode::Normal => handle_services_normal(app, key.code),
                     Mode::Adding { .. } => handle_adding(app, key.code),
                     Mode::Editing { .. } => handle_editing(app, key.code),
                     Mode::Renaming { .. } => handle_renaming(app, key.code),
@@ -73,6 +95,9 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mu
                     Mode::EditingService { .. } => handle_editing_service(app, key.code),
                     Mode::ConfirmingServiceDelete { .. } => handle_confirming_service_delete(app, key.code),
                     Mode::AddingApiToken { .. } => handle_adding_api_token(app, key.code),
+                    Mode::Routes { .. } => handle_routes(app, key.code),
+                    Mode::AddingRoute { .. } => handle_adding_route(app, key.code),
+                    Mode::ConfirmingRouteDelete { .. } => handle_confirming_route_delete(app, key.code),
                     Mode::Logs { .. } | Mode::Help => {
                         if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                             app.mode = Mode::Normal;
@@ -91,8 +116,13 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mu
 fn handle_normal(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
-        KeyCode::Char('1') => app.tab = Tab::Tunnels,
-        KeyCode::Char('2') => app.tab = Tab::Services,
+        KeyCode::Char('1') => { app.tab = Tab::Services; app.submenu = false; }
+        KeyCode::Char('2') => { app.tab = Tab::Tunnels; app.submenu = false; }
+        KeyCode::Left | KeyCode::Right => {
+            app.tab = if app.tab == Tab::Services { Tab::Tunnels } else { Tab::Services };
+            app.submenu = false;
+        }
+        KeyCode::Char('.') => app.submenu = !app.submenu,
         KeyCode::Char('j') | KeyCode::Down => app.move_down(),
         KeyCode::Char('k') | KeyCode::Up => app.move_up(),
         KeyCode::Char('s') => app.start_selected(),
@@ -103,6 +133,7 @@ fn handle_normal(app: &mut App, code: KeyCode) {
         KeyCode::Char('n') => app.begin_rename(),
         KeyCode::Char('d') => app.confirm_delete(),
         KeyCode::Char('l') | KeyCode::Enter => app.show_logs(),
+        KeyCode::Char('m') => app.begin_routes(),
         KeyCode::Char('R') => app.refresh_cf(),
         KeyCode::Char('I') => app.import_existing(),
         KeyCode::Char('T') => app.begin_add_api_token(),
@@ -114,8 +145,13 @@ fn handle_normal(app: &mut App, code: KeyCode) {
 fn handle_services_normal(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
-        KeyCode::Char('1') => app.tab = Tab::Tunnels,
-        KeyCode::Char('2') => app.tab = Tab::Services,
+        KeyCode::Char('1') => { app.tab = Tab::Services; app.submenu = false; }
+        KeyCode::Char('2') => { app.tab = Tab::Tunnels; app.submenu = false; }
+        KeyCode::Left | KeyCode::Right => {
+            app.tab = if app.tab == Tab::Services { Tab::Tunnels } else { Tab::Services };
+            app.submenu = false;
+        }
+        KeyCode::Char('.') => app.submenu = !app.submenu,
         KeyCode::Char('j') | KeyCode::Down => {
             if !app.service_rows.is_empty() && app.service_selected < app.service_rows.len() - 1 {
                 app.service_selected += 1;
@@ -138,7 +174,7 @@ fn handle_services_normal(app: &mut App, code: KeyCode) {
 }
 
 fn handle_adding_service(app: &mut App, code: KeyCode) {
-    let Mode::AddingService { field, name, port, machine, tunnel } = &mut app.mode else {
+    let Mode::AddingService { field, name, port, tunnel, memo } = &mut app.mode else {
         return;
     };
 
@@ -147,23 +183,23 @@ fn handle_adding_service(app: &mut App, code: KeyCode) {
         KeyCode::Tab | KeyCode::BackTab => {
             *field = match field {
                 ServiceField::Name => ServiceField::Port,
-                ServiceField::Port => ServiceField::Machine,
-                ServiceField::Machine => ServiceField::Tunnel,
-                ServiceField::Tunnel => ServiceField::Name,
+                ServiceField::Port => ServiceField::Tunnel,
+                ServiceField::Tunnel => ServiceField::Memo,
+                ServiceField::Memo => ServiceField::Name,
             };
         }
         KeyCode::Enter => {
-            if !name.is_empty() && !port.is_empty() && !machine.is_empty() {
-                let (n, p, m, t) = (name.clone(), port.clone(), machine.clone(), tunnel.clone());
-                app.finish_add_service(n, p, m, t);
+            if !name.is_empty() && !port.is_empty() {
+                let (n, p, t, m) = (name.clone(), port.clone(), tunnel.clone(), memo.clone());
+                app.finish_add_service(n, p, t, m);
             }
         }
         KeyCode::Backspace => {
             let s = match field {
                 ServiceField::Name => name,
                 ServiceField::Port => port,
-                ServiceField::Machine => machine,
                 ServiceField::Tunnel => tunnel,
+                ServiceField::Memo => memo,
             };
             s.pop();
         }
@@ -173,8 +209,8 @@ fn handle_adding_service(app: &mut App, code: KeyCode) {
                 ServiceField::Port => {
                     if c.is_ascii_digit() { port } else { return; }
                 }
-                ServiceField::Machine => machine,
                 ServiceField::Tunnel => tunnel,
+                ServiceField::Memo => memo,
             };
             s.push(c);
         }
@@ -183,7 +219,7 @@ fn handle_adding_service(app: &mut App, code: KeyCode) {
 }
 
 fn handle_editing_service(app: &mut App, code: KeyCode) {
-    let Mode::EditingService { idx, field, name, port, machine, tunnel } = &mut app.mode else {
+    let Mode::EditingService { idx, field, name, port, tunnel, memo } = &mut app.mode else {
         return;
     };
 
@@ -192,23 +228,23 @@ fn handle_editing_service(app: &mut App, code: KeyCode) {
         KeyCode::Tab | KeyCode::BackTab => {
             *field = match field {
                 ServiceField::Name => ServiceField::Port,
-                ServiceField::Port => ServiceField::Machine,
-                ServiceField::Machine => ServiceField::Tunnel,
-                ServiceField::Tunnel => ServiceField::Name,
+                ServiceField::Port => ServiceField::Tunnel,
+                ServiceField::Tunnel => ServiceField::Memo,
+                ServiceField::Memo => ServiceField::Name,
             };
         }
         KeyCode::Enter => {
-            if !name.is_empty() && !port.is_empty() && !machine.is_empty() {
-                let (i, n, p, m, t) = (*idx, name.clone(), port.clone(), machine.clone(), tunnel.clone());
-                app.finish_edit_service(i, n, p, m, t);
+            if !name.is_empty() && !port.is_empty() {
+                let (i, n, p, t, m) = (*idx, name.clone(), port.clone(), tunnel.clone(), memo.clone());
+                app.finish_edit_service(i, n, p, t, m);
             }
         }
         KeyCode::Backspace => {
             let s = match field {
                 ServiceField::Name => name,
                 ServiceField::Port => port,
-                ServiceField::Machine => machine,
                 ServiceField::Tunnel => tunnel,
+                ServiceField::Memo => memo,
             };
             s.pop();
         }
@@ -218,8 +254,8 @@ fn handle_editing_service(app: &mut App, code: KeyCode) {
                 ServiceField::Port => {
                     if c.is_ascii_digit() { port } else { return; }
                 }
-                ServiceField::Machine => machine,
                 ServiceField::Tunnel => tunnel,
+                ServiceField::Memo => memo,
             };
             s.push(c);
         }
@@ -228,14 +264,14 @@ fn handle_editing_service(app: &mut App, code: KeyCode) {
 }
 
 fn handle_confirming_service_delete(app: &mut App, code: KeyCode) {
-    let Mode::ConfirmingServiceDelete { name, port, machine } = &app.mode else {
+    let Mode::ConfirmingServiceDelete { idx, .. } = &app.mode else {
         return;
     };
-    let (name, port, machine) = (name.clone(), *port, machine.clone());
+    let idx = *idx;
 
     match code {
         KeyCode::Char('y') | KeyCode::Char('Y') => {
-            app.delete_service(&name, port, &machine);
+            app.delete_service(idx);
             app.mode = Mode::Normal;
         }
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -393,30 +429,146 @@ fn handle_confirming(app: &mut App, code: KeyCode) {
     }
 }
 
-fn cli_list() -> Result<()> {
+fn handle_routes(app: &mut App, code: KeyCode) {
+    let Mode::Routes { routes, selected, .. } = &mut app.mode else {
+        return;
+    };
+
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.mode = Mode::Normal;
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            if !routes.is_empty() && *selected < routes.len() - 1 {
+                *selected += 1;
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            if *selected > 0 {
+                *selected -= 1;
+            }
+        }
+        KeyCode::Char('a') => {
+            app.begin_add_route();
+        }
+        KeyCode::Char('d') => {
+            app.confirm_delete_route();
+        }
+        _ => {}
+    }
+}
+
+fn handle_adding_route(app: &mut App, code: KeyCode) {
+    let Mode::AddingRoute { tunnel_name, api_token, account_id, tunnel_id, field, hostname, service } = &mut app.mode else {
+        return;
+    };
+
+    match code {
+        KeyCode::Esc => app.mode = Mode::Normal,
+        KeyCode::Tab | KeyCode::BackTab => {
+            *field = match field {
+                RouteField::Hostname => RouteField::Service,
+                RouteField::Service => RouteField::Hostname,
+            };
+        }
+        KeyCode::Enter => {
+            if !hostname.is_empty() && !service.is_empty() {
+                let (tn, at, ai, ti, h, s) = (
+                    tunnel_name.clone(), api_token.clone(),
+                    account_id.clone(), tunnel_id.clone(),
+                    hostname.clone(), service.clone(),
+                );
+                app.finish_add_route(tn, at, ai, ti, h, s);
+            }
+        }
+        KeyCode::Backspace => {
+            let s = match field {
+                RouteField::Hostname => hostname,
+                RouteField::Service => service,
+            };
+            s.pop();
+        }
+        KeyCode::Char(c) => {
+            let s = match field {
+                RouteField::Hostname => hostname,
+                RouteField::Service => service,
+            };
+            s.push(c);
+        }
+        _ => {}
+    }
+}
+
+fn handle_confirming_route_delete(app: &mut App, code: KeyCode) {
+    let Mode::ConfirmingRouteDelete { tunnel_name, api_token, account_id, tunnel_id, hostname } = &app.mode else {
+        return;
+    };
+    let (tn, at, ai, ti, h) = (
+        tunnel_name.clone(), api_token.clone(),
+        account_id.clone(), tunnel_id.clone(),
+        hostname.clone(),
+    );
+
+    match code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.finish_delete_route(tn, at, ai, ti, h);
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            app.mode = Mode::Normal;
+        }
+        _ => {}
+    }
+}
+
+fn cli_list(json: bool) -> Result<()> {
     let config = config::Config::load()?;
     if config.tunnels.is_empty() {
-        println!("No tunnels configured.");
+        if json {
+            println!("[]");
+        } else {
+            println!("No tunnels configured.");
+        }
         return Ok(());
     }
 
-    println!("{:<18} {:<10} {:<10} {}", "NAME", "STATUS", "PID", "TUNNEL ID");
-    println!("{:<18} {:<10} {:<10} {}", "──────────────────", "──────────", "──────────", "──────────────");
+    if json {
+        let items: Vec<serde_json::Value> = config.tunnels.iter().map(|t| {
+            let status = launchd::status(&t.name);
+            let (status_str, pid) = match &status {
+                launchd::Status::Running { pid } => ("running", *pid),
+                launchd::Status::Stopped => ("stopped", None),
+                launchd::Status::Inactive => ("inactive", None),
+            };
+            let tunnel_id = config::decode_token(&t.token)
+                .map(|p| p.tunnel_id)
+                .unwrap_or_default();
+            serde_json::json!({
+                "name": t.name,
+                "status": status_str,
+                "pid": pid,
+                "tunnel_id": tunnel_id,
+            })
+        }).collect();
+        println!("{}", serde_json::to_string_pretty(&items)?);
+    } else {
+        println!("{:<18} {:<10} {:<10} {}", "NAME", "STATUS", "PID", "TUNNEL ID");
+        println!("{:<18} {:<10} {:<10} {}", "──────────────────", "──────────", "──────────", "──────────────");
 
-    for t in &config.tunnels {
-        let status = launchd::status(&t.name);
-        let (status_str, pid_str) = match &status {
-            launchd::Status::Running { pid } => {
-                ("running", pid.map(|p| p.to_string()).unwrap_or("-".into()))
-            }
-            launchd::Status::Stopped => ("stopped", "-".into()),
-            launchd::Status::Inactive => ("inactive", "-".into()),
-        };
-        let tunnel_id = config::decode_token(&t.token)
-            .map(|p| p.tunnel_id)
-            .unwrap_or("-".into());
+        for t in &config.tunnels {
+            let status = launchd::status(&t.name);
+            let (status_str, pid_str) = match &status {
+                launchd::Status::Running { pid } => {
+                    ("running", pid.map(|p| p.to_string()).unwrap_or("-".into()))
+                }
+                launchd::Status::Stopped => ("stopped", "-".into()),
+                launchd::Status::Inactive => ("inactive", "-".into()),
+            };
+            let tunnel_id = config::decode_token(&t.token)
+                .map(|p| p.tunnel_id)
+                .unwrap_or("-".into());
 
-        println!("{:<18} {:<10} {:<10} {}", t.name, status_str, pid_str, tunnel_id);
+            println!("{:<18} {:<10} {:<10} {}", t.name, status_str, pid_str, tunnel_id);
+        }
     }
     Ok(())
 }
@@ -434,4 +586,198 @@ fn cli_import() -> Result<()> {
     }
     println!("{} tunnel(s) imported.", count);
     Ok(())
+}
+
+/// Resolve a tunnel name to its (api_token, account_id, tunnel_id).
+/// Tries all configured API tokens to find one that works.
+fn resolve_tunnel(config: &config::Config, tunnel_name: &str) -> Result<(String, String, String)> {
+    let tunnel = config.tunnels.iter()
+        .find(|t| t.name == tunnel_name)
+        .ok_or_else(|| anyhow::anyhow!("tunnel '{}' not found", tunnel_name))?;
+
+    let payload = config::decode_token(&tunnel.token)?;
+    let api_tokens = config.all_cf_api_tokens();
+
+    for api_token in &api_tokens {
+        if cloudflare::verify_token(api_token, &payload.account_id, &payload.tunnel_id) {
+            return Ok((api_token.to_string(), payload.account_id, payload.tunnel_id));
+        }
+    }
+
+    anyhow::bail!("No API token works for tunnel '{}'. Add one with: tunnels (TUI) → T", tunnel_name)
+}
+
+fn cli_routes(tunnel_filter: Option<&str>, json: bool) -> Result<()> {
+    let config = config::Config::load()?;
+
+    // If a tunnel name is given and it looks like a flag, skip it
+    let tunnel_filter = tunnel_filter.filter(|s| !s.starts_with('-'));
+
+    let tunnels_to_query: Vec<&config::Tunnel> = if let Some(name) = tunnel_filter {
+        let t = config.tunnels.iter().find(|t| t.name == name)
+            .ok_or_else(|| anyhow::anyhow!("tunnel '{}' not found", name))?;
+        vec![t]
+    } else {
+        config.tunnels.iter().collect()
+    };
+
+    let api_tokens = config.all_cf_api_tokens();
+    if api_tokens.is_empty() {
+        eprintln!("No API tokens configured. Add one in the TUI with T.");
+        std::process::exit(1);
+    }
+
+    let mut all_routes: Vec<serde_json::Value> = Vec::new();
+
+    for tunnel in &tunnels_to_query {
+        let payload = match config::decode_token(&tunnel.token) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        // Find a working API token
+        let api_token = api_tokens.iter()
+            .find(|t| cloudflare::verify_token(t, &payload.account_id, &payload.tunnel_id));
+
+        let api_token = match api_token {
+            Some(t) => t,
+            None => continue,
+        };
+
+        let routes = cloudflare::list_routes(api_token, &payload.account_id, &payload.tunnel_id);
+        for route in &routes {
+            let hostname = route.hostname.as_deref().unwrap_or("(catch-all)");
+            all_routes.push(serde_json::json!({
+                "tunnel": tunnel.name,
+                "hostname": hostname,
+                "service": route.service,
+            }));
+        }
+    }
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&all_routes)?);
+    } else {
+        if all_routes.is_empty() {
+            println!("No routes found.");
+            return Ok(());
+        }
+        println!("{:<20} {:<35} {}", "TUNNEL", "HOSTNAME", "SERVICE");
+        println!("{:<20} {:<35} {}", "────────────────────", "───────────────────────────────────", "───────────────────────");
+        for r in &all_routes {
+            println!("{:<20} {:<35} {}",
+                r["tunnel"].as_str().unwrap_or(""),
+                r["hostname"].as_str().unwrap_or(""),
+                r["service"].as_str().unwrap_or(""),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Normalize service: "3000" → "http://localhost:3000", passthrough URLs
+fn normalize_service(input: &str) -> String {
+    if input.parse::<u16>().is_ok() {
+        format!("http://localhost:{}", input)
+    } else {
+        input.to_string()
+    }
+}
+
+fn cli_route_add(args: &[String]) -> Result<()> {
+    if args.len() < 2 {
+        eprintln!("Usage: tunnels route add <hostname> <port|service> --tunnel <name>");
+        eprintln!("  e.g. tunnels route add levee2.everyday.vet 3000 --tunnel myapp");
+        eprintln!("       tunnels route add levee2.everyday.vet http://localhost:3000 --tunnel myapp");
+        eprintln!();
+        eprintln!("Idempotent — safe to re-run to fix DNS if it failed the first time.");
+        std::process::exit(1);
+    }
+
+    let hostname = &args[0];
+    let service = normalize_service(&args[1]);
+    let tunnel_name = parse_flag(args, "--tunnel")
+        .ok_or_else(|| anyhow::anyhow!("--tunnel <name> is required"))?;
+
+    let config = config::Config::load()?;
+    let (api_token, account_id, tunnel_id) = resolve_tunnel(&config, &tunnel_name)?;
+
+    match cloudflare::add_route(&api_token, &account_id, &tunnel_id, hostname, &service) {
+        Ok(cloudflare::RouteResult::Ok) => {
+            println!("✓ {} → {} via {}", hostname, service, tunnel_name);
+            println!("  Route: created");
+            println!("  DNS:   created");
+        }
+        Ok(cloudflare::RouteResult::AlreadyExists) => {
+            println!("✓ {} → {} via {}", hostname, service, tunnel_name);
+            println!("  Route: already exists");
+            println!("  DNS:   ok");
+        }
+        Ok(cloudflare::RouteResult::DnsFailure(ref e)) => {
+            println!("⚠ {} → {} via {}", hostname, service, tunnel_name);
+            println!("  Route: ok");
+            println!("  DNS:   FAILED — {}", e);
+            println!();
+            println!("{}", cloudflare::DNS_PERMISSION_HINT);
+            println!();
+            println!("Or manually add a CNAME:");
+            println!("  {} → {}.cfargotunnel.com", hostname, tunnel_id);
+            println!();
+            println!("Then re-run this command to verify.");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("✗ Failed: {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    Ok(())
+}
+
+fn cli_route_rm(args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        eprintln!("Usage: tunnels route rm <hostname> --tunnel <name>");
+        std::process::exit(1);
+    }
+
+    let hostname = &args[0];
+    let tunnel_name = parse_flag(args, "--tunnel")
+        .ok_or_else(|| anyhow::anyhow!("--tunnel <name> is required"))?;
+
+    let config = config::Config::load()?;
+    let (api_token, account_id, tunnel_id) = resolve_tunnel(&config, &tunnel_name)?;
+
+    match cloudflare::remove_route(&api_token, &account_id, &tunnel_id, hostname) {
+        Ok(cloudflare::RouteResult::Ok) => {
+            println!("✓ Removed {}", hostname);
+            println!("  Route: removed");
+            println!("  DNS:   removed");
+        }
+        Ok(cloudflare::RouteResult::DnsFailure(ref e)) => {
+            println!("⚠ Removed {} (route only)", hostname);
+            println!("  Route: removed");
+            println!("  DNS:   FAILED — {}", e);
+            println!();
+            println!("Manually delete the CNAME record for: {}", hostname);
+            println!("Or update your API token permissions:");
+            println!("{}", cloudflare::DNS_PERMISSION_HINT);
+        }
+        Ok(cloudflare::RouteResult::AlreadyExists) => unreachable!(),
+        Err(e) => {
+            eprintln!("✗ Failed: {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    Ok(())
+}
+
+
+fn parse_flag(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
 }

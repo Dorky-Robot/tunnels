@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{AddField, App, Mode, ServiceField, Tab};
+use crate::app::{AddField, App, Mode, RouteField, ServiceField, Tab};
 use crate::launchd::Status;
 
 const CYAN: Color = Color::Cyan;
@@ -26,8 +26,8 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     draw_header(f, app, chunks[0]);
     match app.tab {
-        Tab::Tunnels => draw_table(f, app, chunks[1]),
         Tab::Services => draw_services_table(f, app, chunks[1]),
+        Tab::Tunnels => draw_table(f, app, chunks[1]),
     }
     draw_status_bar(f, app, chunks[2]);
     draw_keybindings(f, app, chunks[3]);
@@ -52,18 +52,27 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Logs { name, content } => {
             draw_logs_dialog(f, name, content);
         }
-        Mode::AddingService { field, name, port, machine, tunnel } => {
-            draw_service_dialog(f, "Add Service", field, name, port, machine, tunnel);
+        Mode::AddingService { field, name, port, tunnel, memo } => {
+            draw_service_dialog(f, "Add Service", field, name, port, tunnel, memo);
         }
-        Mode::EditingService { field, name, port, machine, tunnel, .. } => {
-            draw_service_dialog(f, "Edit Service", field, name, port, machine, tunnel);
+        Mode::EditingService { field, name, port, tunnel, memo, .. } => {
+            draw_service_dialog(f, "Edit Service", field, name, port, tunnel, memo);
         }
-        Mode::ConfirmingServiceDelete { name, port, machine } => {
-            let label = format!("{} :{} on {}", name, port, machine);
+        Mode::ConfirmingServiceDelete { name, port, .. } => {
+            let label = format!("{} :{}", name, port);
             draw_confirm_dialog(f, "untrack", &label);
         }
         Mode::AddingApiToken { input } => {
             draw_add_api_token_dialog(f, &app.unreached, input);
+        }
+        Mode::Routes { tunnel_name, routes, selected, .. } => {
+            draw_routes_dialog(f, tunnel_name, routes, *selected);
+        }
+        Mode::AddingRoute { tunnel_name, field, hostname, service, .. } => {
+            draw_add_route_dialog(f, tunnel_name, field, hostname, service);
+        }
+        Mode::ConfirmingRouteDelete { hostname, .. } => {
+            draw_confirm_dialog(f, "remove route", hostname);
         }
         Mode::Help => {
             draw_help(f);
@@ -84,11 +93,11 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let header = Paragraph::new(Line::from(vec![
         Span::styled(" tunnels ", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
         Span::styled("  ", Style::default()),
-        Span::styled(" 1 ", Style::default().fg(Color::Black).bg(if app.tab == Tab::Tunnels { Color::Cyan } else { Color::Rgb(80, 90, 100) })),
-        Span::styled(" Tunnels ", tab_style(app.tab == Tab::Tunnels)),
-        Span::styled("  ", Style::default()),
-        Span::styled(" 2 ", Style::default().fg(Color::Black).bg(if app.tab == Tab::Services { Color::Cyan } else { Color::Rgb(80, 90, 100) })),
+        Span::styled(" 1 ", Style::default().fg(Color::Black).bg(if app.tab == Tab::Services { Color::Cyan } else { Color::Rgb(80, 90, 100) })),
         Span::styled(" Services ", tab_style(app.tab == Tab::Services)),
+        Span::styled("  ", Style::default()),
+        Span::styled(" 2 ", Style::default().fg(Color::Black).bg(if app.tab == Tab::Tunnels { Color::Cyan } else { Color::Rgb(80, 90, 100) })),
+        Span::styled(" Tunnels ", tab_style(app.tab == Tab::Tunnels)),
     ]))
     .block(
         Block::default()
@@ -196,31 +205,52 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_keybindings(f: &mut Frame, app: &App, area: Rect) {
     let keys = match &app.mode {
-        Mode::Normal if app.tab == Tab::Services => vec![
-            ("1/2", "tabs"),
-            ("j/k", "navigate"),
-            ("S", "scan"),
+        Mode::Normal if app.tab == Tab::Services && app.submenu => vec![
             ("R", "sync CF"),
             ("T", "CF tokens"),
+            ("S", "scan ports"),
+            (".", "back"),
+            ("?", "help"),
+        ],
+        Mode::Normal if app.tab == Tab::Services => vec![
+            ("j/k", "nav"),
             ("a", "add"),
             ("e", "edit"),
-            ("d", "untrack"),
-            ("?", "more"),
+            ("d", "del"),
+            (".", "more"),
             ("q", "quit"),
         ],
-        Mode::Normal => vec![
-            ("1/2", "tabs"),
-            ("j/k", "navigate"),
-            ("s", "start"),
-            ("x", "stop"),
-            ("r", "restart"),
+        Mode::Normal if app.submenu => vec![
+            ("e", "edit token"),
+            ("n", "rename"),
+            ("l", "logs"),
             ("R", "sync CF"),
             ("T", "CF tokens"),
+            ("I", "import"),
+            (".", "back"),
+            ("?", "help"),
+        ],
+        Mode::Normal => vec![
+            ("j/k", "nav"),
+            ("s/x/r", "start/stop/restart"),
+            ("m", "routes"),
             ("a", "add"),
-            ("d", "delete"),
-            ("?", "more"),
+            ("d", "del"),
+            (".", "more"),
             ("q", "quit"),
         ],
+        Mode::Routes { .. } => vec![
+            ("j/k", "nav"),
+            ("a", "add route"),
+            ("d", "delete route"),
+            ("Esc", "back"),
+        ],
+        Mode::AddingRoute { .. } => vec![
+            ("Tab", "next field"),
+            ("Enter", "confirm"),
+            ("Esc", "cancel"),
+        ],
+        Mode::ConfirmingRouteDelete { .. } => vec![("y", "confirm"), ("n/Esc", "cancel")],
         Mode::AddingService { .. } | Mode::EditingService { .. } => vec![
             ("Tab", "next field"),
             ("Enter", "confirm"),
@@ -515,6 +545,10 @@ fn draw_help(f: &mut Frame) {
             Span::raw("View logs"),
         ]),
         Line::from(vec![
+            Span::styled("  m     ", Style::default().fg(CYAN)),
+            Span::raw("Manage routes (subdomains)"),
+        ]),
+        Line::from(vec![
             Span::styled("  R     ", Style::default().fg(CYAN)),
             Span::raw("Sync from Cloudflare"),
         ]),
@@ -573,9 +607,9 @@ fn draw_services_table(f: &mut Frame, app: &App, area: Rect) {
     let header = Row::new(vec![
         Cell::from("PROJECT").style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
         Cell::from("PORT").style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
-        Cell::from("TUNNEL").style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
         Cell::from("STATUS").style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
         Cell::from("URL").style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+        Cell::from("MEMO").style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
     ])
     .height(1)
     .bottom_margin(0);
@@ -604,9 +638,9 @@ fn draw_services_table(f: &mut Frame, app: &App, area: Rect) {
             Row::new(vec![
                 Cell::from(row.name.clone()),
                 Cell::from(row.port.to_string()),
-                Cell::from(row.tunnel.clone()).style(Style::default().fg(DIM)),
                 Cell::from(row.tunnel_status.clone()).style(Style::default().fg(status_color)),
                 Cell::from(row.url.clone()).style(Style::default().fg(url_color)),
+                Cell::from(row.memo.clone()).style(Style::default().fg(DIM)),
             ])
             .style(style)
         })
@@ -617,15 +651,134 @@ fn draw_services_table(f: &mut Frame, app: &App, area: Rect) {
         [
             Constraint::Length(16),
             Constraint::Length(7),
-            Constraint::Length(18),
             Constraint::Length(12),
-            Constraint::Min(30),
+            Constraint::Length(30),
+            Constraint::Min(20),
         ],
     )
     .header(header)
     .row_highlight_style(Style::default().bg(Color::Rgb(30, 40, 55)));
 
     f.render_widget(table, area);
+}
+
+fn draw_routes_dialog(f: &mut Frame, tunnel_name: &str, routes: &[crate::app::RouteRow], selected: usize) {
+    use crate::app::DnsStatus;
+
+    let area = centered_rect(80, 70, f.area());
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(format!(" Routes: {} ", tunnel_name))
+        .title_style(Style::default().fg(CYAN).bold())
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(CYAN));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if routes.is_empty() {
+        let empty = Paragraph::new(Line::from(vec![
+            Span::styled("  No routes. Press ", Style::default().fg(DIM)),
+            Span::styled("a", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+            Span::styled(" to add one.", Style::default().fg(DIM)),
+        ]));
+        f.render_widget(empty, inner);
+        return;
+    }
+
+    let header = Row::new(vec![
+        Cell::from("HOSTNAME").style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+        Cell::from("SERVICE").style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+        Cell::from("DNS").style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+    ])
+    .height(1)
+    .bottom_margin(0);
+
+    let rows: Vec<Row> = routes
+        .iter()
+        .enumerate()
+        .map(|(i, route)| {
+            let is_catchall = route.hostname == "(catch-all)";
+            let hostname_color = if is_catchall { DIM } else { Color::White };
+            let (dns_text, dns_color) = match route.dns {
+                DnsStatus::Ok => ("✓", GREEN),
+                DnsStatus::Missing => ("✗ missing", RED),
+                DnsStatus::Unknown => ("?", YELLOW),
+            };
+            let style = if i == selected {
+                Style::default()
+                    .bg(Color::Rgb(30, 40, 55))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+
+            Row::new(vec![
+                Cell::from(route.hostname.clone()).style(Style::default().fg(hostname_color)),
+                Cell::from(route.service.clone()).style(Style::default().fg(DIM)),
+                Cell::from(dns_text).style(Style::default().fg(dns_color)),
+            ])
+            .style(style)
+        })
+        .collect();
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(40),
+            Constraint::Percentage(40),
+            Constraint::Percentage(20),
+        ],
+    )
+    .header(header);
+
+    f.render_widget(table, inner);
+}
+
+fn draw_add_route_dialog(f: &mut Frame, tunnel_name: &str, field: &RouteField, hostname: &str, service: &str) {
+    let area = fixed_centered_rect(65, 9, f.area());
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(format!(" Add Route to '{}' ", tunnel_name))
+        .title_style(Style::default().fg(CYAN).bold())
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(CYAN));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+
+    let field_style = |f: RouteField, active: &RouteField| {
+        if f == *active {
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(DIM)
+        }
+    };
+    let cursor = |f: RouteField, active: &RouteField| {
+        if f == *active { "_" } else { "" }
+    };
+
+    f.render_widget(
+        Paragraph::new(format!("  Hostname: {}{}", hostname, cursor(RouteField::Hostname, field)))
+            .style(field_style(RouteField::Hostname, field)),
+        chunks[1],
+    );
+    f.render_widget(
+        Paragraph::new(format!("  Service:  {}{}", service, cursor(RouteField::Service, field)))
+            .style(field_style(RouteField::Service, field)),
+        chunks[3],
+    );
 }
 
 fn draw_add_api_token_dialog(
@@ -683,7 +836,7 @@ fn draw_add_api_token_dialog(
         chunks[5],
     );
     f.render_widget(
-        Paragraph::new("  Permission: Account > Cloudflare Tunnel > Read")
+        Paragraph::new("  Permissions: Account > Tunnel > Read/Edit, Zone > DNS > Edit")
             .style(Style::default().fg(DIM)),
         chunks[6],
     );
@@ -703,7 +856,7 @@ fn draw_add_api_token_dialog(
     );
 }
 
-fn draw_service_dialog(f: &mut Frame, title: &str, field: &ServiceField, name: &str, port: &str, machine: &str, tunnel: &str) {
+fn draw_service_dialog(f: &mut Frame, title: &str, field: &ServiceField, name: &str, port: &str, tunnel: &str, memo: &str) {
     let area = fixed_centered_rect(60, 13, f.area());
     f.render_widget(Clear, area);
 
@@ -751,13 +904,13 @@ fn draw_service_dialog(f: &mut Frame, title: &str, field: &ServiceField, name: &
         chunks[3],
     );
     f.render_widget(
-        Paragraph::new(format!("  Machine: {}{}", machine, cursor(ServiceField::Machine, field)))
-            .style(field_style(ServiceField::Machine, field)),
+        Paragraph::new(format!("  Tunnel:  {}{}", tunnel, cursor(ServiceField::Tunnel, field)))
+            .style(field_style(ServiceField::Tunnel, field)),
         chunks[5],
     );
     f.render_widget(
-        Paragraph::new(format!("  Tunnel:  {}{}", tunnel, cursor(ServiceField::Tunnel, field)))
-            .style(field_style(ServiceField::Tunnel, field)),
+        Paragraph::new(format!("  Memo:    {}{}", memo, cursor(ServiceField::Memo, field)))
+            .style(field_style(ServiceField::Memo, field)),
         chunks[7],
     );
 }

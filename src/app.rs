@@ -19,11 +19,35 @@ pub enum Mode {
     Confirming { action: String, target: String },
     Logs { name: String, content: String },
     Migrating { daemon_plists: Vec<std::path::PathBuf> },
-    AddingService { field: ServiceField, name: String, port: String, machine: String, tunnel: String },
-    EditingService { idx: usize, field: ServiceField, name: String, port: String, machine: String, tunnel: String },
-    ConfirmingServiceDelete { name: String, port: u16, machine: String },
+    AddingService { field: ServiceField, name: String, port: String, tunnel: String, memo: String },
+    EditingService { idx: usize, field: ServiceField, name: String, port: String, tunnel: String, memo: String },
+    ConfirmingServiceDelete { idx: usize, name: String, port: u16 },
     AddingApiToken {
         input: String,
+    },
+    Routes {
+        tunnel_name: String,
+        api_token: String,
+        account_id: String,
+        tunnel_id: String,
+        routes: Vec<RouteRow>,
+        selected: usize,
+    },
+    AddingRoute {
+        tunnel_name: String,
+        api_token: String,
+        account_id: String,
+        tunnel_id: String,
+        field: RouteField,
+        hostname: String,
+        service: String,
+    },
+    ConfirmingRouteDelete {
+        tunnel_name: String,
+        api_token: String,
+        account_id: String,
+        tunnel_id: String,
+        hostname: String,
     },
     Help,
 }
@@ -38,8 +62,28 @@ pub enum AddField {
 pub enum ServiceField {
     Name,
     Port,
-    Machine,
     Tunnel,
+    Memo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteField {
+    Hostname,
+    Service,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsStatus {
+    Ok,
+    Missing,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteRow {
+    pub hostname: String,
+    pub service: String,
+    pub dns: DnsStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -54,9 +98,11 @@ pub struct TunnelRow {
 pub struct ServiceRow {
     pub name: String,
     pub port: u16,
+    #[allow(dead_code)]
     pub tunnel: String,
     pub tunnel_status: String,
     pub url: String,
+    pub memo: String,
 }
 
 pub struct App {
@@ -72,6 +118,7 @@ pub struct App {
     pub mode: Mode,
     pub status_msg: Option<String>,
     pub should_quit: bool,
+    pub submenu: bool,
 }
 
 impl App {
@@ -84,7 +131,7 @@ impl App {
         let sync = cloudflare::sync(&cf_tokens, &tunnel_tokens);
         let mut app = Self {
             config,
-            tab: Tab::Tunnels,
+            tab: Tab::Services,
             rows: Vec::new(),
             service_rows: Vec::new(),
             tunnel_info: sync.tunnel_info,
@@ -95,6 +142,7 @@ impl App {
             mode: Mode::Normal,
             status_msg: None,
             should_quit: false,
+            submenu: false,
         };
         app.refresh();
         app
@@ -183,6 +231,7 @@ impl App {
                     tunnel: tunnel_display,
                     tunnel_status,
                     url,
+                    memo: s.memo.clone().unwrap_or_default(),
                 }
             })
             .collect();
@@ -391,17 +440,16 @@ impl App {
     // --- Service tab methods ---
 
     pub fn begin_add_service(&mut self) {
-        let machine = hostname();
         self.mode = Mode::AddingService {
             field: ServiceField::Name,
             name: String::new(),
             port: String::new(),
-            machine,
             tunnel: String::new(),
+            memo: String::new(),
         };
     }
 
-    pub fn finish_add_service(&mut self, name: String, port: String, machine: String, tunnel: String) {
+    pub fn finish_add_service(&mut self, name: String, port: String, tunnel: String, memo: String) {
         let port: u16 = match port.parse() {
             Ok(p) => p,
             Err(_) => {
@@ -411,7 +459,8 @@ impl App {
             }
         };
         let tunnel = if tunnel.is_empty() { None } else { Some(tunnel) };
-        match self.config.add_service(name.clone(), port, machine, tunnel) {
+        let memo = if memo.is_empty() { None } else { Some(memo) };
+        match self.config.add_service(name.clone(), port, tunnel, memo) {
             Ok(()) => self.status_msg = Some(format!("Added service '{}'", name)),
             Err(e) => self.status_msg = Some(format!("Error: {}", e)),
         }
@@ -426,13 +475,13 @@ impl App {
                 field: ServiceField::Name,
                 name: s.name.clone(),
                 port: s.port.to_string(),
-                machine: s.machine.clone(),
                 tunnel: s.tunnel.clone().unwrap_or_default(),
+                memo: s.memo.clone().unwrap_or_default(),
             };
         }
     }
 
-    pub fn finish_edit_service(&mut self, idx: usize, name: String, port: String, machine: String, tunnel: String) {
+    pub fn finish_edit_service(&mut self, idx: usize, name: String, port: String, tunnel: String, memo: String) {
         let port: u16 = match port.parse() {
             Ok(p) => p,
             Err(_) => {
@@ -442,7 +491,8 @@ impl App {
             }
         };
         let tunnel = if tunnel.is_empty() { None } else { Some(tunnel) };
-        match self.config.update_service(idx, name.clone(), port, machine, tunnel) {
+        let memo = if memo.is_empty() { None } else { Some(memo) };
+        match self.config.update_service(idx, name.clone(), port, tunnel, memo) {
             Ok(()) => self.status_msg = Some(format!("Updated service '{}'", name)),
             Err(e) => self.status_msg = Some(format!("Error: {}", e)),
         }
@@ -452,24 +502,18 @@ impl App {
 
     pub fn scan_services(&mut self) {
         let found = scan::scan_services();
-        let machine = hostname();
         let mut count = 0;
 
         for s in &found {
-            // Skip if we already have this service on this machine
-            if self.config.services.iter().any(|existing| {
-                existing.port == s.port && existing.machine == machine
-            }) {
+            if self.config.services.iter().any(|existing| existing.port == s.port) {
                 continue;
             }
 
-            // Check if any tunnel is configured that might map to this service
-            // (heuristic: tunnel name contains the service name)
             let tunnel = self.config.tunnels.iter()
                 .find(|t| t.name.contains(&s.name) || s.name.contains(&t.name))
                 .map(|t| t.name.clone());
 
-            if self.config.add_service(s.name.clone(), s.port, machine.clone(), tunnel).is_ok() {
+            if self.config.add_service(s.name.clone(), s.port, tunnel, None).is_ok() {
                 count += 1;
             }
         }
@@ -481,16 +525,17 @@ impl App {
     pub fn confirm_delete_service(&mut self) {
         if let Some(s) = self.config.services.get(self.service_selected) {
             self.mode = Mode::ConfirmingServiceDelete {
+                idx: self.service_selected,
                 name: s.name.clone(),
                 port: s.port,
-                machine: s.machine.clone(),
             };
         }
     }
 
-    pub fn delete_service(&mut self, name: &str, port: u16, machine: &str) {
-        match self.config.remove_service(name, port, machine) {
-            Ok(()) => self.status_msg = Some(format!("Untracked '{}'", name)),
+    pub fn delete_service(&mut self, idx: usize) {
+        let name = self.config.services.get(idx).map(|s| s.name.clone());
+        match self.config.remove_service_by_idx(idx) {
+            Ok(()) => self.status_msg = Some(format!("Untracked '{}'", name.unwrap_or_default())),
             Err(e) => self.status_msg = Some(format!("Error: {}", e)),
         }
         self.refresh();
@@ -520,6 +565,219 @@ impl App {
             self.status_msg = Some(format!("Migrated {} — errors: {}", migrated, errors.join(", ")));
         }
         self.mode = Mode::Normal;
+        self.refresh();
+    }
+
+    // --- Route management methods ---
+
+    pub fn begin_routes(&mut self) {
+        let tunnel = match self.selected_tunnel().cloned() {
+            Some(t) => t,
+            None => return,
+        };
+
+        let payload = match config::decode_token(&tunnel.token) {
+            Ok(p) => p,
+            Err(_) => {
+                self.status_msg = Some("Could not decode tunnel token".into());
+                return;
+            }
+        };
+
+        let api_tokens = self.config.all_cf_api_tokens();
+        let api_token = api_tokens.iter()
+            .find(|t| cloudflare::verify_token(t, &payload.account_id, &payload.tunnel_id));
+
+        let api_token = match api_token {
+            Some(t) => t.to_string(),
+            None => {
+                self.status_msg = Some("No API token with access — press T to add one".into());
+                return;
+            }
+        };
+
+        let cf_routes = cloudflare::list_routes(&api_token, &payload.account_id, &payload.tunnel_id);
+        let mut fixed = 0;
+        let mut fix_failed = 0;
+        let routes: Vec<RouteRow> = cf_routes.iter()
+            .map(|r| {
+                let hostname = r.hostname.clone().unwrap_or_else(|| "(catch-all)".into());
+                let dns = if r.hostname.is_none() {
+                    DnsStatus::Ok
+                } else {
+                    match cloudflare::check_dns(&api_token, &hostname) {
+                        Ok(true) => DnsStatus::Ok,
+                        Ok(false) => {
+                            // Auto-fix: try to create the missing DNS record
+                            match cloudflare::ensure_dns(&api_token, &hostname, &payload.tunnel_id) {
+                                Ok(cloudflare::RouteResult::Ok) => {
+                                    fixed += 1;
+                                    DnsStatus::Ok
+                                }
+                                _ => {
+                                    fix_failed += 1;
+                                    DnsStatus::Missing
+                                }
+                            }
+                        }
+                        Err(_) => DnsStatus::Unknown,
+                    }
+                };
+                RouteRow {
+                    hostname,
+                    service: r.service.clone(),
+                    dns,
+                }
+            })
+            .collect();
+
+        if fixed > 0 && fix_failed == 0 {
+            self.status_msg = Some(format!("✓ Fixed DNS for {} route(s)", fixed));
+        } else if fixed > 0 {
+            self.status_msg = Some(format!("✓ Fixed {} route(s), ⚠ {} still need DNS (token needs Zone>DNS>Edit)", fixed, fix_failed));
+        } else if fix_failed > 0 {
+            self.status_msg = Some(format!("⚠ {} route(s) missing DNS — token needs Zone>Zone>Read + Zone>DNS>Edit", fix_failed));
+        }
+
+        self.mode = Mode::Routes {
+            tunnel_name: tunnel.name,
+            api_token,
+            account_id: payload.account_id,
+            tunnel_id: payload.tunnel_id,
+            routes,
+            selected: 0,
+        };
+    }
+
+    pub fn begin_add_route(&mut self) {
+        let Mode::Routes { tunnel_name, api_token, account_id, tunnel_id, .. } = &self.mode else {
+            return;
+        };
+        self.mode = Mode::AddingRoute {
+            tunnel_name: tunnel_name.clone(),
+            api_token: api_token.clone(),
+            account_id: account_id.clone(),
+            tunnel_id: tunnel_id.clone(),
+            field: RouteField::Hostname,
+            hostname: String::new(),
+            service: "http://localhost:".into(),
+        };
+    }
+
+    pub fn confirm_delete_route(&mut self) {
+        let Mode::Routes { tunnel_name, api_token, account_id, tunnel_id, routes, selected } = &self.mode else {
+            return;
+        };
+        if let Some(route) = routes.get(*selected) {
+            if route.hostname == "(catch-all)" {
+                self.status_msg = Some("Cannot delete catch-all route".into());
+                return;
+            }
+            self.mode = Mode::ConfirmingRouteDelete {
+                tunnel_name: tunnel_name.clone(),
+                api_token: api_token.clone(),
+                account_id: account_id.clone(),
+                tunnel_id: tunnel_id.clone(),
+                hostname: route.hostname.clone(),
+            };
+        }
+    }
+
+    pub fn finish_add_route(&mut self, tunnel_name: String, api_token: String, account_id: String, tunnel_id: String, hostname: String, service: String) {
+        // Normalize port shorthand
+        let service = if service.parse::<u16>().is_ok() {
+            format!("http://localhost:{}", service)
+        } else {
+            service
+        };
+
+        match cloudflare::add_route(&api_token, &account_id, &tunnel_id, &hostname, &service) {
+            Ok(cloudflare::RouteResult::Ok) => {
+                self.status_msg = Some(format!("✓ {} → {} (route + DNS)", hostname, service));
+            }
+            Ok(cloudflare::RouteResult::AlreadyExists) => {
+                self.status_msg = Some(format!("✓ {} — route exists, DNS ok", hostname));
+            }
+            Ok(cloudflare::RouteResult::DnsFailure(ref e)) => {
+                self.status_msg = Some(format!(
+                    "⚠ Route ok, DNS failed: {} — re-run or add CNAME: {} → {}.cfargotunnel.com",
+                    e, hostname, tunnel_id
+                ));
+            }
+            Err(e) => {
+                self.status_msg = Some(format!("✗ {}", e));
+                self.mode = Mode::Normal;
+                return;
+            }
+        }
+
+        self.reload_routes(tunnel_name, api_token, account_id, tunnel_id);
+    }
+
+    pub fn finish_delete_route(&mut self, tunnel_name: String, api_token: String, account_id: String, tunnel_id: String, hostname: String) {
+        match cloudflare::remove_route(&api_token, &account_id, &tunnel_id, &hostname) {
+            Ok(cloudflare::RouteResult::Ok) => {
+                self.status_msg = Some(format!("✓ Removed {} (route + DNS)", hostname));
+            }
+            Ok(cloudflare::RouteResult::DnsFailure(ref e)) => {
+                self.status_msg = Some(format!(
+                    "⚠ Route removed, DNS cleanup failed: {} — manually delete CNAME for {}",
+                    e, hostname
+                ));
+            }
+            Ok(cloudflare::RouteResult::AlreadyExists) => unreachable!(),
+            Err(e) => {
+                self.status_msg = Some(format!("✗ {}", e));
+                self.mode = Mode::Normal;
+                return;
+            }
+        }
+
+        self.reload_routes(tunnel_name, api_token, account_id, tunnel_id);
+    }
+
+    fn reload_routes(&mut self, tunnel_name: String, api_token: String, account_id: String, tunnel_id: String) {
+        let cf_routes = cloudflare::list_routes(&api_token, &account_id, &tunnel_id);
+        let routes: Vec<RouteRow> = cf_routes.iter()
+            .map(|r| {
+                let hostname = r.hostname.clone().unwrap_or_else(|| "(catch-all)".into());
+                let dns = if r.hostname.is_none() {
+                    DnsStatus::Ok
+                } else {
+                    match cloudflare::check_dns(&api_token, &hostname) {
+                        Ok(true) => DnsStatus::Ok,
+                        Ok(false) => {
+                            match cloudflare::ensure_dns(&api_token, &hostname, &tunnel_id) {
+                                Ok(cloudflare::RouteResult::Ok) => DnsStatus::Ok,
+                                _ => DnsStatus::Missing,
+                            }
+                        }
+                        Err(_) => DnsStatus::Unknown,
+                    }
+                };
+                RouteRow { hostname, service: r.service.clone(), dns }
+            })
+            .collect();
+        self.mode = Mode::Routes {
+            tunnel_name,
+            api_token,
+            account_id,
+            tunnel_id,
+            routes,
+            selected: 0,
+        };
+        self.refresh_cf_data();
+    }
+
+    fn refresh_cf_data(&mut self) {
+        let tunnel_tokens: Vec<(String, String)> = self.config.tunnels.iter()
+            .map(|t| (t.name.clone(), t.token.clone()))
+            .collect();
+        let cf_tokens = self.config.all_cf_api_tokens();
+        let sync = cloudflare::sync(&cf_tokens, &tunnel_tokens);
+        self.tunnel_info = sync.tunnel_info;
+        self.ingress_routes = sync.ingress_routes;
+        self.unreached = sync.unreached;
         self.refresh();
     }
 
@@ -580,12 +838,3 @@ impl App {
     }
 }
 
-fn hostname() -> String {
-    std::process::Command::new("hostname")
-        .arg("-s")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "localhost".into())
-}

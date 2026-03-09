@@ -6,15 +6,21 @@ use std::path::PathBuf;
 pub struct Tunnel {
     pub name: String,
     pub token: String,
+    /// Per-tunnel CF API token (optional, used alongside global cf_api_tokens)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Service {
     pub name: String,
     pub port: u16,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub machine: String,
     #[serde(default)]
     pub tunnel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -33,12 +39,20 @@ pub struct Config {
 }
 
 impl Config {
-    /// All configured CF API tokens (merges cf_api_tokens + legacy cf_api_token)
+    /// All configured CF API tokens (merges cf_api_tokens + legacy cf_api_token + per-tunnel tokens)
     pub fn all_cf_api_tokens(&self) -> Vec<&str> {
         let mut tokens: Vec<&str> = self.cf_api_tokens.iter().map(|s| s.as_str()).collect();
         if let Some(ref t) = self.cf_api_token {
             if !t.is_empty() && !tokens.iter().any(|existing| existing == &t.as_str()) {
                 tokens.push(t.as_str());
+            }
+        }
+        // Include per-tunnel API tokens
+        for tunnel in &self.tunnels {
+            if let Some(ref t) = tunnel.api_token {
+                if !t.is_empty() && !tokens.iter().any(|existing| existing == &t.as_str()) {
+                    tokens.push(t.as_str());
+                }
             }
         }
         tokens
@@ -82,7 +96,7 @@ impl Config {
         if self.tunnels.iter().any(|t| t.name == name) {
             anyhow::bail!("tunnel '{}' already exists", name);
         }
-        self.tunnels.push(Tunnel { name, token });
+        self.tunnels.push(Tunnel { name, token, api_token: None });
         self.save()
     }
 
@@ -118,29 +132,29 @@ impl Config {
         self.save()
     }
 
-    pub fn add_service(&mut self, name: String, port: u16, machine: String, tunnel: Option<String>) -> Result<()> {
-        if self.services.iter().any(|s| s.port == port && s.machine == machine) {
-            anyhow::bail!("port {} on '{}' already tracked", port, machine);
+    pub fn add_service(&mut self, name: String, port: u16, tunnel: Option<String>, memo: Option<String>) -> Result<()> {
+        if self.services.iter().any(|s| s.port == port) {
+            anyhow::bail!("port {} already tracked", port);
         }
-        self.services.push(Service { name, port, machine, tunnel });
+        self.services.push(Service { name, port, machine: String::new(), tunnel, memo });
         self.save()
     }
 
-    pub fn remove_service(&mut self, name: &str, port: u16, machine: &str) -> Result<()> {
-        let len = self.services.len();
-        self.services.retain(|s| !(s.name == name && s.port == port && s.machine == machine));
-        if self.services.len() == len {
-            anyhow::bail!("service not found");
+    pub fn remove_service_by_idx(&mut self, idx: usize) -> Result<()> {
+        if idx < self.services.len() {
+            self.services.remove(idx);
+            self.save()
+        } else {
+            anyhow::bail!("service not found")
         }
-        self.save()
     }
 
-    pub fn update_service(&mut self, idx: usize, name: String, port: u16, machine: String, tunnel: Option<String>) -> Result<()> {
+    pub fn update_service(&mut self, idx: usize, name: String, port: u16, tunnel: Option<String>, memo: Option<String>) -> Result<()> {
         if let Some(s) = self.services.get_mut(idx) {
             s.name = name;
             s.port = port;
-            s.machine = machine;
             s.tunnel = tunnel;
+            s.memo = memo;
             self.save()
         } else {
             anyhow::bail!("service index out of range")

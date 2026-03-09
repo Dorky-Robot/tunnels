@@ -26,7 +26,7 @@ struct CfConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct CfIngress {
+pub struct CfIngress {
     #[serde(default)]
     pub hostname: Option<String>,
     pub service: String,
@@ -274,4 +274,390 @@ fn fetch_tunnel_config(api_token: &str, account_id: &str, tunnel_id: &str) -> Ve
         return Vec::new();
     }
     resp.result.map(|r| r.config.ingress).unwrap_or_default()
+}
+
+/// Add an ingress rule (subdomain mapping) to a tunnel's configuration.
+/// Idempotent: if the route already exists, just ensures DNS is correct.
+pub fn add_route(
+    api_token: &str,
+    account_id: &str,
+    tunnel_id: &str,
+    hostname: &str,
+    service: &str,
+) -> Result<RouteResult, String> {
+    let current = fetch_tunnel_config(api_token, account_id, tunnel_id);
+    if current.is_empty() {
+        return Err("Could not fetch current tunnel config".into());
+    }
+
+    let already_exists = current.iter().any(|r| r.hostname.as_deref() == Some(hostname));
+
+    if !already_exists {
+        // Build new ingress list: existing rules (minus catch-all) + new rule + catch-all
+        let mut ingress: Vec<serde_json::Value> = Vec::new();
+        for rule in &current {
+            if rule.hostname.is_none() {
+                continue;
+            }
+            let mut entry = serde_json::json!({ "service": rule.service });
+            if let Some(ref h) = rule.hostname {
+                entry["hostname"] = serde_json::json!(h);
+            }
+            ingress.push(entry);
+        }
+
+        ingress.push(serde_json::json!({
+            "hostname": hostname,
+            "service": service,
+        }));
+
+        let catchall_service = current.iter()
+            .find(|r| r.hostname.is_none())
+            .map(|r| r.service.as_str())
+            .unwrap_or("http_status:404");
+        ingress.push(serde_json::json!({ "service": catchall_service }));
+
+        put_tunnel_config(api_token, account_id, tunnel_id, ingress)?;
+    }
+
+    // Ensure DNS — works for both new routes and fixing existing ones
+    match create_dns_record(api_token, hostname, tunnel_id) {
+        Ok(()) => {
+            if already_exists {
+                Ok(RouteResult::AlreadyExists)
+            } else {
+                Ok(RouteResult::Ok)
+            }
+        }
+        Err(e) => Ok(RouteResult::DnsFailure(e)),
+    }
+}
+
+/// Remove an ingress rule (subdomain mapping) from a tunnel's configuration.
+pub fn remove_route(
+    api_token: &str,
+    account_id: &str,
+    tunnel_id: &str,
+    hostname: &str,
+) -> Result<RouteResult, String> {
+    let current = fetch_tunnel_config(api_token, account_id, tunnel_id);
+    if current.is_empty() {
+        return Err("Could not fetch current tunnel config".into());
+    }
+
+    if !current.iter().any(|r| r.hostname.as_deref() == Some(hostname)) {
+        return Err(format!("No route found for '{}'", hostname));
+    }
+
+    let mut ingress: Vec<serde_json::Value> = Vec::new();
+    for rule in &current {
+        if rule.hostname.as_deref() == Some(hostname) {
+            continue;
+        }
+        let mut entry = serde_json::json!({ "service": rule.service });
+        if let Some(ref h) = rule.hostname {
+            entry["hostname"] = serde_json::json!(h);
+        }
+        ingress.push(entry);
+    }
+
+    if !ingress.iter().any(|e| e.get("hostname").is_none()) {
+        ingress.push(serde_json::json!({ "service": "http_status:404" }));
+    }
+
+    put_tunnel_config(api_token, account_id, tunnel_id, ingress)?;
+
+    match delete_dns_record(api_token, hostname) {
+        Ok(()) => Ok(RouteResult::Ok),
+        Err(e) => Ok(RouteResult::DnsFailure(e)),
+    }
+}
+
+/// List all ingress routes for a tunnel
+pub fn list_routes(
+    api_token: &str,
+    account_id: &str,
+    tunnel_id: &str,
+) -> Vec<CfIngress> {
+    fetch_tunnel_config(api_token, account_id, tunnel_id)
+}
+
+/// Result of a route add/remove/fix operation
+#[derive(Debug, Clone)]
+pub enum RouteResult {
+    /// Everything worked
+    Ok,
+    /// Route existed already, DNS was ensured
+    AlreadyExists,
+    /// Route succeeded but DNS failed
+    DnsFailure(String),
+}
+
+pub const DNS_PERMISSION_HINT: &str = "\
+Your API token needs these additional permissions for automatic DNS:
+  • Zone > Zone > Read
+  • Zone > DNS > Edit
+Update at: dash.cloudflare.com/profile/api-tokens";
+
+/// Check if a CNAME DNS record exists for a hostname
+pub fn check_dns(api_token: &str, hostname: &str) -> Result<bool, String> {
+    let zone_id = find_zone_id(api_token, hostname)?;
+    let url = format!(
+        "https://api.cloudflare.com/client/v4/zones/{}/dns_records?type=CNAME&name={}",
+        zone_id, hostname
+    );
+    let output = Command::new("curl")
+        .args(["-s", &url, "-H", &format!("Authorization: Bearer {}", api_token)])
+        .output()
+        .map_err(|e| format!("curl: {}", e))?;
+
+    let val: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("parse: {}", e))?;
+
+    let results = val.get("result").and_then(|v| v.as_array());
+    Ok(results.map_or(false, |r| !r.is_empty()))
+}
+
+/// Ensure DNS record exists for a hostname pointing at a tunnel.
+/// This is idempotent — safe to call even if the record already exists.
+pub fn ensure_dns(
+    api_token: &str,
+    hostname: &str,
+    tunnel_id: &str,
+) -> Result<RouteResult, String> {
+    match create_dns_record(api_token, hostname, tunnel_id) {
+        Ok(()) => Ok(RouteResult::Ok),
+        Err(e) => Ok(RouteResult::DnsFailure(e)),
+    }
+}
+
+// --- DNS management ---
+
+/// Look up the Cloudflare zone ID for a hostname (e.g. "levee2.everyday.vet" → zone for "everyday.vet")
+fn find_zone_id(api_token: &str, hostname: &str) -> Result<String, String> {
+    // Try progressively shorter domain suffixes: "sub.example.com" → "example.com"
+    let parts: Vec<&str> = hostname.split('.').collect();
+    for i in 0..parts.len().saturating_sub(1) {
+        let candidate = parts[i..].join(".");
+        let url = format!(
+            "https://api.cloudflare.com/client/v4/zones?name={}",
+            candidate
+        );
+        let output = Command::new("curl")
+            .args(["-s", &url, "-H", &format!("Authorization: Bearer {}", api_token)])
+            .output()
+            .map_err(|e| format!("curl: {}", e))?;
+
+        if !output.status.success() {
+            continue;
+        }
+
+        let val: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|e| format!("parse: {}", e))?;
+
+        if val.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+            if let Some(results) = val.get("result").and_then(|v| v.as_array()) {
+                if let Some(zone) = results.first() {
+                    if let Some(id) = zone.get("id").and_then(|v| v.as_str()) {
+                        return Ok(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    Err(format!("No Cloudflare zone found for '{}'", hostname))
+}
+
+/// Create a CNAME DNS record pointing hostname → tunnel_id.cfargotunnel.com
+fn create_dns_record(api_token: &str, hostname: &str, tunnel_id: &str) -> Result<(), String> {
+    let zone_id = find_zone_id(api_token, hostname)?;
+    let target = format!("{}.cfargotunnel.com", tunnel_id);
+
+    // Check if record already exists
+    let list_url = format!(
+        "https://api.cloudflare.com/client/v4/zones/{}/dns_records?type=CNAME&name={}",
+        zone_id, hostname
+    );
+    let output = Command::new("curl")
+        .args(["-s", &list_url, "-H", &format!("Authorization: Bearer {}", api_token)])
+        .output()
+        .map_err(|e| format!("curl: {}", e))?;
+
+    if output.status.success() {
+        let val: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
+        if let Some(results) = val.get("result").and_then(|v| v.as_array()) {
+            if !results.is_empty() {
+                // Record already exists, update it
+                if let Some(record_id) = results[0].get("id").and_then(|v| v.as_str()) {
+                    return update_dns_record(api_token, &zone_id, record_id, hostname, &target);
+                }
+            }
+        }
+    }
+
+    // Create new record
+    let create_url = format!(
+        "https://api.cloudflare.com/client/v4/zones/{}/dns_records",
+        zone_id
+    );
+    let body = serde_json::json!({
+        "type": "CNAME",
+        "name": hostname,
+        "content": target,
+        "proxied": true,
+    });
+    let body_str = serde_json::to_string(&body).map_err(|e| e.to_string())?;
+
+    let output = Command::new("curl")
+        .args([
+            "-s", "-X", "POST",
+            &create_url,
+            "-H", &format!("Authorization: Bearer {}", api_token),
+            "-H", "Content-Type: application/json",
+            "-d", &body_str,
+        ])
+        .output()
+        .map_err(|e| format!("curl: {}", e))?;
+
+    parse_cf_response(&output.stdout).map(|_| ())
+}
+
+fn update_dns_record(api_token: &str, zone_id: &str, record_id: &str, hostname: &str, target: &str) -> Result<(), String> {
+    let url = format!(
+        "https://api.cloudflare.com/client/v4/zones/{}/dns_records/{}",
+        zone_id, record_id
+    );
+    let body = serde_json::json!({
+        "type": "CNAME",
+        "name": hostname,
+        "content": target,
+        "proxied": true,
+    });
+    let body_str = serde_json::to_string(&body).map_err(|e| e.to_string())?;
+
+    let output = Command::new("curl")
+        .args([
+            "-s", "-X", "PUT",
+            &url,
+            "-H", &format!("Authorization: Bearer {}", api_token),
+            "-H", "Content-Type: application/json",
+            "-d", &body_str,
+        ])
+        .output()
+        .map_err(|e| format!("curl: {}", e))?;
+
+    parse_cf_response(&output.stdout).map(|_| ())
+}
+
+/// Delete the CNAME DNS record for a hostname
+fn delete_dns_record(api_token: &str, hostname: &str) -> Result<(), String> {
+    let zone_id = find_zone_id(api_token, hostname)?;
+
+    let list_url = format!(
+        "https://api.cloudflare.com/client/v4/zones/{}/dns_records?type=CNAME&name={}",
+        zone_id, hostname
+    );
+    let output = Command::new("curl")
+        .args(["-s", &list_url, "-H", &format!("Authorization: Bearer {}", api_token)])
+        .output()
+        .map_err(|e| format!("curl: {}", e))?;
+
+    if !output.status.success() {
+        return Err("Failed to list DNS records".into());
+    }
+
+    let val: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("parse: {}", e))?;
+
+    let results = val.get("result").and_then(|v| v.as_array())
+        .ok_or_else(|| format!("No DNS record found for '{}'", hostname))?;
+
+    if results.is_empty() {
+        return Ok(()); // No record to delete
+    }
+
+    let record_id = results[0].get("id").and_then(|v| v.as_str())
+        .ok_or("Could not get DNS record ID")?;
+
+    let delete_url = format!(
+        "https://api.cloudflare.com/client/v4/zones/{}/dns_records/{}",
+        zone_id, record_id
+    );
+    let output = Command::new("curl")
+        .args([
+            "-s", "-X", "DELETE",
+            &delete_url,
+            "-H", &format!("Authorization: Bearer {}", api_token),
+        ])
+        .output()
+        .map_err(|e| format!("curl: {}", e))?;
+
+    parse_cf_response(&output.stdout).map(|_| ())
+}
+
+fn put_tunnel_config(
+    api_token: &str,
+    account_id: &str,
+    tunnel_id: &str,
+    ingress: Vec<serde_json::Value>,
+) -> Result<String, String> {
+    let url = format!(
+        "https://api.cloudflare.com/client/v4/accounts/{}/cfd_tunnel/{}/configurations",
+        account_id, tunnel_id
+    );
+    let body = serde_json::json!({
+        "config": {
+            "ingress": ingress
+        }
+    });
+    let body_str = serde_json::to_string(&body).map_err(|e| e.to_string())?;
+
+    let output = Command::new("curl")
+        .args([
+            "-s", "-X", "PUT",
+            &url,
+            "-H", &format!("Authorization: Bearer {}", api_token),
+            "-H", "Content-Type: application/json",
+            "-d", &body_str,
+        ])
+        .output()
+        .map_err(|e| format!("curl: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("curl exited {}: {}", output.status, stderr.trim()));
+    }
+
+    parse_cf_response(&output.stdout)
+}
+
+fn parse_cf_response(body: &[u8]) -> Result<String, String> {
+    let val: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| format!("parse response: {}", e))?;
+
+    let success = val.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+    if success {
+        return Ok("OK".into());
+    }
+
+    // Extract readable error messages
+    let errors = val.get("errors")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    let code = e.get("code").and_then(|c| c.as_u64());
+                    let msg = e.get("message").and_then(|m| m.as_str());
+                    match (code, msg) {
+                        (Some(c), Some(m)) => Some(format!("[{}] {}", c, m)),
+                        (None, Some(m)) => Some(m.to_string()),
+                        _ => None,
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .unwrap_or_else(|| "unknown error".into());
+
+    Err(errors)
 }
