@@ -60,6 +60,7 @@ pub struct IngressRoute {
     pub hostname: String,
     pub tunnel_name: String,
     pub tunnel_id: String,
+    pub scheme: String,
 }
 
 /// An account that needs an API token
@@ -179,10 +180,12 @@ pub fn sync(cf_api_tokens: &[&str], tunnel_tokens: &[(String, String)]) -> SyncR
                     };
                     if let Some(p) = parse_port_from_service(&rule.service) {
                         total_routes += 1;
+                        let scheme = parse_scheme_from_service(&rule.service);
                         port_map.entry(p).or_default().push(IngressRoute {
                             hostname,
                             tunnel_name: name.clone(),
                             tunnel_id: tunnel_id.clone(),
+                            scheme,
                         });
                     }
                 }
@@ -219,6 +222,18 @@ fn parse_port_from_service(service: &str) -> Option<u16> {
         .rsplit(':')
         .next()
         .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
+}
+
+/// Extract the scheme from a cloudflared service URL.
+/// e.g. "ssh://localhost:22" → "ssh", "http://localhost:3000" → "https" (proxied via CF)
+fn parse_scheme_from_service(service: &str) -> String {
+    match service.split("://").next() {
+        Some("ssh") => "ssh".into(),
+        Some("tcp") => "tcp".into(),
+        Some("rdp") => "rdp".into(),
+        Some("unix" | "unix+tls") => "https".into(),
+        _ => "https".into(),
+    }
 }
 
 fn fetch_tunnel_config_check(api_token: &str, account_id: &str, tunnel_id: &str) -> bool {

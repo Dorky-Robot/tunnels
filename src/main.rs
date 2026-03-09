@@ -78,11 +78,18 @@ fn main() -> Result<()> {
 
 fn run_loop(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut App) -> Result<()> {
     loop {
+        app.spinner_tick = app.spinner_tick.wrapping_add(1);
+        app.poll_bg();
+
         terminal.draw(|f| ui::draw(f, app))?;
 
-        if event::poll(Duration::from_millis(250))? {
+        if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+
+                if app.loading.is_some() {
                     continue;
                 }
 
@@ -168,6 +175,7 @@ fn handle_services_normal(app: &mut App, code: KeyCode) {
         }
         KeyCode::Char('a') => app.begin_add_service(),
         KeyCode::Char('e') => app.begin_edit_service(),
+        KeyCode::Char('m') => app.begin_rename_service_route(),
         KeyCode::Char('d') => app.confirm_delete_service(),
         KeyCode::Char('S') => app.scan_services(),
         KeyCode::Char('R') => app.refresh_cf(),
@@ -507,28 +515,28 @@ fn handle_adding_route(app: &mut App, code: KeyCode) {
 }
 
 fn handle_renaming_route(app: &mut App, code: KeyCode) {
-    let Mode::RenamingRoute { tunnel_name, api_token, account_id, tunnel_id, old_hostname, service, new_hostname } = &mut app.mode else {
+    let Mode::RenamingRoute { tunnel_name, api_token, account_id, tunnel_id, old_hostname, service, new_subdomain, domain_suffix } = &mut app.mode else {
         return;
     };
 
     match code {
         KeyCode::Esc => app.mode = Mode::Normal,
         KeyCode::Enter => {
-            if !new_hostname.is_empty() {
-                let (tn, at, ai, ti, oh, svc, nh) = (
+            if !new_subdomain.is_empty() {
+                let full_hostname = format!("{}{}", new_subdomain, domain_suffix);
+                let (tn, at, ai, ti, oh, svc) = (
                     tunnel_name.clone(), api_token.clone(),
                     account_id.clone(), tunnel_id.clone(),
                     old_hostname.clone(), service.clone(),
-                    new_hostname.clone(),
                 );
-                app.finish_rename_route(tn, at, ai, ti, oh, svc, nh);
+                app.finish_rename_route(tn, at, ai, ti, oh, svc, full_hostname);
             }
         }
         KeyCode::Backspace => {
-            new_hostname.pop();
+            new_subdomain.pop();
         }
         KeyCode::Char(c) => {
-            new_hostname.push(c);
+            new_subdomain.push(c);
         }
         _ => {}
     }

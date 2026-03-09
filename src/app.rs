@@ -3,6 +3,51 @@ use crate::config::{self, Config, Tunnel};
 use crate::launchd;
 use crate::scan;
 use std::collections::HashMap;
+use std::sync::mpsc;
+
+pub const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+pub enum BgResult {
+    CfSync(cloudflare::SyncResult),
+    Routes {
+        tunnel_name: String,
+        api_token: String,
+        account_id: String,
+        tunnel_id: String,
+        routes: Vec<RouteRow>,
+        status_msg: Option<String>,
+    },
+    RouteRenamed {
+        status_msg: String,
+        tunnel_name: String,
+        api_token: String,
+        account_id: String,
+        tunnel_id: String,
+    },
+    RouteAdded {
+        status_msg: String,
+        tunnel_name: String,
+        api_token: String,
+        account_id: String,
+        tunnel_id: String,
+    },
+    RouteDeleted {
+        status_msg: String,
+        tunnel_name: String,
+        api_token: String,
+        account_id: String,
+        tunnel_id: String,
+    },
+    VerifyToken {
+        tunnel_name: String,
+        api_token: String,
+        account_id: String,
+        tunnel_id: String,
+        hostname: String,
+        service_url: String,
+    },
+    VerifyTokenFailed(String),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -49,7 +94,8 @@ pub enum Mode {
         tunnel_id: String,
         old_hostname: String,
         service: String,
-        new_hostname: String,
+        new_subdomain: String,
+        domain_suffix: String,
     },
     ConfirmingRouteDelete {
         tunnel_name: String,
@@ -114,6 +160,18 @@ pub struct ServiceRow {
     pub memo: String,
 }
 
+/// Split a hostname into (subdomain, domain_suffix).
+/// e.g. "katulong-mini.felixflor.es" → ("katulong-mini", ".felixflor.es")
+/// "simple.com" → ("simple", ".com")
+/// "bare" → ("bare", "")
+fn split_hostname(hostname: &str) -> (String, String) {
+    if let Some(dot_pos) = hostname.find('.') {
+        (hostname[..dot_pos].to_string(), hostname[dot_pos..].to_string())
+    } else {
+        (hostname.to_string(), String::new())
+    }
+}
+
 pub struct App {
     pub config: Config,
     pub tab: Tab,
@@ -128,32 +186,37 @@ pub struct App {
     pub status_msg: Option<String>,
     pub should_quit: bool,
     pub submenu: bool,
+    pub loading: Option<String>,
+    pub spinner_tick: usize,
+    bg_tx: mpsc::Sender<BgResult>,
+    bg_rx: mpsc::Receiver<BgResult>,
 }
 
 impl App {
     pub fn new() -> Self {
         let config = Config::load().unwrap_or_default();
-        let tunnel_tokens: Vec<(String, String)> = config.tunnels.iter()
-            .map(|t| (t.name.clone(), t.token.clone()))
-            .collect();
-        let cf_tokens = config.all_cf_api_tokens();
-        let sync = cloudflare::sync(&cf_tokens, &tunnel_tokens);
+        let (tx, rx) = mpsc::channel();
         let mut app = Self {
             config,
             tab: Tab::Services,
             rows: Vec::new(),
             service_rows: Vec::new(),
-            tunnel_info: sync.tunnel_info,
-            ingress_routes: sync.ingress_routes,
-            unreached: sync.unreached,
+            tunnel_info: HashMap::new(),
+            ingress_routes: HashMap::new(),
+            unreached: Vec::new(),
             selected: 0,
             service_selected: 0,
             mode: Mode::Normal,
             status_msg: None,
             should_quit: false,
             submenu: false,
+            loading: Some("Syncing Cloudflare...".into()),
+            spinner_tick: 0,
+            bg_tx: tx,
+            bg_rx: rx,
         };
         app.refresh();
+        app.spawn_cf_sync();
         app
     }
 
@@ -216,7 +279,7 @@ impl App {
                         (
                             route.tunnel_name.clone(),
                             status,
-                            format!("https://{}", route.hostname),
+                            format!("{}://{}", route.scheme, route.hostname),
                         )
                     } else {
                         ("—".to_string(), "—".to_string(), "—".to_string())
@@ -251,20 +314,89 @@ impl App {
     }
 
     pub fn refresh_cf(&mut self) {
+        self.loading = Some("Syncing Cloudflare...".into());
+        self.spawn_cf_sync();
+    }
+
+    fn spawn_cf_sync(&self) {
+        let tx = self.bg_tx.clone();
         let tunnel_tokens: Vec<(String, String)> = self.config.tunnels.iter()
             .map(|t| (t.name.clone(), t.token.clone()))
             .collect();
-        let cf_tokens = self.config.all_cf_api_tokens();
-        let sync = cloudflare::sync(&cf_tokens, &tunnel_tokens);
-        self.tunnel_info = sync.tunnel_info;
-        self.ingress_routes = sync.ingress_routes;
-        self.unreached = sync.unreached;
-        self.status_msg = Some(sync.status);
-        self.refresh();
+        let cf_tokens: Vec<String> = self.config.all_cf_api_tokens()
+            .into_iter().map(|s| s.to_string()).collect();
 
-        // Auto-prompt if accounts need tokens
-        if !self.unreached.is_empty() {
-            self.begin_add_api_token();
+        std::thread::spawn(move || {
+            let refs: Vec<&str> = cf_tokens.iter().map(|s| s.as_str()).collect();
+            let sync = cloudflare::sync(&refs, &tunnel_tokens);
+            let _ = tx.send(BgResult::CfSync(sync));
+        });
+    }
+
+    pub fn poll_bg(&mut self) {
+        while let Ok(result) = self.bg_rx.try_recv() {
+            self.loading = None;
+            match result {
+                BgResult::CfSync(sync) => {
+                    self.tunnel_info = sync.tunnel_info;
+                    self.ingress_routes = sync.ingress_routes;
+                    self.unreached = sync.unreached;
+                    self.status_msg = Some(sync.status);
+                    self.refresh();
+                    if !self.unreached.is_empty() {
+                        self.begin_add_api_token();
+                    }
+                }
+                BgResult::Routes { tunnel_name, api_token, account_id, tunnel_id, routes, status_msg } => {
+                    if let Some(msg) = status_msg {
+                        self.status_msg = Some(msg);
+                    }
+                    self.mode = Mode::Routes {
+                        tunnel_name,
+                        api_token,
+                        account_id,
+                        tunnel_id,
+                        routes,
+                        selected: 0,
+                    };
+                }
+                BgResult::RouteRenamed { status_msg, tunnel_name, api_token, account_id, tunnel_id } => {
+                    self.status_msg = Some(status_msg);
+                    if self.tab == Tab::Services {
+                        self.loading = Some("Syncing...".into());
+                        self.spawn_cf_sync();
+                    } else {
+                        self.loading = Some("Reloading routes...".into());
+                        self.spawn_reload_routes(tunnel_name, api_token, account_id, tunnel_id);
+                    }
+                }
+                BgResult::RouteAdded { status_msg, tunnel_name, api_token, account_id, tunnel_id } => {
+                    self.status_msg = Some(status_msg);
+                    self.loading = Some("Reloading routes...".into());
+                    self.spawn_reload_routes(tunnel_name, api_token, account_id, tunnel_id);
+                }
+                BgResult::RouteDeleted { status_msg, tunnel_name, api_token, account_id, tunnel_id } => {
+                    self.status_msg = Some(status_msg);
+                    self.loading = Some("Reloading routes...".into());
+                    self.spawn_reload_routes(tunnel_name, api_token, account_id, tunnel_id);
+                }
+                BgResult::VerifyToken { tunnel_name, api_token, account_id, tunnel_id, hostname, service_url } => {
+                    let (subdomain, domain_suffix) = split_hostname(&hostname);
+                    self.mode = Mode::RenamingRoute {
+                        tunnel_name,
+                        api_token,
+                        account_id,
+                        tunnel_id,
+                        old_hostname: hostname,
+                        service: service_url,
+                        new_subdomain: subdomain,
+                        domain_suffix,
+                    };
+                }
+                BgResult::VerifyTokenFailed(msg) => {
+                    self.status_msg = Some(msg);
+                }
+            }
         }
     }
 
@@ -577,6 +709,79 @@ impl App {
         self.refresh();
     }
 
+    /// Look up the route info for the currently selected service.
+    /// Returns (tunnel_name, tunnel_token, hostname, service_url) or an error message.
+    pub fn resolve_service_route(&self) -> Result<(String, String, String, String), String> {
+        let service = self.config.services.get(self.service_selected)
+            .ok_or_else(|| "No service selected".to_string())?;
+
+        let routes = self.ingress_routes.get(&service.port)
+            .filter(|r| !r.is_empty())
+            .ok_or_else(|| "No route found for this service".to_string())?;
+
+        let route = &routes[0];
+        let service_url = format!("http://localhost:{}", service.port);
+
+        // Find the tunnel config that owns this route
+        let tunnel = self.config.tunnels.iter()
+            .find(|t| {
+                config::decode_token(&t.token)
+                    .map(|p| p.tunnel_id == route.tunnel_id)
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| "Tunnel not found for this route".to_string())?;
+
+        Ok((tunnel.name.clone(), tunnel.token.clone(), route.hostname.clone(), service_url))
+    }
+
+    pub fn begin_rename_service_route(&mut self) {
+        let (tunnel_name, tunnel_token, hostname, service_url) = match self.resolve_service_route() {
+            Ok(v) => v,
+            Err(msg) => {
+                self.status_msg = Some(msg);
+                return;
+            }
+        };
+
+        let payload = match config::decode_token(&tunnel_token) {
+            Ok(p) => p,
+            Err(_) => {
+                self.status_msg = Some("Could not decode tunnel token".into());
+                return;
+            }
+        };
+
+        self.loading = Some("Verifying API token...".into());
+        let tx = self.bg_tx.clone();
+        let api_tokens: Vec<String> = self.config.all_cf_api_tokens()
+            .into_iter().map(|s| s.to_string()).collect();
+        let account_id = payload.account_id.clone();
+        let tunnel_id = payload.tunnel_id.clone();
+
+        std::thread::spawn(move || {
+            let api_token = api_tokens.iter().find(|t| {
+                cloudflare::verify_token(t, &account_id, &tunnel_id)
+            });
+            match api_token {
+                Some(t) => {
+                    let _ = tx.send(BgResult::VerifyToken {
+                        tunnel_name,
+                        api_token: t.to_string(),
+                        account_id,
+                        tunnel_id,
+                        hostname,
+                        service_url,
+                    });
+                }
+                None => {
+                    let _ = tx.send(BgResult::VerifyTokenFailed(
+                        "No API token with access — press T to add one".into()
+                    ));
+                }
+            }
+        });
+    }
+
     // --- Route management methods ---
 
     pub fn begin_routes(&mut self) {
@@ -593,69 +798,71 @@ impl App {
             }
         };
 
-        let api_tokens = self.config.all_cf_api_tokens();
-        let api_token = api_tokens.iter()
-            .find(|t| cloudflare::verify_token(t, &payload.account_id, &payload.tunnel_id));
+        self.loading = Some("Loading routes...".into());
+        let tx = self.bg_tx.clone();
+        let api_tokens: Vec<String> = self.config.all_cf_api_tokens()
+            .into_iter().map(|s| s.to_string()).collect();
+        let tunnel_name = tunnel.name.clone();
+        let account_id = payload.account_id.clone();
+        let tunnel_id = payload.tunnel_id.clone();
 
-        let api_token = match api_token {
-            Some(t) => t.to_string(),
-            None => {
-                self.status_msg = Some("No API token with access — press T to add one".into());
-                return;
-            }
-        };
+        std::thread::spawn(move || {
+            let api_token = match api_tokens.iter().find(|t| {
+                cloudflare::verify_token(t, &account_id, &tunnel_id)
+            }) {
+                Some(t) => t.to_string(),
+                None => {
+                    let _ = tx.send(BgResult::VerifyTokenFailed(
+                        "No API token with access — press T to add one".into()
+                    ));
+                    return;
+                }
+            };
 
-        let cf_routes = cloudflare::list_routes(&api_token, &payload.account_id, &payload.tunnel_id);
-        let mut fixed = 0;
-        let mut fix_failed = 0;
-        let routes: Vec<RouteRow> = cf_routes.iter()
-            .map(|r| {
-                let hostname = r.hostname.clone().unwrap_or_else(|| "(catch-all)".into());
-                let dns = if r.hostname.is_none() {
-                    DnsStatus::Ok
-                } else {
-                    match cloudflare::check_dns(&api_token, &hostname) {
-                        Ok(true) => DnsStatus::Ok,
-                        Ok(false) => {
-                            // Auto-fix: try to create the missing DNS record
-                            match cloudflare::ensure_dns(&api_token, &hostname, &payload.tunnel_id) {
-                                Ok(cloudflare::RouteResult::Ok) => {
-                                    fixed += 1;
-                                    DnsStatus::Ok
-                                }
-                                _ => {
-                                    fix_failed += 1;
-                                    DnsStatus::Missing
+            let cf_routes = cloudflare::list_routes(&api_token, &account_id, &tunnel_id);
+            let mut fixed = 0;
+            let mut fix_failed = 0;
+            let routes: Vec<RouteRow> = cf_routes.iter()
+                .map(|r| {
+                    let hostname = r.hostname.clone().unwrap_or_else(|| "(catch-all)".into());
+                    let dns = if r.hostname.is_none() {
+                        DnsStatus::Ok
+                    } else {
+                        match cloudflare::check_dns(&api_token, &hostname) {
+                            Ok(true) => DnsStatus::Ok,
+                            Ok(false) => {
+                                match cloudflare::ensure_dns(&api_token, &hostname, &tunnel_id) {
+                                    Ok(cloudflare::RouteResult::Ok) => {
+                                        fixed += 1;
+                                        DnsStatus::Ok
+                                    }
+                                    _ => {
+                                        fix_failed += 1;
+                                        DnsStatus::Missing
+                                    }
                                 }
                             }
+                            Err(_) => DnsStatus::Unknown,
                         }
-                        Err(_) => DnsStatus::Unknown,
-                    }
-                };
-                RouteRow {
-                    hostname,
-                    service: r.service.clone(),
-                    dns,
-                }
-            })
-            .collect();
+                    };
+                    RouteRow { hostname, service: r.service.clone(), dns }
+                })
+                .collect();
 
-        if fixed > 0 && fix_failed == 0 {
-            self.status_msg = Some(format!("✓ Fixed DNS for {} route(s)", fixed));
-        } else if fixed > 0 {
-            self.status_msg = Some(format!("✓ Fixed {} route(s), ⚠ {} still need DNS (token needs Zone>DNS>Edit)", fixed, fix_failed));
-        } else if fix_failed > 0 {
-            self.status_msg = Some(format!("⚠ {} route(s) missing DNS — token needs Zone>Zone>Read + Zone>DNS>Edit", fix_failed));
-        }
+            let status_msg = if fixed > 0 && fix_failed == 0 {
+                Some(format!("✓ Fixed DNS for {} route(s)", fixed))
+            } else if fixed > 0 {
+                Some(format!("✓ Fixed {} route(s), ⚠ {} still need DNS (token needs Zone>DNS>Edit)", fixed, fix_failed))
+            } else if fix_failed > 0 {
+                Some(format!("⚠ {} route(s) missing DNS — token needs Zone>Zone>Read + Zone>DNS>Edit", fix_failed))
+            } else {
+                None
+            };
 
-        self.mode = Mode::Routes {
-            tunnel_name: tunnel.name,
-            api_token,
-            account_id: payload.account_id,
-            tunnel_id: payload.tunnel_id,
-            routes,
-            selected: 0,
-        };
+            let _ = tx.send(BgResult::Routes {
+                tunnel_name, api_token, account_id, tunnel_id, routes, status_msg,
+            });
+        });
     }
 
     pub fn begin_add_route(&mut self) {
@@ -682,6 +889,7 @@ impl App {
                 self.status_msg = Some("Cannot rename catch-all route".into());
                 return;
             }
+            let (subdomain, domain_suffix) = split_hostname(&route.hostname);
             self.mode = Mode::RenamingRoute {
                 tunnel_name: tunnel_name.clone(),
                 api_token: api_token.clone(),
@@ -689,7 +897,8 @@ impl App {
                 tunnel_id: tunnel_id.clone(),
                 old_hostname: route.hostname.clone(),
                 service: route.service.clone(),
-                new_hostname: route.hostname.clone(),
+                new_subdomain: subdomain,
+                domain_suffix,
             };
         }
     }
@@ -697,40 +906,57 @@ impl App {
     pub fn finish_rename_route(&mut self, tunnel_name: String, api_token: String, account_id: String, tunnel_id: String, old_hostname: String, service: String, new_hostname: String) {
         if old_hostname == new_hostname {
             self.status_msg = Some("Name unchanged".into());
-            self.reload_routes(tunnel_name, api_token, account_id, tunnel_id);
+            self.mode = Mode::Normal;
             return;
         }
 
-        // Add new route first
-        match cloudflare::add_route(&api_token, &account_id, &tunnel_id, &new_hostname, &service) {
-            Ok(cloudflare::RouteResult::Ok | cloudflare::RouteResult::AlreadyExists) => {}
-            Ok(cloudflare::RouteResult::DnsFailure(ref e)) => {
-                self.status_msg = Some(format!("⚠ New route ok, DNS failed: {} — re-run m to fix", e));
-                self.reload_routes(tunnel_name, api_token, account_id, tunnel_id);
-                return;
-            }
-            Err(e) => {
-                self.status_msg = Some(format!("✗ Failed to create {}: {}", new_hostname, e));
-                self.mode = Mode::Normal;
-                return;
-            }
-        }
+        self.loading = Some("Renaming route...".into());
+        self.mode = Mode::Normal;
+        let tx = self.bg_tx.clone();
 
-        // Remove old route
-        match cloudflare::remove_route(&api_token, &account_id, &tunnel_id, &old_hostname) {
-            Ok(cloudflare::RouteResult::Ok) => {
-                self.status_msg = Some(format!("✓ Renamed {} → {}", old_hostname, new_hostname));
+        std::thread::spawn(move || {
+            // Add new route first
+            match cloudflare::add_route(&api_token, &account_id, &tunnel_id, &new_hostname, &service) {
+                Ok(cloudflare::RouteResult::Ok | cloudflare::RouteResult::AlreadyExists) => {}
+                Ok(cloudflare::RouteResult::DnsFailure(ref e)) => {
+                    let _ = tx.send(BgResult::RouteRenamed {
+                        status_msg: format!("⚠ New route ok, DNS failed: {} — re-run m to fix", e),
+                        tunnel_name, api_token, account_id, tunnel_id,
+                    });
+                    return;
+                }
+                Err(e) => {
+                    let msg = if e.contains("10000") || e.contains("Authentication") {
+                        format!("✗ API token needs Cloudflare Tunnel:Edit permission — {}", e)
+                    } else {
+                        format!("✗ Failed to create {}: {}", new_hostname, e)
+                    };
+                    let _ = tx.send(BgResult::RouteRenamed {
+                        status_msg: msg,
+                        tunnel_name, api_token, account_id, tunnel_id,
+                    });
+                    return;
+                }
             }
-            Ok(cloudflare::RouteResult::DnsFailure(ref e)) => {
-                self.status_msg = Some(format!("⚠ Renamed, old DNS cleanup failed: {}", e));
-            }
-            Ok(cloudflare::RouteResult::AlreadyExists) => unreachable!(),
-            Err(e) => {
-                self.status_msg = Some(format!("⚠ New route ok, old removal failed: {}", e));
-            }
-        }
 
-        self.reload_routes(tunnel_name, api_token, account_id, tunnel_id);
+            // Remove old route
+            let status_msg = match cloudflare::remove_route(&api_token, &account_id, &tunnel_id, &old_hostname) {
+                Ok(cloudflare::RouteResult::Ok) => {
+                    format!("✓ Renamed {} → {}", old_hostname, new_hostname)
+                }
+                Ok(cloudflare::RouteResult::DnsFailure(ref e)) => {
+                    format!("⚠ Renamed, old DNS cleanup failed: {}", e)
+                }
+                Ok(cloudflare::RouteResult::AlreadyExists) => unreachable!(),
+                Err(e) => {
+                    format!("⚠ New route ok, old removal failed: {}", e)
+                }
+            };
+
+            let _ = tx.send(BgResult::RouteRenamed {
+                status_msg, tunnel_name, api_token, account_id, tunnel_id,
+            });
+        });
     }
 
     pub fn confirm_delete_route(&mut self) {
@@ -760,94 +986,85 @@ impl App {
             service
         };
 
-        match cloudflare::add_route(&api_token, &account_id, &tunnel_id, &hostname, &service) {
-            Ok(cloudflare::RouteResult::Ok) => {
-                self.status_msg = Some(format!("✓ {} → {} (route + DNS)", hostname, service));
-            }
-            Ok(cloudflare::RouteResult::AlreadyExists) => {
-                self.status_msg = Some(format!("✓ {} — route exists, DNS ok", hostname));
-            }
-            Ok(cloudflare::RouteResult::DnsFailure(ref e)) => {
-                self.status_msg = Some(format!(
-                    "⚠ Route ok, DNS failed: {} — re-run or add CNAME: {} → {}.cfargotunnel.com",
-                    e, hostname, tunnel_id
-                ));
-            }
-            Err(e) => {
-                self.status_msg = Some(format!("✗ {}", e));
-                self.mode = Mode::Normal;
-                return;
-            }
-        }
+        self.loading = Some("Adding route...".into());
+        self.mode = Mode::Normal;
+        let tx = self.bg_tx.clone();
 
-        self.reload_routes(tunnel_name, api_token, account_id, tunnel_id);
+        std::thread::spawn(move || {
+            let status_msg = match cloudflare::add_route(&api_token, &account_id, &tunnel_id, &hostname, &service) {
+                Ok(cloudflare::RouteResult::Ok) => {
+                    format!("✓ {} → {} (route + DNS)", hostname, service)
+                }
+                Ok(cloudflare::RouteResult::AlreadyExists) => {
+                    format!("✓ {} — route exists, DNS ok", hostname)
+                }
+                Ok(cloudflare::RouteResult::DnsFailure(ref e)) => {
+                    format!("⚠ Route ok, DNS failed: {} — re-run or add CNAME: {} → {}.cfargotunnel.com", e, hostname, tunnel_id)
+                }
+                Err(e) => {
+                    format!("✗ {}", e)
+                }
+            };
+            let _ = tx.send(BgResult::RouteAdded {
+                status_msg, tunnel_name, api_token, account_id, tunnel_id,
+            });
+        });
     }
 
     pub fn finish_delete_route(&mut self, tunnel_name: String, api_token: String, account_id: String, tunnel_id: String, hostname: String) {
-        match cloudflare::remove_route(&api_token, &account_id, &tunnel_id, &hostname) {
-            Ok(cloudflare::RouteResult::Ok) => {
-                self.status_msg = Some(format!("✓ Removed {} (route + DNS)", hostname));
-            }
-            Ok(cloudflare::RouteResult::DnsFailure(ref e)) => {
-                self.status_msg = Some(format!(
-                    "⚠ Route removed, DNS cleanup failed: {} — manually delete CNAME for {}",
-                    e, hostname
-                ));
-            }
-            Ok(cloudflare::RouteResult::AlreadyExists) => unreachable!(),
-            Err(e) => {
-                self.status_msg = Some(format!("✗ {}", e));
-                self.mode = Mode::Normal;
-                return;
-            }
-        }
+        self.loading = Some("Removing route...".into());
+        self.mode = Mode::Normal;
+        let tx = self.bg_tx.clone();
 
-        self.reload_routes(tunnel_name, api_token, account_id, tunnel_id);
+        std::thread::spawn(move || {
+            let status_msg = match cloudflare::remove_route(&api_token, &account_id, &tunnel_id, &hostname) {
+                Ok(cloudflare::RouteResult::Ok) => {
+                    format!("✓ Removed {} (route + DNS)", hostname)
+                }
+                Ok(cloudflare::RouteResult::DnsFailure(ref e)) => {
+                    format!("⚠ Route removed, DNS cleanup failed: {} — manually delete CNAME for {}", e, hostname)
+                }
+                Ok(cloudflare::RouteResult::AlreadyExists) => unreachable!(),
+                Err(e) => {
+                    format!("✗ {}", e)
+                }
+            };
+            let _ = tx.send(BgResult::RouteDeleted {
+                status_msg, tunnel_name, api_token, account_id, tunnel_id,
+            });
+        });
     }
 
-    fn reload_routes(&mut self, tunnel_name: String, api_token: String, account_id: String, tunnel_id: String) {
-        let cf_routes = cloudflare::list_routes(&api_token, &account_id, &tunnel_id);
-        let routes: Vec<RouteRow> = cf_routes.iter()
-            .map(|r| {
-                let hostname = r.hostname.clone().unwrap_or_else(|| "(catch-all)".into());
-                let dns = if r.hostname.is_none() {
-                    DnsStatus::Ok
-                } else {
-                    match cloudflare::check_dns(&api_token, &hostname) {
-                        Ok(true) => DnsStatus::Ok,
-                        Ok(false) => {
-                            match cloudflare::ensure_dns(&api_token, &hostname, &tunnel_id) {
-                                Ok(cloudflare::RouteResult::Ok) => DnsStatus::Ok,
-                                _ => DnsStatus::Missing,
+    fn spawn_reload_routes(&self, tunnel_name: String, api_token: String, account_id: String, tunnel_id: String) {
+        let tx = self.bg_tx.clone();
+
+        std::thread::spawn(move || {
+            let cf_routes = cloudflare::list_routes(&api_token, &account_id, &tunnel_id);
+            let routes: Vec<RouteRow> = cf_routes.iter()
+                .map(|r| {
+                    let hostname = r.hostname.clone().unwrap_or_else(|| "(catch-all)".into());
+                    let dns = if r.hostname.is_none() {
+                        DnsStatus::Ok
+                    } else {
+                        match cloudflare::check_dns(&api_token, &hostname) {
+                            Ok(true) => DnsStatus::Ok,
+                            Ok(false) => {
+                                match cloudflare::ensure_dns(&api_token, &hostname, &tunnel_id) {
+                                    Ok(cloudflare::RouteResult::Ok) => DnsStatus::Ok,
+                                    _ => DnsStatus::Missing,
+                                }
                             }
+                            Err(_) => DnsStatus::Unknown,
                         }
-                        Err(_) => DnsStatus::Unknown,
-                    }
-                };
-                RouteRow { hostname, service: r.service.clone(), dns }
-            })
-            .collect();
-        self.mode = Mode::Routes {
-            tunnel_name,
-            api_token,
-            account_id,
-            tunnel_id,
-            routes,
-            selected: 0,
-        };
-        self.refresh_cf_data();
-    }
+                    };
+                    RouteRow { hostname, service: r.service.clone(), dns }
+                })
+                .collect();
 
-    fn refresh_cf_data(&mut self) {
-        let tunnel_tokens: Vec<(String, String)> = self.config.tunnels.iter()
-            .map(|t| (t.name.clone(), t.token.clone()))
-            .collect();
-        let cf_tokens = self.config.all_cf_api_tokens();
-        let sync = cloudflare::sync(&cf_tokens, &tunnel_tokens);
-        self.tunnel_info = sync.tunnel_info;
-        self.ingress_routes = sync.ingress_routes;
-        self.unreached = sync.unreached;
-        self.refresh();
+            let _ = tx.send(BgResult::Routes {
+                tunnel_name, api_token, account_id, tunnel_id, routes, status_msg: None,
+            });
+        });
     }
 
     // --- CF API Token methods ---
@@ -862,8 +1079,32 @@ impl App {
         };
     }
 
+    #[cfg(test)]
+    pub fn test_app(config: config::Config, ingress_routes: HashMap<u16, Vec<IngressRoute>>) -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self {
+            config,
+            tab: Tab::Services,
+            rows: Vec::new(),
+            service_rows: Vec::new(),
+            tunnel_info: HashMap::new(),
+            ingress_routes,
+            unreached: Vec::new(),
+            selected: 0,
+            service_selected: 0,
+            mode: Mode::Normal,
+            status_msg: None,
+            should_quit: false,
+            submenu: false,
+            loading: None,
+            spinner_tick: 0,
+            bg_tx: tx,
+            bg_rx: rx,
+        }
+    }
+
     pub fn finish_add_api_token(&mut self, token: String) {
-        // Try the token against all unreached accounts
+        // verify_token is blocking but it's a single HTTP call per unreached account — keep sync for now
         let matched: Option<&UnreachedAccount> = self.unreached.iter().find(|a| {
             cloudflare::verify_token(&token, &a.account_id, &a.tunnel_id)
         });
@@ -886,24 +1127,272 @@ impl App {
             }
         }
 
-        // Re-sync
-        let tunnel_tokens: Vec<(String, String)> = self.config.tunnels.iter()
-            .map(|t| (t.name.clone(), t.token.clone()))
-            .collect();
-        let cf_tokens = self.config.all_cf_api_tokens();
-        let sync = cloudflare::sync(&cf_tokens, &tunnel_tokens);
-        self.tunnel_info = sync.tunnel_info;
-        self.ingress_routes = sync.ingress_routes;
-        self.unreached = sync.unreached.clone();
-        self.refresh();
+        self.mode = Mode::Normal;
+        self.loading = Some("Syncing Cloudflare...".into());
+        self.spawn_cf_sync();
+    }
+}
 
-        if sync.unreached.is_empty() {
-            self.mode = Mode::Normal;
-        } else {
-            self.mode = Mode::AddingApiToken {
-                input: String::new(),
-            };
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cloudflare::IngressRoute;
+    use crate::config::{Config, Service, Tunnel};
+
+    // Token payload: {"a":"acct123","t":"tun456"}
+    const TEST_TOKEN: &str = "eyJhIjoiYWNjdDEyMyIsInQiOiJ0dW40NTYifQ==";
+
+    fn make_app(services: Vec<Service>, tunnels: Vec<Tunnel>, ingress: HashMap<u16, Vec<IngressRoute>>) -> App {
+        let config = Config {
+            tunnels,
+            services,
+            cf_api_tokens: Vec::new(),
+            cf_api_token: None,
+        };
+        App::test_app(config, ingress)
+    }
+
+    #[test]
+    fn split_hostname_splits_correctly() {
+        let (sub, domain) = super::split_hostname("katulong-mini.felixflor.es");
+        assert_eq!(sub, "katulong-mini");
+        assert_eq!(domain, ".felixflor.es");
+    }
+
+    #[test]
+    fn split_hostname_single_dot() {
+        let (sub, domain) = super::split_hostname("simple.com");
+        assert_eq!(sub, "simple");
+        assert_eq!(domain, ".com");
+    }
+
+    #[test]
+    fn split_hostname_no_dot() {
+        let (sub, domain) = super::split_hostname("bare");
+        assert_eq!(sub, "bare");
+        assert_eq!(domain, "");
+    }
+
+    #[test]
+    fn resolve_service_route_finds_route_by_port() {
+        let services = vec![Service {
+            name: "katulong".into(),
+            port: 3001,
+            machine: String::new(),
+            tunnel: None,
+            memo: None,
+        }];
+        let tunnels = vec![Tunnel {
+            name: "my-tunnel".into(),
+            token: TEST_TOKEN.into(),
+            api_token: None,
+        }];
+        let mut ingress = HashMap::new();
+        ingress.insert(3001, vec![IngressRoute {
+            hostname: "katulong-mini.felixflor.es".into(),
+            tunnel_name: "my-tunnel".into(),
+            tunnel_id: "tun456".into(),
+            scheme: "https".into(),
+        }]);
+
+        let app = make_app(services, tunnels, ingress);
+        let result = app.resolve_service_route();
+        assert!(result.is_ok(), "Expected Ok, got: {:?}", result);
+        let (tunnel_name, _, hostname, service_url) = result.unwrap();
+        assert_eq!(tunnel_name, "my-tunnel");
+        assert_eq!(hostname, "katulong-mini.felixflor.es");
+        assert_eq!(service_url, "http://localhost:3001");
+    }
+
+    #[test]
+    fn resolve_service_route_no_service_selected() {
+        let app = make_app(Vec::new(), Vec::new(), HashMap::new());
+        let result = app.resolve_service_route();
+        assert_eq!(result, Err("No service selected".into()));
+    }
+
+    #[test]
+    fn resolve_service_route_no_route_for_port() {
+        let services = vec![Service {
+            name: "postgres".into(),
+            port: 5432,
+            machine: String::new(),
+            tunnel: None,
+            memo: Some("levee db".into()),
+        }];
+
+        let app = make_app(services, Vec::new(), HashMap::new());
+        let result = app.resolve_service_route();
+        assert_eq!(result, Err("No route found for this service".into()));
+    }
+
+    #[test]
+    fn resolve_service_route_no_matching_tunnel() {
+        let services = vec![Service {
+            name: "katulong".into(),
+            port: 3001,
+            machine: String::new(),
+            tunnel: None,
+            memo: None,
+        }];
+        // No tunnels configured
+        let mut ingress = HashMap::new();
+        ingress.insert(3001, vec![IngressRoute {
+            hostname: "katulong-mini.felixflor.es".into(),
+            tunnel_name: "my-tunnel".into(),
+            tunnel_id: "tun456".into(),
+            scheme: "https".into(),
+        }]);
+
+        let app = make_app(services, Vec::new(), ingress);
+        let result = app.resolve_service_route();
+        assert_eq!(result, Err("Tunnel not found for this route".into()));
+    }
+
+    #[test]
+    fn resolve_service_route_returns_decoded_token_data() {
+        let services = vec![Service {
+            name: "katulong".into(),
+            port: 3001,
+            machine: String::new(),
+            tunnel: None,
+            memo: None,
+        }];
+        let tunnels = vec![Tunnel {
+            name: "my-tunnel".into(),
+            token: TEST_TOKEN.into(),
+            api_token: None,
+        }];
+        let mut ingress = HashMap::new();
+        ingress.insert(3001, vec![IngressRoute {
+            hostname: "katulong-mini.felixflor.es".into(),
+            tunnel_name: "my-tunnel".into(),
+            tunnel_id: "tun456".into(),
+            scheme: "https".into(),
+        }]);
+
+        let app = make_app(services, tunnels, ingress);
+        let (_, token, _, _) = app.resolve_service_route().unwrap();
+        // Verify the token can be decoded to get account_id
+        let payload = config::decode_token(&token).unwrap();
+        assert_eq!(payload.account_id, "acct123");
+        assert_eq!(payload.tunnel_id, "tun456");
+    }
+
+    #[test]
+    fn resolve_service_route_selects_correct_service() {
+        let services = vec![
+            Service {
+                name: "dogtopia".into(),
+                port: 3000,
+                machine: String::new(),
+                tunnel: None,
+                memo: None,
+            },
+            Service {
+                name: "katulong".into(),
+                port: 3001,
+                machine: String::new(),
+                tunnel: None,
+                memo: None,
+            },
+        ];
+        let tunnels = vec![Tunnel {
+            name: "my-tunnel".into(),
+            token: TEST_TOKEN.into(),
+            api_token: None,
+        }];
+        let mut ingress = HashMap::new();
+        ingress.insert(3000, vec![IngressRoute {
+            hostname: "dogtopia.everyday.vet".into(),
+            tunnel_name: "my-tunnel".into(),
+            tunnel_id: "tun456".into(),
+            scheme: "https".into(),
+        }]);
+        ingress.insert(3001, vec![IngressRoute {
+            hostname: "katulong-mini.felixflor.es".into(),
+            tunnel_name: "my-tunnel".into(),
+            tunnel_id: "tun456".into(),
+            scheme: "https".into(),
+        }]);
+
+        let mut app = make_app(services, tunnels, ingress);
+        app.service_selected = 1; // katulong
+        let result = app.resolve_service_route();
+        assert!(result.is_ok());
+        let (_, _, hostname, _) = result.unwrap();
+        assert_eq!(hostname, "katulong-mini.felixflor.es");
+    }
+
+    #[test]
+    fn begin_rename_service_route_sets_error_when_no_route() {
+        let services = vec![Service {
+            name: "postgres".into(),
+            port: 5432,
+            machine: String::new(),
+            tunnel: None,
+            memo: Some("levee db".into()),
+        }];
+        let mut app = make_app(services, Vec::new(), HashMap::new());
+        app.begin_rename_service_route();
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.status_msg, Some("No route found for this service".into()));
+    }
+
+    #[test]
+    fn begin_rename_service_route_sets_error_when_no_tunnel() {
+        let services = vec![Service {
+            name: "katulong".into(),
+            port: 3001,
+            machine: String::new(),
+            tunnel: None,
+            memo: None,
+        }];
+        let mut ingress = HashMap::new();
+        ingress.insert(3001, vec![IngressRoute {
+            hostname: "katulong-mini.felixflor.es".into(),
+            tunnel_name: "my-tunnel".into(),
+            tunnel_id: "tun456".into(),
+            scheme: "https".into(),
+        }]);
+
+        let mut app = make_app(services, Vec::new(), ingress);
+        app.begin_rename_service_route();
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.status_msg, Some("Tunnel not found for this route".into()));
+    }
+
+    #[test]
+    fn begin_rename_service_route_sets_error_when_no_api_token() {
+        let services = vec![Service {
+            name: "katulong".into(),
+            port: 3001,
+            machine: String::new(),
+            tunnel: None,
+            memo: None,
+        }];
+        let tunnels = vec![Tunnel {
+            name: "my-tunnel".into(),
+            token: TEST_TOKEN.into(),
+            api_token: None,
+        }];
+        let mut ingress = HashMap::new();
+        ingress.insert(3001, vec![IngressRoute {
+            hostname: "katulong-mini.felixflor.es".into(),
+            tunnel_name: "my-tunnel".into(),
+            tunnel_id: "tun456".into(),
+            scheme: "https".into(),
+        }]);
+
+        let mut app = make_app(services, tunnels, ingress);
+        // No cf_api_tokens configured, so verify_token can't find a match
+        app.begin_rename_service_route();
+        // This now runs in a background thread — wait for it
+        assert!(app.loading.is_some());
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        app.poll_bg();
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.status_msg, Some("No API token with access — press T to add one".into()));
     }
 }
 

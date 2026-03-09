@@ -71,8 +71,8 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::AddingRoute { tunnel_name, field, hostname, service, .. } => {
             draw_add_route_dialog(f, tunnel_name, field, hostname, service);
         }
-        Mode::RenamingRoute { old_hostname, new_hostname, .. } => {
-            draw_rename_route_dialog(f, old_hostname, new_hostname);
+        Mode::RenamingRoute { old_hostname, new_subdomain, domain_suffix, .. } => {
+            draw_rename_route_dialog(f, old_hostname, new_subdomain, domain_suffix);
         }
         Mode::ConfirmingRouteDelete { hostname, .. } => {
             draw_confirm_dialog(f, "remove route", hostname);
@@ -189,14 +189,16 @@ fn draw_table(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
-    let msg = app
-        .status_msg
-        .as_deref()
-        .unwrap_or("");
+    let (msg, color) = if let Some(ref loading_msg) = app.loading {
+        let frame = crate::app::SPINNER[app.spinner_tick % crate::app::SPINNER.len()];
+        (format!("{} {}", frame, loading_msg), CYAN)
+    } else {
+        (app.status_msg.as_deref().unwrap_or("").to_string(), YELLOW)
+    };
 
     let status = Paragraph::new(Line::from(vec![
         Span::styled(" ", Style::default()),
-        Span::styled(msg, Style::default().fg(YELLOW)),
+        Span::styled(msg, Style::default().fg(color)),
     ]))
     .block(
         Block::default()
@@ -219,6 +221,7 @@ fn draw_keybindings(f: &mut Frame, app: &App, area: Rect) {
             ("j/k", "nav"),
             ("a", "add"),
             ("e", "edit"),
+            ("m", "rename url"),
             ("d", "del"),
             (".", "more"),
             ("q", "quit"),
@@ -583,6 +586,10 @@ fn draw_help(f: &mut Frame) {
             Span::raw("Edit service"),
         ]),
         Line::from(vec![
+            Span::styled("  m     ", Style::default().fg(CYAN)),
+            Span::raw("Rename subdomain"),
+        ]),
+        Line::from(vec![
             Span::styled("  d     ", Style::default().fg(RED)),
             Span::raw("Delete service"),
         ]),
@@ -633,7 +640,7 @@ fn draw_services_table(f: &mut Frame, app: &App, area: Rect) {
                 _ => DIM,
             };
 
-            let url_color = if row.url.starts_with("https://") { CYAN } else { DIM };
+            let url_color = if row.url != "—" { CYAN } else { DIM };
 
             let style = if i == app.service_selected {
                 Style::default()
@@ -789,7 +796,7 @@ fn draw_add_route_dialog(f: &mut Frame, tunnel_name: &str, field: &RouteField, h
     );
 }
 
-fn draw_rename_route_dialog(f: &mut Frame, old_hostname: &str, new_hostname: &str) {
+fn draw_rename_route_dialog(f: &mut Frame, old_hostname: &str, new_subdomain: &str, domain_suffix: &str) {
     let area = fixed_centered_rect(65, 7, f.area());
     f.render_widget(Clear, area);
 
@@ -810,12 +817,15 @@ fn draw_rename_route_dialog(f: &mut Frame, old_hostname: &str, new_hostname: &st
     .split(inner);
 
     f.render_widget(
-        Paragraph::new("  New hostname:").style(Style::default().fg(DIM)),
+        Paragraph::new("  New subdomain:").style(Style::default().fg(DIM)),
         chunks[0],
     );
     f.render_widget(
-        Paragraph::new(format!("  > {}_", new_hostname))
-            .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Paragraph::new(Line::from(vec![
+            Span::raw("  > "),
+            Span::styled(format!("{}_", new_subdomain), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(domain_suffix, Style::default().fg(DIM)),
+        ])),
         chunks[2],
     );
 }
