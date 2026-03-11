@@ -921,46 +921,53 @@ fn parse_flag(args: &[String], flag: &str) -> Option<String> {
 }
 
 fn print_help() {
-    println!("tunnels — k9s-style TUI for managing cloudflared tunnels and local services");
+    println!("tunnels — manage cloudflared tunnels, routes, and local services");
+    println!();
+    println!("No sudo needed. Tunnels run as LaunchAgents in your user session.");
     println!();
     println!("USAGE:");
-    println!("  tunnels                              Launch TUI");
+    println!("  tunnels                              Launch interactive TUI");
     println!("  tunnels <command> [args]              Run a CLI command");
     println!();
-    println!("TUNNEL COMMANDS:");
-    println!("  list [--json]                         List tunnels");
-    println!("  start <name>                          Start a tunnel");
-    println!("  stop <name>                           Stop a tunnel");
-    println!("  restart <name>                        Restart a tunnel");
+    println!("QUICK START:");
+    println!("  tunnels list                          See what tunnels exist");
+    println!("  tunnels restart <name>                Restart a tunnel that's down");
+    println!("  tunnels routes <name>                 See hostname → port mappings");
+    println!("  tunnels route add app.example.com 3000 --tunnel my-tunnel");
+    println!("                                        Expose localhost:3000 as app.example.com");
+    println!();
+    println!("TUNNEL LIFECYCLE:");
+    println!("  list [--json]                         List tunnels with status and PID");
+    println!("  start <name>                          Start a tunnel (bootstraps LaunchAgent)");
+    println!("  stop <name>                           Stop a tunnel (removes LaunchAgent)");
+    println!("  restart <name>                        Restart a tunnel (kickstart or stop+start)");
     println!("  logs <name> [--lines N]               View tunnel logs (default 50 lines)");
-    println!("  add <name> --token <token>            Add a new tunnel");
-    println!("  rm <name>                             Delete a tunnel");
+    println!("  add <name> --token <token>            Register a new tunnel");
+    println!("  rm <name>                             Delete a tunnel and its LaunchAgent");
     println!("  rename <old> <new>                    Rename a tunnel");
     println!("  import                                Import existing cloudflared plists");
     println!();
     println!("ROUTE COMMANDS:");
-    println!("  routes [tunnel] [--json]              List ingress routes");
-    println!("  route add <host> <port> --tunnel <n>  Add a route (idempotent)");
+    println!("  routes [tunnel] [--json]              List ingress routes (hostname → service)");
+    println!("  route add <host> <port> --tunnel <n>  Add a route (idempotent, creates DNS)");
     println!("  route rm <host> --tunnel <name>       Remove a route");
-    println!("  route mv <old> <new> --tunnel <name>  Rename a route");
+    println!("  route mv <old> <new> --tunnel <name>  Rename a route's hostname");
     println!();
-    println!("SERVICE COMMANDS:");
-    println!("  service list [--json]                 List tracked services");
+    println!("SERVICE TRACKING:");
+    println!("  service list [--json]                 List tracked local services");
     println!("  service add <name> --port <p> [--tunnel <t>] [--memo <m>]");
-    println!("                                        Add a service");
-    println!("  service rm <name>                     Remove a service");
+    println!("  service rm <name>                     Untrack a service");
     println!("  service edit <name> [--port <p>] [--tunnel <t>] [--memo <m>]");
-    println!("                                        Edit a service");
-    println!("  service scan                          Scan for listening ports");
+    println!("  service scan                          Scan for listening ports (lsof)");
     println!();
-    println!("TOKEN COMMANDS:");
+    println!("TOKENS:");
     println!("  token add <token>                     Add a Cloudflare API token");
-    println!("  token edit <tunnel> --token <token>   Set per-tunnel token");
+    println!("  token edit <tunnel> --token <token>   Set per-tunnel API token");
+    println!("  sync                                  Sync routes from Cloudflare API");
     println!();
-    println!("OTHER:");
-    println!("  sync                                  Sync from Cloudflare API");
-    println!("  help, --help, -h                      Show this help");
-    println!("  --version, -v                         Show version");
+    println!("CONFIG: ~/.config/tunnels/config.json");
+    println!("PLISTS: ~/Library/LaunchAgents/com.cloudflare.cloudflared-<name>.plist");
+    println!("LOGS:   ~/Library/Logs/tunnels/");
 }
 
 fn cli_start(name: Option<&str>) -> Result<()> {

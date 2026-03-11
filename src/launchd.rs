@@ -99,7 +99,13 @@ pub fn status(name: &str) -> Status {
     }
 }
 
+fn gui_domain() -> String {
+    let uid = unsafe { libc::getuid() };
+    format!("gui/{}", uid)
+}
+
 pub fn start(name: &str, token: &str) -> Result<()> {
+    let label = label_for(name);
     let path = plist_path(name);
     let plist = generate_plist(name, token);
 
@@ -110,38 +116,81 @@ pub fn start(name: &str, token: &str) -> Result<()> {
     std::fs::create_dir_all(log_dir())?;
 
     // Write plist directly — no sudo needed for ~/Library/LaunchAgents
-    std::fs::write(&path, plist)?;
+    std::fs::write(&path, &plist)?;
 
+    // Try modern bootstrap first, fall back to legacy load
+    let domain = gui_domain();
     let out = Command::new("launchctl")
-        .args(["load", &path.to_string_lossy()])
+        .args(["bootstrap", &domain, &path.to_string_lossy()])
         .output()
-        .context("launchctl load")?;
+        .context("launchctl bootstrap")?;
 
     if !out.status.success() {
-        anyhow::bail!(
-            "launchctl load failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // error 37 = "already bootstrapped" — that's fine, just kickstart it
+        if stderr.contains("37:") || stderr.contains("already loaded") || stderr.contains("Bootstrap failed") {
+            let _ = Command::new("launchctl")
+                .args(["kickstart", "-k", &format!("{}/{}", domain, label)])
+                .output();
+        } else {
+            // Fall back to legacy load
+            let legacy = Command::new("launchctl")
+                .args(["load", &path.to_string_lossy()])
+                .output()
+                .context("launchctl load (legacy fallback)")?;
+            if !legacy.status.success() {
+                anyhow::bail!(
+                    "launchctl start failed: {}",
+                    String::from_utf8_lossy(&legacy.stderr)
+                );
+            }
+        }
     }
     Ok(())
 }
 
 pub fn stop(name: &str) -> Result<()> {
+    let label = label_for(name);
     let path = plist_path(name);
     if !path.exists() {
         return Ok(());
     }
 
-    let _ = Command::new("launchctl")
-        .args(["unload", &path.to_string_lossy()])
+    // Try modern bootout first, fall back to legacy unload
+    let domain = gui_domain();
+    let out = Command::new("launchctl")
+        .args(["bootout", &format!("{}/{}", domain, label)])
         .output();
 
-    let _ = std::fs::remove_file(&path);
+    if let Ok(o) = &out {
+        if !o.status.success() {
+            // Fall back to legacy unload
+            let _ = Command::new("launchctl")
+                .args(["unload", &path.to_string_lossy()])
+                .output();
+        }
+    }
 
+    let _ = std::fs::remove_file(&path);
     Ok(())
 }
 
 pub fn restart(name: &str, token: &str) -> Result<()> {
+    let label = label_for(name);
+    let domain = gui_domain();
+
+    // Try kickstart -k (kill + restart) first — fastest path
+    let out = Command::new("launchctl")
+        .args(["kickstart", "-k", &format!("{}/{}", domain, label)])
+        .output();
+
+    if let Ok(o) = &out {
+        if o.status.success() {
+            return Ok(());
+        }
+    }
+
+    // If not bootstrapped, do full stop + start
     stop(name)?;
     start(name, token)
 }

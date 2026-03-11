@@ -1400,6 +1400,7 @@ dependencies = [
  "base64",
  "crossterm",
  "dirs",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",
