@@ -79,6 +79,7 @@ fn main() -> Result<()> {
                 }
             }
             "sync" => return cli_sync(),
+            "heal" => return cli_heal(),
             "--version" | "-v" | "-V" => {
                 println!("tunnels {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
@@ -964,6 +965,7 @@ fn print_help() {
     println!("  token add <token>                     Add a Cloudflare API token");
     println!("  token edit <tunnel> --token <token>   Set per-tunnel API token");
     println!("  sync                                  Sync routes from Cloudflare API");
+    println!("  heal                                  Restart tunnels with no edge connections");
     println!();
     println!("CONFIG: ~/.config/tunnels/config.json");
     println!("PLISTS: ~/Library/LaunchAgents/com.cloudflare.cloudflared-<name>.plist");
@@ -1256,6 +1258,63 @@ fn cli_sync() -> Result<()> {
                 println!("{:<8} {:<35} {}", port, entry.hostname, entry.tunnel_name);
             }
         }
+    }
+
+    Ok(())
+}
+
+fn cli_heal() -> Result<()> {
+    let config = config::Config::load()?;
+    let api_tokens = config.all_cf_api_tokens();
+
+    if api_tokens.is_empty() {
+        eprintln!("No API tokens configured. Add one with: tunnels token add <token>");
+        std::process::exit(1);
+    }
+
+    let tunnel_tokens: Vec<(String, String)> = config.tunnels.iter()
+        .map(|t| (t.name.clone(), t.token.clone()))
+        .collect();
+
+    let result = cloudflare::sync(&api_tokens, &tunnel_tokens);
+
+    // Find tunnels that are running locally but have no edge connections
+    let mut healed = Vec::new();
+
+    for tunnel in &config.tunnels {
+        let status = launchd::status(&tunnel.name);
+        let is_running = matches!(status, launchd::Status::Running { .. });
+        if !is_running {
+            continue;
+        }
+
+        // Decode token to get tunnel_id
+        let tunnel_id = match config::decode_token(&tunnel.token) {
+            Ok(p) => p.tunnel_id,
+            Err(_) => continue,
+        };
+
+        let has_edge = result.tunnel_info.get(&tunnel_id)
+            .map(|info| !info.connections.starts_with("no "))
+            .unwrap_or(false);
+
+        if !has_edge {
+            match launchd::restart(&tunnel.name, &tunnel.token) {
+                Ok(()) => {
+                    println!("↻ Restarted {} (no edge connections)", tunnel.name);
+                    healed.push(tunnel.name.clone());
+                }
+                Err(e) => {
+                    eprintln!("✗ Failed to restart {}: {}", tunnel.name, e);
+                }
+            }
+        }
+    }
+
+    if healed.is_empty() {
+        println!("All running tunnels have edge connections.");
+    } else {
+        println!("Healed {} tunnel(s).", healed.len());
     }
 
     Ok(())
