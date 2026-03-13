@@ -51,10 +51,7 @@ fn generate_plist(name: &str, token: &str) -> String {
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
-	<dict>
-		<key>SuccessfulExit</key>
-		<false/>
-	</dict>
+	<true/>
 	<key>StandardOutPath</key>
 	<string>{log_dir_str}/{label}.out.log</string>
 	<key>StandardErrorPath</key>

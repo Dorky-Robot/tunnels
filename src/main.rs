@@ -1287,11 +1287,11 @@ fn cli_heal() -> Result<()> {
     let mut attempted: usize = 0;
 
     for tunnel in &config.tunnels {
-        // Only heal tunnels that are running with an active PID
-        let is_running = matches!(launchd::status(&tunnel.name), launchd::Status::Running { pid: Some(_) });
-        if !is_running {
-            continue;
-        }
+        let status = launchd::status(&tunnel.name);
+        let (_is_loaded, has_pid) = match &status {
+            launchd::Status::Running { pid } => (true, pid.is_some()),
+            _ => continue, // Stopped or Inactive — not managed, skip
+        };
 
         let tunnel_id = match config::decode_token(&tunnel.token) {
             Ok(p) => p.tunnel_id,
@@ -1306,11 +1306,17 @@ fn cli_heal() -> Result<()> {
             continue;
         }
 
-        let has_edge = result.tunnel_info.get(&tunnel_id)
-            .map(|info| info.connection_count > 0)
-            .unwrap_or(true); // assume healthy when data is missing
+        // Needs healing if: loaded but no process, or running but no edge connections
+        let needs_heal = if !has_pid {
+            true // loaded in launchd but process not running
+        } else {
+            let has_edge = result.tunnel_info.get(&tunnel_id)
+                .map(|info| info.connection_count > 0)
+                .unwrap_or(true); // assume healthy when data is missing
+            !has_edge
+        };
 
-        if !has_edge {
+        if needs_heal {
             attempted += 1;
             match launchd::restart(&tunnel.name, &tunnel.token) {
                 Ok(()) => {
