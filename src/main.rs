@@ -79,6 +79,7 @@ fn main() -> Result<()> {
                 }
             }
             "sync" => return cli_sync(),
+            "heal" => return cli_heal(),
             "--version" | "-v" | "-V" => {
                 println!("tunnels {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
@@ -964,6 +965,7 @@ fn print_help() {
     println!("  token add <token>                     Add a Cloudflare API token");
     println!("  token edit <tunnel> --token <token>   Set per-tunnel API token");
     println!("  sync                                  Sync routes from Cloudflare API");
+    println!("  heal                                  Restart tunnels with no edge connections");
     println!();
     println!("CONFIG: ~/.config/tunnels/config.json");
     println!("PLISTS: ~/Library/LaunchAgents/com.cloudflare.cloudflared-<name>.plist");
@@ -1221,7 +1223,7 @@ fn cli_service_scan() -> Result<()> {
     Ok(())
 }
 
-fn cli_sync() -> Result<()> {
+fn load_sync_result() -> Result<(config::Config, cloudflare::SyncResult)> {
     let config = config::Config::load()?;
     let api_tokens = config.all_cf_api_tokens();
 
@@ -1234,8 +1236,14 @@ fn cli_sync() -> Result<()> {
         .map(|t| (t.name.clone(), t.token.clone()))
         .collect();
 
-    println!("Syncing from Cloudflare...");
     let result = cloudflare::sync(&api_tokens, &tunnel_tokens);
+    Ok((config, result))
+}
+
+fn cli_sync() -> Result<()> {
+    println!("Syncing from Cloudflare...");
+    let (_config, result) = load_sync_result()?;
+
     println!("{}", result.status);
 
     if !result.unreached.is_empty() {
@@ -1256,6 +1264,78 @@ fn cli_sync() -> Result<()> {
                 println!("{:<8} {:<35} {}", port, entry.hostname, entry.tunnel_name);
             }
         }
+    }
+
+    Ok(())
+}
+
+fn cli_heal() -> Result<()> {
+    let (config, result) = load_sync_result()?;
+
+    // If we got no tunnel data at all, the API is likely unreachable — don't restart anything
+    if result.tunnel_info.is_empty() {
+        eprintln!("Could not fetch tunnel status from Cloudflare API — aborting heal.");
+        std::process::exit(1);
+    }
+
+    // Build set of unreached tunnel IDs so we skip them rather than false-positive restart
+    let unreached_ids: std::collections::HashSet<String> = result.unreached.iter()
+        .map(|u| u.tunnel_id.clone())
+        .collect();
+
+    let mut healed: usize = 0;
+    let mut attempted: usize = 0;
+
+    for tunnel in &config.tunnels {
+        let status = launchd::status(&tunnel.name);
+        let (_is_loaded, has_pid) = match &status {
+            launchd::Status::Running { pid } => (true, pid.is_some()),
+            _ => continue, // Stopped or Inactive — not managed, skip
+        };
+
+        let tunnel_id = match config::decode_token(&tunnel.token) {
+            Ok(p) => p.tunnel_id,
+            Err(e) => {
+                eprintln!("Skipping {}: could not decode token ({})", tunnel.name, e);
+                continue;
+            }
+        };
+
+        // Skip tunnels whose accounts we couldn't reach — no data, not confirmed unhealthy
+        if unreached_ids.contains(&tunnel_id) {
+            continue;
+        }
+
+        // Needs healing if: loaded but no process, or running but no edge connections
+        let needs_heal = if !has_pid {
+            true // loaded in launchd but process not running
+        } else {
+            let has_edge = result.tunnel_info.get(&tunnel_id)
+                .map(|info| info.connection_count > 0)
+                .unwrap_or(true); // assume healthy when data is missing
+            !has_edge
+        };
+
+        if needs_heal {
+            attempted += 1;
+            match launchd::restart(&tunnel.name, &tunnel.token) {
+                Ok(()) => {
+                    println!("↻ Restarted {} (no edge connections)", tunnel.name);
+                    healed += 1;
+                }
+                Err(e) => {
+                    eprintln!("✗ Failed to restart {}: {}", tunnel.name, e);
+                }
+            }
+        }
+    }
+
+    if attempted == 0 {
+        println!("All running tunnels have edge connections.");
+    } else if healed == attempted {
+        println!("Healed {} tunnel(s).", healed);
+    } else {
+        println!("Healed {} of {} tunnel(s).", healed, attempted);
     }
 
     Ok(())

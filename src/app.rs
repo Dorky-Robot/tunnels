@@ -265,14 +265,14 @@ impl App {
                     let best = routes.iter()
                         .find(|r| {
                             self.tunnel_info.get(&r.tunnel_id)
-                                .map_or(false, |info| !info.connections.starts_with("no "))
+                                .map_or(false, |info| info.connection_count > 0)
                         })
                         .or(routes.first());
 
                     if let Some(route) = best {
                         let status = self.tunnel_info.get(&route.tunnel_id)
                             .map(|info| {
-                                if info.connections.starts_with("no ") { "no edge" } else { "connected" }
+                                if info.connection_count == 0 { "no edge" } else { "connected" }
                             })
                             .unwrap_or("—")
                             .to_string();
