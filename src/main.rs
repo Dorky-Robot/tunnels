@@ -1223,7 +1223,7 @@ fn cli_service_scan() -> Result<()> {
     Ok(())
 }
 
-fn cli_sync() -> Result<()> {
+fn load_sync_result() -> Result<(config::Config, cloudflare::SyncResult)> {
     let config = config::Config::load()?;
     let api_tokens = config.all_cf_api_tokens();
 
@@ -1236,8 +1236,14 @@ fn cli_sync() -> Result<()> {
         .map(|t| (t.name.clone(), t.token.clone()))
         .collect();
 
-    println!("Syncing from Cloudflare...");
     let result = cloudflare::sync(&api_tokens, &tunnel_tokens);
+    Ok((config, result))
+}
+
+fn cli_sync() -> Result<()> {
+    println!("Syncing from Cloudflare...");
+    let (_config, result) = load_sync_result()?;
+
     println!("{}", result.status);
 
     if !result.unreached.is_empty() {
@@ -1264,45 +1270,52 @@ fn cli_sync() -> Result<()> {
 }
 
 fn cli_heal() -> Result<()> {
-    let config = config::Config::load()?;
-    let api_tokens = config.all_cf_api_tokens();
+    let (config, result) = load_sync_result()?;
 
-    if api_tokens.is_empty() {
-        eprintln!("No API tokens configured. Add one with: tunnels token add <token>");
+    // If we got no tunnel data at all, the API is likely unreachable — don't restart anything
+    if result.tunnel_info.is_empty() {
+        eprintln!("Could not fetch tunnel status from Cloudflare API — aborting heal.");
         std::process::exit(1);
     }
 
-    let tunnel_tokens: Vec<(String, String)> = config.tunnels.iter()
-        .map(|t| (t.name.clone(), t.token.clone()))
+    // Build set of unreached tunnel IDs so we skip them rather than false-positive restart
+    let unreached_ids: std::collections::HashSet<String> = result.unreached.iter()
+        .map(|u| u.tunnel_id.clone())
         .collect();
 
-    let result = cloudflare::sync(&api_tokens, &tunnel_tokens);
-
-    // Find tunnels that are running locally but have no edge connections
-    let mut healed = Vec::new();
+    let mut healed: usize = 0;
+    let mut attempted: usize = 0;
 
     for tunnel in &config.tunnels {
-        let status = launchd::status(&tunnel.name);
-        let is_running = matches!(status, launchd::Status::Running { .. });
+        // Only heal tunnels that are running with an active PID
+        let is_running = matches!(launchd::status(&tunnel.name), launchd::Status::Running { pid: Some(_) });
         if !is_running {
             continue;
         }
 
-        // Decode token to get tunnel_id
         let tunnel_id = match config::decode_token(&tunnel.token) {
             Ok(p) => p.tunnel_id,
-            Err(_) => continue,
+            Err(e) => {
+                eprintln!("Skipping {}: could not decode token ({})", tunnel.name, e);
+                continue;
+            }
         };
 
+        // Skip tunnels whose accounts we couldn't reach — no data, not confirmed unhealthy
+        if unreached_ids.contains(&tunnel_id) {
+            continue;
+        }
+
         let has_edge = result.tunnel_info.get(&tunnel_id)
-            .map(|info| !info.connections.starts_with("no "))
-            .unwrap_or(false);
+            .map(|info| info.connection_count > 0)
+            .unwrap_or(true); // assume healthy when data is missing
 
         if !has_edge {
+            attempted += 1;
             match launchd::restart(&tunnel.name, &tunnel.token) {
                 Ok(()) => {
                     println!("↻ Restarted {} (no edge connections)", tunnel.name);
-                    healed.push(tunnel.name.clone());
+                    healed += 1;
                 }
                 Err(e) => {
                     eprintln!("✗ Failed to restart {}: {}", tunnel.name, e);
@@ -1311,10 +1324,12 @@ fn cli_heal() -> Result<()> {
         }
     }
 
-    if healed.is_empty() {
+    if attempted == 0 {
         println!("All running tunnels have edge connections.");
+    } else if healed == attempted {
+        println!("Healed {} tunnel(s).", healed);
     } else {
-        println!("Healed {} tunnel(s).", healed.len());
+        println!("Healed {} of {} tunnel(s).", healed, attempted);
     }
 
     Ok(())

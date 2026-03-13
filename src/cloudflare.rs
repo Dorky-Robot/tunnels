@@ -52,6 +52,7 @@ struct CfTunnelDetail {
 pub struct TunnelInfo {
     pub cf_name: String,
     pub connections: String,
+    pub connection_count: usize,
 }
 
 /// An ingress rule resolved to a port
@@ -165,9 +166,11 @@ pub fn sync(cf_api_tokens: &[&str], tunnel_tokens: &[(String, String)]) -> SyncR
                             .map(|c| c.colo_name.as_str()).collect();
                         format!("{}x edge ({})", colos.len(), colos.join(", "))
                     };
+                    let connection_count = detail.connections.len();
                     tunnel_info.insert(tunnel_id.clone(), TunnelInfo {
                         cf_name: detail.name,
                         connections: conns,
+                        connection_count,
                     });
                 }
 
