@@ -43,3 +43,69 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: tunnels-*.tar.gz
+
+  update-tap:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Compute SHA256 sums
+        run: |
+          for f in tunnels-*.tar.gz; do
+            target=$(echo "$f" | sed "s/tunnels-${GITHUB_REF_NAME}-//" | sed 's/\.tar\.gz//' | tr '-' '_')
+            sha=$(sha256sum "$f" | cut -d' ' -f1)
+            echo "SHA_${target}=${sha}" >> "$GITHUB_ENV"
+          done
+
+      - name: Checkout tap repo
+        uses: actions/checkout@v4
+        with:
+          repository: dorky-robot/homebrew-tap
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update formula
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          TAG="${GITHUB_REF_NAME}"
+          BASE="https://github.com/Dorky-Robot/tunnels/releases/download/${TAG}"
+
+          mkdir -p homebrew-tap/Formula
+          cat > homebrew-tap/Formula/tunnels.rb << FORMULA
+          class Tunnels < Formula
+            desc "k9s-style TUI for managing cloudflared tunnels and local services"
+            homepage "https://github.com/Dorky-Robot/tunnels"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "${BASE}/tunnels-${TAG}-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA_aarch64_apple_darwin}"
+              end
+
+              on_intel do
+                url "${BASE}/tunnels-${TAG}-x86_64-apple-darwin.tar.gz"
+                sha256 "${SHA_x86_64_apple_darwin}"
+              end
+            end
+
+            def install
+              bin.install "tunnels"
+            end
+
+            test do
+              assert_match "tunnels", shell_output("#{bin}/tunnels --help")
+            end
+          end
+          FORMULA
+
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/tunnels.rb
+          git commit -m "tunnels ${VERSION}"
+          git push
