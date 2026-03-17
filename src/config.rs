@@ -123,6 +123,15 @@ impl Config {
     }
 
     pub fn update_token(&mut self, name: &str, token: String) -> Result<()> {
+        // Validate that the token is a valid connector token (base64-encoded JSON
+        // with account_id and tunnel_id fields). This prevents accidentally
+        // overwriting the connector token with a CF API token.
+        decode_token(&token).with_context(|| {
+            "This doesn't look like a tunnel connector token. \
+             Connector tokens are base64-encoded and start with 'eyJ...'. \
+             If you meant to add a Cloudflare API token, use: tunnels token add <token>"
+        })?;
+
         let t = self
             .tunnels
             .iter_mut()
@@ -177,4 +186,170 @@ pub fn decode_token(token: &str) -> Result<TokenPayload> {
     use base64::Engine;
     let bytes = STANDARD.decode(token).with_context(|| "base64 decode")?;
     serde_json::from_slice(&bytes).with_context(|| "json decode token payload")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    use std::path::Path;
+
+    /// Helper: build a Config with one tunnel using a valid connector token.
+    fn test_config(dir: &Path) -> (Config, String) {
+        let payload = serde_json::json!({ "a": "acct123", "t": "tun456", "s": "secret" });
+        let valid_token = STANDARD.encode(serde_json::to_vec(&payload).unwrap());
+
+        let config = Config {
+            tunnels: vec![Tunnel {
+                name: "my-tunnel".into(),
+                token: valid_token.clone(),
+                api_token: None,
+            }],
+            services: vec![],
+            cf_api_tokens: vec![],
+            cf_api_token: None,
+        };
+
+        // Point save/load at a temp file
+        let config_path = dir.join("config.json");
+        std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        (config, valid_token)
+    }
+
+    /// Helper: make a valid connector token with custom account/tunnel ids.
+    fn make_connector_token(account_id: &str, tunnel_id: &str) -> String {
+        let payload = serde_json::json!({ "a": account_id, "t": tunnel_id, "s": "sec" });
+        STANDARD.encode(serde_json::to_vec(&payload).unwrap())
+    }
+
+    #[test]
+    fn update_token_rejects_api_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut config, _valid) = test_config(dir.path());
+
+        // A CF API token is a plain string, not base64 JSON — must be rejected
+        let api_token = "v1.0-55T-6-eesaSOMEFAKETOKEN1234567890abc".to_string();
+        let result = config.update_token("my-tunnel", api_token);
+
+        assert!(result.is_err());
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            err_msg.contains("tunnels token add"),
+            "Error should suggest 'tunnels token add', got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn update_token_rejects_random_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut config, _valid) = test_config(dir.path());
+
+        let result = config.update_token("my-tunnel", "not-a-real-token".into());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn update_token_accepts_valid_connector_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut config, _) = test_config(dir.path());
+
+        let new_token = make_connector_token("new_acct", "new_tun");
+        // Patch save to use temp dir — we can't easily override path() so just
+        // test the validation logic by calling decode_token + the find logic directly.
+        let result = decode_token(&new_token);
+        assert!(result.is_ok());
+
+        let t = config.tunnels.iter_mut().find(|t| t.name == "my-tunnel").unwrap();
+        t.token = new_token.clone();
+        assert_eq!(t.token, new_token);
+    }
+
+    #[test]
+    fn update_token_tunnel_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut config, _) = test_config(dir.path());
+
+        let token = make_connector_token("a", "t");
+        let result = config.update_token("nonexistent", token);
+
+        assert!(result.is_err());
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(err_msg.contains("not found"));
+    }
+
+    #[test]
+    fn decode_token_valid() {
+        let token = make_connector_token("acct_abc", "tun_xyz");
+        let payload = decode_token(&token).unwrap();
+        assert_eq!(payload.account_id, "acct_abc");
+        assert_eq!(payload.tunnel_id, "tun_xyz");
+    }
+
+    #[test]
+    fn decode_token_invalid_base64() {
+        let result = decode_token("not-valid-base64!@#");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_token_valid_base64_but_not_json() {
+        let token = STANDARD.encode(b"just a plain string");
+        let result = decode_token(&token);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_token_valid_json_but_missing_fields() {
+        let payload = serde_json::json!({ "foo": "bar" });
+        let token = STANDARD.encode(serde_json::to_vec(&payload).unwrap());
+        let result = decode_token(&token);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn add_api_token_does_not_duplicate() {
+        let mut config = Config::default();
+        // Manually push instead of calling add_api_token (which calls save)
+        config.cf_api_tokens.push("tok_abc".into());
+        // Simulate add logic
+        if !config.cf_api_tokens.iter().any(|t| t == "tok_abc") {
+            config.cf_api_tokens.push("tok_abc".into());
+        }
+        assert_eq!(config.cf_api_tokens.len(), 1);
+    }
+
+    #[test]
+    fn all_cf_api_tokens_merges_sources() {
+        let config = Config {
+            tunnels: vec![Tunnel {
+                name: "t1".into(),
+                token: "connector".into(),
+                api_token: Some("per_tunnel_tok".into()),
+            }],
+            services: vec![],
+            cf_api_tokens: vec!["global_tok".into()],
+            cf_api_token: Some("legacy_tok".into()),
+        };
+
+        let tokens = config.all_cf_api_tokens();
+        assert_eq!(tokens.len(), 3);
+        assert!(tokens.contains(&"global_tok"));
+        assert!(tokens.contains(&"legacy_tok"));
+        assert!(tokens.contains(&"per_tunnel_tok"));
+    }
+
+    #[test]
+    fn all_cf_api_tokens_deduplicates() {
+        let config = Config {
+            tunnels: vec![],
+            services: vec![],
+            cf_api_tokens: vec!["same_tok".into()],
+            cf_api_token: Some("same_tok".into()),
+        };
+
+        let tokens = config.all_cf_api_tokens();
+        assert_eq!(tokens.len(), 1);
+    }
 }

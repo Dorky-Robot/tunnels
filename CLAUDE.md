@@ -8,9 +8,9 @@ A k9s-style TUI for managing cloudflared tunnels and local services on macOS.
 - **launchd.rs** — LaunchAgent plist generation, start/stop/status via `launchctl`, plist discovery/migration
 - **cloudflare.rs** — CF API integration via API tokens (multi-account + per-tunnel), tunnel details + ingress route fetch, route add/remove with DNS management, auto-match tokens to accounts
 - **scan.rs** — Service discovery via `lsof`: find listening TCP ports, resolve project names from process cwd
-- **app.rs** — App state, tab system (Services/Tunnels), mode machine, CF + scan integration, submenu toggle
-- **ui.rs** — ratatui rendering: tab header, tunnel/service tables, dialogs, two-level keybinding bar
-- **main.rs** — crossterm event loop, key handlers per mode, full CLI subcommands (tunnel lifecycle, routes, services, tokens, sync)
+- **app.rs** — App state, unified tree view model (UnifiedRow), mode machine with prefix keys + context menu, CF + scan integration
+- **ui.rs** — ratatui rendering: tree table (tunnels with nested services), context menu overlay, prefix-aware keybinding bar, dialogs
+- **main.rs** — crossterm event loop, unified key handler with context-sensitive dispatch, prefix key handler, context menu handler, full CLI subcommands
 
 ## Build & Install
 
@@ -21,52 +21,58 @@ cp target/release/tunnels ~/.local/bin/
 
 Or via Homebrew: `brew install dorky-robot/tap/tunnels`
 
-## Tab Order
+## Tree View
 
-- **Tab 1** (default): Services
-- **Tab 2**: Tunnels
-- Switch with `1`/`2` or left/right arrows
+Single unified view: tunnels as parent rows (▼/▶) with services nested underneath. Unlinked services appear under a separator.
 
 ## Key Bindings
 
-### Services Tab (primary bar)
-| Key | Action |
-|-----|--------|
-| j/k | Navigate |
-| a | Add service |
-| e | Edit service |
-| m | Rename URL (subdomain) |
-| d | Untrack service |
-| . | Toggle secondary actions |
-| q | Quit |
+### Normal mode (context-sensitive)
+| Key | On Tunnel | On Service |
+|-----|-----------|------------|
+| j/k | Navigate | Navigate |
+| Enter | Context menu | Context menu |
+| Space/←/→ | Toggle expand/collapse | (no-op) |
+| s | Start tunnel | — |
+| x | Stop tunnel | — |
+| r | Restart tunnel | — |
+| e | Edit connector token | Edit service |
+| n | Rename tunnel | Rename URL |
+| d | Delete tunnel | Untrack service |
+| l | View logs | — |
+| m | Manage routes | — |
+| a | Prefix: add... | Prefix: add... |
+| t | Prefix: token... | Prefix: token... |
+| g | Prefix: global... | Prefix: global... |
+| ? | Help | Help |
+| q/Esc | Quit | Quit |
 
-### Services Tab (secondary bar, press `.`)
+### Prefix keys
+**a → add...**
 | Key | Action |
 |-----|--------|
-| S | Scan listening ports |
-| R | Sync from Cloudflare API |
-| T | Add CF API token |
+| t | Add tunnel |
+| s | Add service |
+| r | Add route (tunnel selected) |
+| Esc | Cancel |
 
-### Tunnels Tab (primary bar)
+**t → token...**
 | Key | Action |
 |-----|--------|
-| j/k | Navigate |
-| s/x/r | Start/stop/restart tunnel |
-| m | Manage routes (subdomains) |
-| a | Add new tunnel |
-| d | Delete tunnel |
-| . | Toggle secondary actions |
-| q | Quit |
+| c | Edit connector token |
+| a | Add CF API token |
+| Esc | Cancel |
 
-### Tunnels Tab (secondary bar, press `.`)
+**g → global...**
 | Key | Action |
 |-----|--------|
-| e | Edit token |
-| n | Rename tunnel |
-| l | View logs |
-| R | Sync from Cloudflare API |
-| T | Add CF API token |
-| I | Import existing plists |
+| s | Sync from Cloudflare |
+| p | Scan listening ports |
+| i | Import existing plists |
+| Esc | Cancel |
+
+### Context menu (Enter)
+Opens a floating menu with actions for the selected row. Navigate with j/k + Enter, or press the shortcut letter.
 
 ## CLI Subcommands
 

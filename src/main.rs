@@ -6,7 +6,7 @@ mod scan;
 mod ui;
 
 use anyhow::Result;
-use app::{AddField, App, Mode, RouteField, ServiceField, Tab};
+use app::{AddField, App, Mode, PrefixKey, RouteField, ServiceField};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -126,8 +126,12 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mu
                 }
 
                 match &app.mode {
-                    Mode::Normal if app.tab == Tab::Tunnels => handle_normal(app, key.code),
-                    Mode::Normal => handle_services_normal(app, key.code),
+                    Mode::Normal => handle_normal(app, key.code),
+                    Mode::Prefix(prefix) => {
+                        let p = *prefix;
+                        handle_prefix(app, p, key.code);
+                    }
+                    Mode::ContextMenu { .. } => handle_context_menu(app, key.code),
                     Mode::Adding { .. } => handle_adding(app, key.code),
                     Mode::Editing { .. } => handle_editing(app, key.code),
                     Mode::Renaming { .. } => handle_renaming(app, key.code),
@@ -159,60 +163,120 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mu
 fn handle_normal(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
-        KeyCode::Char('1') => { app.tab = Tab::Services; app.submenu = false; }
-        KeyCode::Char('2') => { app.tab = Tab::Tunnels; app.submenu = false; }
-        KeyCode::Left | KeyCode::Right => {
-            app.tab = if app.tab == Tab::Services { Tab::Tunnels } else { Tab::Services };
-            app.submenu = false;
-        }
-        KeyCode::Char('.') => app.submenu = !app.submenu,
         KeyCode::Char('j') | KeyCode::Down => app.move_down(),
         KeyCode::Char('k') | KeyCode::Up => app.move_up(),
-        KeyCode::Char('s') => app.start_selected(),
-        KeyCode::Char('x') => app.stop_selected(),
-        KeyCode::Char('r') => app.restart_selected(),
-        KeyCode::Char('a') => app.begin_add(),
-        KeyCode::Char('e') => app.begin_edit(),
-        KeyCode::Char('n') => app.begin_rename(),
-        KeyCode::Char('d') => app.confirm_delete(),
-        KeyCode::Char('l') | KeyCode::Enter => app.show_logs(),
-        KeyCode::Char('m') => app.begin_routes(),
-        KeyCode::Char('R') => app.refresh_cf(),
-        KeyCode::Char('I') => app.import_existing(),
-        KeyCode::Char('T') => app.begin_add_api_token(),
+        KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right => app.toggle_expand(),
+        KeyCode::Enter => {
+            if let Some(menu) = app.build_context_menu() {
+                app.mode = menu;
+            }
+        }
+        // Prefix keys
+        KeyCode::Char('a') => app.mode = Mode::Prefix(PrefixKey::Add),
+        KeyCode::Char('t') => app.mode = Mode::Prefix(PrefixKey::Token),
+        KeyCode::Char('g') => app.mode = Mode::Prefix(PrefixKey::Global),
+        // Context-sensitive direct keys
+        KeyCode::Char('s') if app.is_tunnel_selected() => app.start_selected(),
+        KeyCode::Char('x') if app.is_tunnel_selected() => app.stop_selected(),
+        KeyCode::Char('r') if app.is_tunnel_selected() => app.restart_selected(),
+        KeyCode::Char('e') => {
+            if app.is_tunnel_selected() {
+                app.begin_edit();
+            } else if app.is_service_selected() {
+                app.begin_edit_service();
+            }
+        }
+        KeyCode::Char('n') => {
+            if app.is_tunnel_selected() {
+                app.begin_rename();
+            } else if app.is_service_selected() {
+                app.begin_rename_service_route();
+            }
+        }
+        KeyCode::Char('d') => {
+            if app.is_tunnel_selected() {
+                app.confirm_delete();
+            } else if app.is_service_selected() {
+                app.confirm_delete_service();
+            }
+        }
+        KeyCode::Char('l') if app.is_tunnel_selected() => app.show_logs(),
+        KeyCode::Char('m') if app.is_tunnel_selected() => app.begin_routes(),
         KeyCode::Char('?') => app.mode = Mode::Help,
         _ => {}
     }
 }
 
-fn handle_services_normal(app: &mut App, code: KeyCode) {
+fn handle_prefix(app: &mut App, prefix: PrefixKey, code: KeyCode) {
     match code {
-        KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
-        KeyCode::Char('1') => { app.tab = Tab::Services; app.submenu = false; }
-        KeyCode::Char('2') => { app.tab = Tab::Tunnels; app.submenu = false; }
-        KeyCode::Left | KeyCode::Right => {
-            app.tab = if app.tab == Tab::Services { Tab::Tunnels } else { Tab::Services };
-            app.submenu = false;
+        KeyCode::Esc => app.mode = Mode::Normal,
+        _ => match prefix {
+            PrefixKey::Add => match code {
+                KeyCode::Char('t') => { app.mode = Mode::Normal; app.begin_add(); }
+                KeyCode::Char('s') => { app.mode = Mode::Normal; app.begin_add_service(); }
+                KeyCode::Char('r') => {
+                    if app.is_tunnel_selected() {
+                        app.mode = Mode::Normal;
+                        app.begin_routes();
+                    } else {
+                        app.mode = Mode::Normal;
+                        app.status_msg = Some("Select a tunnel first to add a route".into());
+                    }
+                }
+                _ => app.mode = Mode::Normal,
+            },
+            PrefixKey::Token => match code {
+                KeyCode::Char('c') => {
+                    app.mode = Mode::Normal;
+                    if app.is_tunnel_selected() {
+                        app.begin_edit();
+                    } else {
+                        app.status_msg = Some("Select a tunnel to edit its connector token".into());
+                    }
+                }
+                KeyCode::Char('a') => { app.mode = Mode::Normal; app.begin_add_api_token(); }
+                _ => app.mode = Mode::Normal,
+            },
+            PrefixKey::Global => match code {
+                KeyCode::Char('s') => { app.mode = Mode::Normal; app.refresh_cf(); }
+                KeyCode::Char('p') => { app.mode = Mode::Normal; app.scan_services(); }
+                KeyCode::Char('i') => { app.mode = Mode::Normal; app.import_existing(); }
+                _ => app.mode = Mode::Normal,
+            },
+        },
+    }
+}
+
+fn handle_context_menu(app: &mut App, code: KeyCode) {
+    let Mode::ContextMenu { items, selected } = &mut app.mode else {
+        return;
+    };
+
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.mode = Mode::Normal;
         }
-        KeyCode::Char('.') => app.submenu = !app.submenu,
         KeyCode::Char('j') | KeyCode::Down => {
-            if !app.service_rows.is_empty() && app.service_selected < app.service_rows.len() - 1 {
-                app.service_selected += 1;
+            if *selected < items.len() - 1 {
+                *selected += 1;
             }
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            if app.service_selected > 0 {
-                app.service_selected -= 1;
+            if *selected > 0 {
+                *selected -= 1;
             }
         }
-        KeyCode::Char('a') => app.begin_add_service(),
-        KeyCode::Char('e') => app.begin_edit_service(),
-        KeyCode::Char('m') => app.begin_rename_service_route(),
-        KeyCode::Char('d') => app.confirm_delete_service(),
-        KeyCode::Char('S') => app.scan_services(),
-        KeyCode::Char('R') => app.refresh_cf(),
-        KeyCode::Char('T') => app.begin_add_api_token(),
-        KeyCode::Char('?') => app.mode = Mode::Help,
+        KeyCode::Enter => {
+            let action = items[*selected].2.clone();
+            app.execute_context_action(action);
+        }
+        KeyCode::Char(c) => {
+            // Direct shortcut key
+            if let Some(item) = items.iter().find(|(key, _, _)| *key == c) {
+                let action = item.2.clone();
+                app.execute_context_action(action);
+            }
+        }
         _ => {}
     }
 }

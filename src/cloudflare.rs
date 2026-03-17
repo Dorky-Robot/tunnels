@@ -86,6 +86,33 @@ pub fn verify_token(api_token: &str, account_id: &str, tunnel_id: &str) -> bool 
     fetch_tunnel_config_check(api_token, account_id, tunnel_id)
 }
 
+/// Check if an API token can list at least one Cloudflare zone (for DNS management).
+/// Returns the zone names if successful.
+pub fn verify_token_has_zones(api_token: &str) -> Option<Vec<String>> {
+    let output = Command::new("curl")
+        .args([
+            "-s",
+            "https://api.cloudflare.com/client/v4/zones?per_page=10",
+            "-H",
+            &format!("Authorization: Bearer {}", api_token),
+        ])
+        .output()
+        .ok()?;
+
+    let val: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    if !val.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return None;
+    }
+    let results = val.get("result").and_then(|v| v.as_array())?;
+    if results.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = results.iter()
+        .filter_map(|z| z.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+        .collect();
+    Some(names)
+}
+
 /// Sync: fetch ingress routes for all accounts using configured API tokens.
 /// cf_api_tokens: user-configured API tokens (one per CF account)
 /// tunnel_tokens: Vec<(config_name, base64_token)>
