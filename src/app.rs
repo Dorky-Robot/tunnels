@@ -617,15 +617,13 @@ impl App {
         }
     }
 
-    pub fn delete_selected(&mut self) {
-        if let Some(t) = self.selected_tunnel().cloned() {
-            let _ = launchd::stop(&t.name);
-            match self.config.remove(&t.name) {
-                Ok(()) => self.status_msg = Some(format!("Deleted '{}'", t.name)),
-                Err(e) => self.status_msg = Some(format!("Error: {}", e)),
-            }
-            self.rebuild_unified_rows();
+    pub fn delete_tunnel_by_name(&mut self, name: &str) {
+        let _ = launchd::stop(name);
+        match self.config.remove(name) {
+            Ok(()) => self.status_msg = Some(format!("Deleted '{}'", name)),
+            Err(e) => self.status_msg = Some(format!("Error: {}", e)),
         }
+        self.rebuild_unified_rows();
     }
 
     pub fn show_logs(&mut self) {

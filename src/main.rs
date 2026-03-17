@@ -288,12 +288,20 @@ fn handle_adding_service(app: &mut App, code: KeyCode) {
 
     match code {
         KeyCode::Esc => app.mode = Mode::Normal,
-        KeyCode::Tab | KeyCode::BackTab => {
+        KeyCode::Tab => {
             *field = match field {
                 ServiceField::Name => ServiceField::Port,
                 ServiceField::Port => ServiceField::Tunnel,
                 ServiceField::Tunnel => ServiceField::Memo,
                 ServiceField::Memo => ServiceField::Name,
+            };
+        }
+        KeyCode::BackTab => {
+            *field = match field {
+                ServiceField::Name => ServiceField::Memo,
+                ServiceField::Port => ServiceField::Name,
+                ServiceField::Tunnel => ServiceField::Port,
+                ServiceField::Memo => ServiceField::Tunnel,
             };
         }
         KeyCode::Enter => {
@@ -333,12 +341,20 @@ fn handle_editing_service(app: &mut App, code: KeyCode) {
 
     match code {
         KeyCode::Esc => app.mode = Mode::Normal,
-        KeyCode::Tab | KeyCode::BackTab => {
+        KeyCode::Tab => {
             *field = match field {
                 ServiceField::Name => ServiceField::Port,
                 ServiceField::Port => ServiceField::Tunnel,
                 ServiceField::Tunnel => ServiceField::Memo,
                 ServiceField::Memo => ServiceField::Name,
+            };
+        }
+        KeyCode::BackTab => {
+            *field = match field {
+                ServiceField::Name => ServiceField::Memo,
+                ServiceField::Port => ServiceField::Name,
+                ServiceField::Tunnel => ServiceField::Port,
+                ServiceField::Memo => ServiceField::Tunnel,
             };
         }
         KeyCode::Enter => {
@@ -525,9 +541,14 @@ fn handle_migrating(app: &mut App, code: KeyCode) {
 }
 
 fn handle_confirming(app: &mut App, code: KeyCode) {
+    let Mode::Confirming { target, .. } = &app.mode else {
+        return;
+    };
+    let target = target.clone();
+
     match code {
         KeyCode::Char('y') | KeyCode::Char('Y') => {
-            app.delete_selected();
+            app.delete_tunnel_by_name(&target);
             app.mode = Mode::Normal;
         }
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {

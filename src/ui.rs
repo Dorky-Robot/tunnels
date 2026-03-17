@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState},
     Frame,
 };
 
@@ -214,7 +214,8 @@ fn draw_unified_table(f: &mut Frame, app: &App, area: Rect) {
     .header(header)
     .row_highlight_style(Style::default().bg(Color::Rgb(30, 40, 55)));
 
-    f.render_widget(table, area);
+    let mut state = TableState::default().with_selected(Some(app.selected));
+    f.render_stateful_widget(table, area, &mut state);
 }
 
 fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
