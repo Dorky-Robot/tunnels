@@ -2,7 +2,7 @@ use crate::cloudflare::{self, IngressRoute, TunnelInfo, UnreachedAccount};
 use crate::config::{self, Config, Tunnel};
 use crate::launchd;
 use crate::scan;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 
 pub const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -49,15 +49,63 @@ pub enum BgResult {
     VerifyTokenFailed(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tab {
-    Tunnels,
-    Services,
+// --- Unified tree view types ---
+
+#[derive(Debug, Clone)]
+pub enum UnifiedRow {
+    Tunnel {
+        name: String,
+        status: launchd::Status,
+        #[allow(dead_code)]
+        cf_name: String,
+        cf_conns: String,
+        service_count: usize,
+    },
+    Service {
+        name: String,
+        port: u16,
+        #[allow(dead_code)]
+        tunnel_name: Option<String>,
+        tunnel_status: String,
+        url: String,
+        memo: String,
+        is_last: bool,
+    },
+    Separator,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefixKey {
+    Add,
+    Token,
+    Global,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContextAction {
+    StartTunnel,
+    StopTunnel,
+    RestartTunnel,
+    ManageRoutes,
+    ViewLogs,
+    EditConnToken,
+    RenameTunnel,
+    DeleteTunnel,
+    EditService,
+    RenameUrl,
+    UntrackService,
+}
+
+// --- Mode and field enums ---
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     Normal,
+    Prefix(PrefixKey),
+    ContextMenu {
+        items: Vec<(char, String, ContextAction)>,
+        selected: usize,
+    },
     Adding { field: AddField, name: String, token: String },
     Editing { name: String, token: String },
     Renaming { old_name: String, new_name: String },
@@ -141,25 +189,6 @@ pub struct RouteRow {
     pub dns: DnsStatus,
 }
 
-#[derive(Debug, Clone)]
-pub struct TunnelRow {
-    pub name: String,
-    pub status: launchd::Status,
-    pub cf_name: String,
-    pub cf_conns: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct ServiceRow {
-    pub name: String,
-    pub port: u16,
-    #[allow(dead_code)]
-    pub tunnel: String,
-    pub tunnel_status: String,
-    pub url: String,
-    pub memo: String,
-}
-
 /// Split a hostname into (subdomain, domain_suffix).
 /// e.g. "katulong-mini.felixflor.es" → ("katulong-mini", ".felixflor.es")
 /// "simple.com" → ("simple", ".com")
@@ -174,20 +203,19 @@ fn split_hostname(hostname: &str) -> (String, String) {
 
 pub struct App {
     pub config: Config,
-    pub tab: Tab,
-    pub rows: Vec<TunnelRow>,
-    pub service_rows: Vec<ServiceRow>,
+    pub unified_rows: Vec<UnifiedRow>,
     pub tunnel_info: HashMap<String, TunnelInfo>,
     pub ingress_routes: HashMap<u16, Vec<IngressRoute>>,
     pub unreached: Vec<UnreachedAccount>,
     pub selected: usize,
-    pub service_selected: usize,
+    pub collapsed: HashSet<String>,
     pub mode: Mode,
     pub status_msg: Option<String>,
     pub should_quit: bool,
-    pub submenu: bool,
     pub loading: Option<String>,
     pub spinner_tick: usize,
+    /// When true, route bg results will reopen the Routes dialog instead of just syncing
+    bg_reopen_routes: bool,
     bg_tx: mpsc::Sender<BgResult>,
     bg_rx: mpsc::Receiver<BgResult>,
 }
@@ -198,118 +226,230 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let mut app = Self {
             config,
-            tab: Tab::Services,
-            rows: Vec::new(),
-            service_rows: Vec::new(),
+            unified_rows: Vec::new(),
             tunnel_info: HashMap::new(),
             ingress_routes: HashMap::new(),
             unreached: Vec::new(),
             selected: 0,
-            service_selected: 0,
+            collapsed: HashSet::new(),
             mode: Mode::Normal,
             status_msg: None,
             should_quit: false,
-            submenu: false,
             loading: Some("Syncing Cloudflare...".into()),
             spinner_tick: 0,
+            bg_reopen_routes: false,
             bg_tx: tx,
             bg_rx: rx,
         };
-        app.refresh();
+        app.rebuild_unified_rows();
         app.spawn_cf_sync();
         app
     }
 
-    pub fn refresh(&mut self) {
-        self.rows = self
-            .config
-            .tunnels
-            .iter()
-            .map(|t| {
-                let status = launchd::status(&t.name);
-                let tunnel_id = config::decode_token(&t.token)
-                    .map(|p| p.tunnel_id)
-                    .unwrap_or_default();
+    pub fn rebuild_unified_rows(&mut self) {
+        self.unified_rows.clear();
+        let mut claimed_services: HashSet<String> = HashSet::new();
 
-                let (cf_name, cf_conns) = self.tunnel_info.get(&tunnel_id)
-                    .map(|info| (info.cf_name.clone(), info.connections.clone()))
-                    .unwrap_or_else(|| ("—".into(), "—".into()));
+        for tunnel_cfg in &self.config.tunnels {
+            let status = launchd::status(&tunnel_cfg.name);
+            let tunnel_id = config::decode_token(&tunnel_cfg.token)
+                .map(|p| p.tunnel_id)
+                .unwrap_or_default();
 
-                TunnelRow {
-                    name: t.name.clone(),
-                    status,
-                    cf_name,
-                    cf_conns,
+            let (cf_name, cf_conns) = self.tunnel_info.get(&tunnel_id)
+                .map(|info| (info.cf_name.clone(), info.connections.clone()))
+                .unwrap_or_else(|| ("—".into(), "—".into()));
+
+            // Find services linked to this tunnel
+            let mut linked_services: Vec<&config::Service> = Vec::new();
+            for svc in &self.config.services {
+                let linked_by_route = self.ingress_routes.get(&svc.port)
+                    .map_or(false, |routes| routes.iter().any(|r| r.tunnel_id == tunnel_id));
+                let linked_by_name = svc.tunnel.as_deref() == Some(&tunnel_cfg.name);
+                if linked_by_route || linked_by_name {
+                    linked_services.push(svc);
+                    claimed_services.insert(svc.name.clone());
                 }
-            })
-            .collect();
+            }
 
-        if self.selected >= self.rows.len() && !self.rows.is_empty() {
-            self.selected = self.rows.len() - 1;
+            let service_count = linked_services.len();
+            self.unified_rows.push(UnifiedRow::Tunnel {
+                name: tunnel_cfg.name.clone(),
+                status: status.clone(),
+                cf_name,
+                cf_conns,
+                service_count,
+            });
+
+            if !self.collapsed.contains(&tunnel_cfg.name) {
+                let total = linked_services.len();
+                for (j, svc) in linked_services.iter().enumerate() {
+                    let (tunnel_status, url) = self.resolve_service_display(svc, Some(&status));
+                    self.unified_rows.push(UnifiedRow::Service {
+                        name: svc.name.clone(),
+                        port: svc.port,
+                        tunnel_name: Some(tunnel_cfg.name.clone()),
+                        tunnel_status,
+                        url,
+                        memo: svc.memo.clone().unwrap_or_default(),
+                        is_last: j == total - 1,
+                    });
+                }
+            }
         }
 
-        self.refresh_services();
-    }
-
-    fn refresh_services(&mut self) {
-        self.service_rows = self
-            .config
-            .services
-            .iter()
-            .map(|s| {
-                // Try to resolve from ingress routes by port first
-                let routes = self.ingress_routes.get(&s.port);
-
-                let (tunnel_display, tunnel_status, url) = if let Some(routes) = routes {
-                    // Pick the route whose tunnel has active connections, or first
-                    let best = routes.iter()
-                        .find(|r| {
-                            self.tunnel_info.get(&r.tunnel_id)
-                                .map_or(false, |info| info.connection_count > 0)
-                        })
-                        .or(routes.first());
-
-                    if let Some(route) = best {
-                        let status = self.tunnel_info.get(&route.tunnel_id)
-                            .map(|info| {
-                                if info.connection_count == 0 { "no edge" } else { "connected" }
-                            })
-                            .unwrap_or("—")
-                            .to_string();
-                        (
-                            route.tunnel_name.clone(),
-                            status,
-                            format!("{}://{}", route.scheme, route.hostname),
-                        )
-                    } else {
-                        ("—".to_string(), "—".to_string(), "—".to_string())
-                    }
-                } else if let Some(name) = &s.tunnel {
-                    // Manual tunnel link (no ingress route found)
-                    let st = launchd::status(name);
-                    let status_str = match &st {
-                        launchd::Status::Running { .. } => "running".to_string(),
-                        launchd::Status::Stopped => "stopped".to_string(),
-                        launchd::Status::Inactive => "inactive".to_string(),
-                    };
-                    (name.clone(), status_str, "—".to_string())
-                } else {
-                    ("—".to_string(), "—".to_string(), "—".to_string())
-                };
-
-                ServiceRow {
-                    name: s.name.clone(),
-                    port: s.port,
-                    tunnel: tunnel_display,
-                    tunnel_status,
-                    url,
-                    memo: s.memo.clone().unwrap_or_default(),
-                }
-            })
+        // Unlinked services
+        let unlinked: Vec<&config::Service> = self.config.services.iter()
+            .filter(|s| !claimed_services.contains(&s.name))
             .collect();
 
-        if self.service_selected >= self.service_rows.len() && !self.service_rows.is_empty() {
-            self.service_selected = self.service_rows.len() - 1;
+        if !unlinked.is_empty() {
+            self.unified_rows.push(UnifiedRow::Separator);
+            let total = unlinked.len();
+            for (j, svc) in unlinked.iter().enumerate() {
+                let (tunnel_status, url) = self.resolve_service_display(svc, None);
+                self.unified_rows.push(UnifiedRow::Service {
+                    name: svc.name.clone(),
+                    port: svc.port,
+                    tunnel_name: None,
+                    tunnel_status,
+                    url,
+                    memo: svc.memo.clone().unwrap_or_default(),
+                    is_last: j == total - 1,
+                });
+            }
+        }
+
+        // Adjust selection
+        if self.unified_rows.is_empty() {
+            self.selected = 0;
+        } else if self.selected >= self.unified_rows.len() {
+            self.selected = self.unified_rows.len() - 1;
+        }
+        // Skip separator if landed on one
+        self.skip_separator();
+    }
+
+    /// Compute display status and URL for a service
+    fn resolve_service_display(&self, svc: &config::Service, parent_status: Option<&launchd::Status>) -> (String, String) {
+        let routes = self.ingress_routes.get(&svc.port);
+        if let Some(routes) = routes {
+            let best = routes.iter()
+                .find(|r| {
+                    self.tunnel_info.get(&r.tunnel_id)
+                        .map_or(false, |info| info.connection_count > 0)
+                })
+                .or(routes.first());
+            if let Some(route) = best {
+                let status = self.tunnel_info.get(&route.tunnel_id)
+                    .map(|info| if info.connection_count == 0 { "no edge" } else { "connected" })
+                    .unwrap_or("—")
+                    .to_string();
+                return (status, format!("{}://{}", route.scheme, route.hostname));
+            }
+        }
+        if let Some(name) = &svc.tunnel {
+            let st = parent_status.cloned().unwrap_or_else(|| launchd::status(name));
+            let status_str = match &st {
+                launchd::Status::Running { .. } => "running".to_string(),
+                launchd::Status::Stopped => "stopped".to_string(),
+                launchd::Status::Inactive => "inactive".to_string(),
+            };
+            (status_str, "—".to_string())
+        } else {
+            ("—".to_string(), "—".to_string())
+        }
+    }
+
+    fn skip_separator(&mut self) {
+        if matches!(self.unified_rows.get(self.selected), Some(UnifiedRow::Separator)) {
+            // Try moving down first, then up
+            if self.selected + 1 < self.unified_rows.len() {
+                self.selected += 1;
+            } else if self.selected > 0 {
+                self.selected -= 1;
+            }
+        }
+    }
+
+    pub fn selected_row(&self) -> Option<&UnifiedRow> {
+        self.unified_rows.get(self.selected)
+    }
+
+    pub fn is_tunnel_selected(&self) -> bool {
+        matches!(self.selected_row(), Some(UnifiedRow::Tunnel { .. }))
+    }
+
+    pub fn is_service_selected(&self) -> bool {
+        matches!(self.selected_row(), Some(UnifiedRow::Service { .. }))
+    }
+
+    pub fn selected_tunnel(&self) -> Option<&Tunnel> {
+        match self.selected_row()? {
+            UnifiedRow::Tunnel { name, .. } => self.config.tunnels.iter().find(|t| &t.name == name),
+            _ => None,
+        }
+    }
+
+    pub fn selected_service_idx(&self) -> Option<usize> {
+        match self.selected_row()? {
+            UnifiedRow::Service { name, .. } => self.config.services.iter().position(|s| &s.name == name),
+            _ => None,
+        }
+    }
+
+    pub fn build_context_menu(&self) -> Option<Mode> {
+        match self.selected_row()? {
+            UnifiedRow::Tunnel { status, .. } => {
+                let mut items: Vec<(char, String, ContextAction)> = Vec::new();
+                match status {
+                    launchd::Status::Running { .. } => {
+                        items.push(('x', "Stop".into(), ContextAction::StopTunnel));
+                        items.push(('r', "Restart".into(), ContextAction::RestartTunnel));
+                    }
+                    _ => {
+                        items.push(('s', "Start".into(), ContextAction::StartTunnel));
+                    }
+                }
+                items.push(('m', "Manage routes".into(), ContextAction::ManageRoutes));
+                items.push(('l', "View logs".into(), ContextAction::ViewLogs));
+                items.push(('e', "Edit conn. token".into(), ContextAction::EditConnToken));
+                items.push(('n', "Rename".into(), ContextAction::RenameTunnel));
+                items.push(('d', "Delete".into(), ContextAction::DeleteTunnel));
+
+                Some(Mode::ContextMenu {
+                    items,
+                    selected: 0,
+                })
+            }
+            UnifiedRow::Service { .. } => {
+                let items = vec![
+                    ('e', "Edit service".into(), ContextAction::EditService),
+                    ('n', "Rename URL".into(), ContextAction::RenameUrl),
+                    ('d', "Untrack".into(), ContextAction::UntrackService),
+                ];
+                Some(Mode::ContextMenu {
+                    items,
+                    selected: 0,
+                })
+            }
+            UnifiedRow::Separator => None,
+        }
+    }
+
+    pub fn execute_context_action(&mut self, action: ContextAction) {
+        match action {
+            ContextAction::StartTunnel => { self.mode = Mode::Normal; self.start_selected(); }
+            ContextAction::StopTunnel => { self.mode = Mode::Normal; self.stop_selected(); }
+            ContextAction::RestartTunnel => { self.mode = Mode::Normal; self.restart_selected(); }
+            ContextAction::ManageRoutes => { self.mode = Mode::Normal; self.begin_routes(); }
+            ContextAction::ViewLogs => { self.mode = Mode::Normal; self.show_logs(); }
+            ContextAction::EditConnToken => { self.mode = Mode::Normal; self.begin_edit(); }
+            ContextAction::RenameTunnel => { self.mode = Mode::Normal; self.begin_rename(); }
+            ContextAction::DeleteTunnel => { self.mode = Mode::Normal; self.confirm_delete(); }
+            ContextAction::EditService => { self.mode = Mode::Normal; self.begin_edit_service(); }
+            ContextAction::RenameUrl => { self.mode = Mode::Normal; self.begin_rename_service_route(); }
+            ContextAction::UntrackService => { self.mode = Mode::Normal; self.confirm_delete_service(); }
         }
     }
 
@@ -342,7 +482,7 @@ impl App {
                     self.ingress_routes = sync.ingress_routes;
                     self.unreached = sync.unreached;
                     self.status_msg = Some(sync.status);
-                    self.refresh();
+                    self.rebuild_unified_rows();
                     if !self.unreached.is_empty() {
                         self.begin_add_api_token();
                     }
@@ -362,12 +502,13 @@ impl App {
                 }
                 BgResult::RouteRenamed { status_msg, tunnel_name, api_token, account_id, tunnel_id } => {
                     self.status_msg = Some(status_msg);
-                    if self.tab == Tab::Services {
-                        self.loading = Some("Syncing...".into());
-                        self.spawn_cf_sync();
-                    } else {
+                    if self.bg_reopen_routes {
+                        self.bg_reopen_routes = false;
                         self.loading = Some("Reloading routes...".into());
                         self.spawn_reload_routes(tunnel_name, api_token, account_id, tunnel_id);
+                    } else {
+                        self.loading = Some("Syncing...".into());
+                        self.spawn_cf_sync();
                     }
                 }
                 BgResult::RouteAdded { status_msg, tunnel_name, api_token, account_id, tunnel_id } => {
@@ -400,21 +541,51 @@ impl App {
         }
     }
 
-    pub fn selected_tunnel(&self) -> Option<&Tunnel> {
-        self.config.tunnels.get(self.selected)
-    }
+    // --- Navigation ---
 
     pub fn move_up(&mut self) {
-        if self.selected > 0 {
-            self.selected -= 1;
+        if self.selected == 0 {
+            return;
+        }
+        self.selected -= 1;
+        // Skip separator
+        if matches!(self.unified_rows.get(self.selected), Some(UnifiedRow::Separator)) {
+            if self.selected > 0 {
+                self.selected -= 1;
+            } else {
+                self.selected += 1;
+            }
         }
     }
 
     pub fn move_down(&mut self) {
-        if !self.rows.is_empty() && self.selected < self.rows.len() - 1 {
-            self.selected += 1;
+        if self.unified_rows.is_empty() || self.selected >= self.unified_rows.len() - 1 {
+            return;
+        }
+        self.selected += 1;
+        // Skip separator
+        if matches!(self.unified_rows.get(self.selected), Some(UnifiedRow::Separator)) {
+            if self.selected + 1 < self.unified_rows.len() {
+                self.selected += 1;
+            } else {
+                self.selected -= 1;
+            }
         }
     }
+
+    pub fn toggle_expand(&mut self) {
+        if let Some(UnifiedRow::Tunnel { name, .. }) = self.selected_row() {
+            let name = name.clone();
+            if self.collapsed.contains(&name) {
+                self.collapsed.remove(&name);
+            } else {
+                self.collapsed.insert(name);
+            }
+            self.rebuild_unified_rows();
+        }
+    }
+
+    // --- Tunnel actions ---
 
     pub fn start_selected(&mut self) {
         if let Some(t) = self.selected_tunnel().cloned() {
@@ -422,7 +593,7 @@ impl App {
                 Ok(()) => self.status_msg = Some(format!("Started '{}'", t.name)),
                 Err(e) => self.status_msg = Some(format!("Error: {}", e)),
             }
-            self.refresh();
+            self.rebuild_unified_rows();
         }
     }
 
@@ -432,7 +603,7 @@ impl App {
                 Ok(()) => self.status_msg = Some(format!("Stopped '{}'", t.name)),
                 Err(e) => self.status_msg = Some(format!("Error: {}", e)),
             }
-            self.refresh();
+            self.rebuild_unified_rows();
         }
     }
 
@@ -442,19 +613,17 @@ impl App {
                 Ok(()) => self.status_msg = Some(format!("Restarted '{}'", t.name)),
                 Err(e) => self.status_msg = Some(format!("Error: {}", e)),
             }
-            self.refresh();
+            self.rebuild_unified_rows();
         }
     }
 
-    pub fn delete_selected(&mut self) {
-        if let Some(t) = self.selected_tunnel().cloned() {
-            let _ = launchd::stop(&t.name);
-            match self.config.remove(&t.name) {
-                Ok(()) => self.status_msg = Some(format!("Deleted '{}'", t.name)),
-                Err(e) => self.status_msg = Some(format!("Error: {}", e)),
-            }
-            self.refresh();
+    pub fn delete_tunnel_by_name(&mut self, name: &str) {
+        let _ = launchd::stop(name);
+        match self.config.remove(name) {
+            Ok(()) => self.status_msg = Some(format!("Deleted '{}'", name)),
+            Err(e) => self.status_msg = Some(format!("Error: {}", e)),
         }
+        self.rebuild_unified_rows();
     }
 
     pub fn show_logs(&mut self) {
@@ -485,7 +654,6 @@ impl App {
     }
 
     pub fn finish_rename(&mut self, old_name: String, new_name: String) {
-        // Stop if running under old name, rename, restart under new name
         let was_running = matches!(launchd::status(&old_name), launchd::Status::Running { .. });
         if was_running {
             let _ = launchd::stop(&old_name);
@@ -502,7 +670,7 @@ impl App {
             Err(e) => self.status_msg = Some(format!("Error: {}", e)),
         }
         self.mode = Mode::Normal;
-        self.refresh();
+        self.rebuild_unified_rows();
     }
 
     pub fn begin_edit(&mut self) {
@@ -529,7 +697,7 @@ impl App {
             Err(e) => self.status_msg = Some(format!("Error: {}", e)),
         }
         self.mode = Mode::Normal;
-        self.refresh();
+        self.rebuild_unified_rows();
     }
 
     pub fn finish_edit(&mut self, name: String, token: String) {
@@ -545,7 +713,7 @@ impl App {
             Err(e) => self.status_msg = Some(format!("Error: {}", e)),
         }
         self.mode = Mode::Normal;
-        self.refresh();
+        self.rebuild_unified_rows();
     }
 
     pub fn import_existing(&mut self) {
@@ -572,13 +740,13 @@ impl App {
                 count, daemon_plists.len()
             ));
             self.mode = Mode::Migrating { daemon_plists };
-            self.refresh();
+            self.rebuild_unified_rows();
             return;
         }
-        self.refresh();
+        self.rebuild_unified_rows();
     }
 
-    // --- Service tab methods ---
+    // --- Service actions ---
 
     pub fn begin_add_service(&mut self) {
         self.mode = Mode::AddingService {
@@ -606,19 +774,21 @@ impl App {
             Err(e) => self.status_msg = Some(format!("Error: {}", e)),
         }
         self.mode = Mode::Normal;
-        self.refresh();
+        self.rebuild_unified_rows();
     }
 
     pub fn begin_edit_service(&mut self) {
-        if let Some(s) = self.config.services.get(self.service_selected) {
-            self.mode = Mode::EditingService {
-                idx: self.service_selected,
-                field: ServiceField::Name,
-                name: s.name.clone(),
-                port: s.port.to_string(),
-                tunnel: s.tunnel.clone().unwrap_or_default(),
-                memo: s.memo.clone().unwrap_or_default(),
-            };
+        if let Some(idx) = self.selected_service_idx() {
+            if let Some(s) = self.config.services.get(idx) {
+                self.mode = Mode::EditingService {
+                    idx,
+                    field: ServiceField::Name,
+                    name: s.name.clone(),
+                    port: s.port.to_string(),
+                    tunnel: s.tunnel.clone().unwrap_or_default(),
+                    memo: s.memo.clone().unwrap_or_default(),
+                };
+            }
         }
     }
 
@@ -638,7 +808,7 @@ impl App {
             Err(e) => self.status_msg = Some(format!("Error: {}", e)),
         }
         self.mode = Mode::Normal;
-        self.refresh();
+        self.rebuild_unified_rows();
     }
 
     pub fn scan_services(&mut self) {
@@ -660,16 +830,18 @@ impl App {
         }
 
         self.status_msg = Some(format!("Scanned — found {} new service(s)", count));
-        self.refresh();
+        self.rebuild_unified_rows();
     }
 
     pub fn confirm_delete_service(&mut self) {
-        if let Some(s) = self.config.services.get(self.service_selected) {
-            self.mode = Mode::ConfirmingServiceDelete {
-                idx: self.service_selected,
-                name: s.name.clone(),
-                port: s.port,
-            };
+        if let Some(idx) = self.selected_service_idx() {
+            if let Some(s) = self.config.services.get(idx) {
+                self.mode = Mode::ConfirmingServiceDelete {
+                    idx,
+                    name: s.name.clone(),
+                    port: s.port,
+                };
+            }
         }
     }
 
@@ -679,7 +851,7 @@ impl App {
             Ok(()) => self.status_msg = Some(format!("Untracked '{}'", name.unwrap_or_default())),
             Err(e) => self.status_msg = Some(format!("Error: {}", e)),
         }
-        self.refresh();
+        self.rebuild_unified_rows();
     }
 
     pub fn do_migrate(&mut self, plists: Vec<std::path::PathBuf>) {
@@ -693,7 +865,6 @@ impl App {
             }
         }
 
-        // Restart imported tunnels as LaunchAgents
         for t in &self.config.tunnels {
             if !matches!(launchd::status(&t.name), launchd::Status::Running { .. }) {
                 let _ = launchd::start(&t.name, &t.token);
@@ -706,13 +877,13 @@ impl App {
             self.status_msg = Some(format!("Migrated {} — errors: {}", migrated, errors.join(", ")));
         }
         self.mode = Mode::Normal;
-        self.refresh();
+        self.rebuild_unified_rows();
     }
 
-    /// Look up the route info for the currently selected service.
-    /// Returns (tunnel_name, tunnel_token, hostname, service_url) or an error message.
-    pub fn resolve_service_route(&self) -> Result<(String, String, String, String), String> {
-        let service = self.config.services.get(self.service_selected)
+    /// Look up the route info for a service by name.
+    pub fn resolve_service_route_by_name(&self, service_name: &str) -> Result<(String, String, String, String), String> {
+        let service = self.config.services.iter()
+            .find(|s| s.name == service_name)
             .ok_or_else(|| "No service selected".to_string())?;
 
         let routes = self.ingress_routes.get(&service.port)
@@ -722,7 +893,6 @@ impl App {
         let route = &routes[0];
         let service_url = format!("http://localhost:{}", service.port);
 
-        // Find the tunnel config that owns this route
         let tunnel = self.config.tunnels.iter()
             .find(|t| {
                 config::decode_token(&t.token)
@@ -732,6 +902,14 @@ impl App {
             .ok_or_else(|| "Tunnel not found for this route".to_string())?;
 
         Ok((tunnel.name.clone(), tunnel.token.clone(), route.hostname.clone(), service_url))
+    }
+
+    /// Look up route info for the currently selected service
+    pub fn resolve_service_route(&self) -> Result<(String, String, String, String), String> {
+        match self.selected_row() {
+            Some(UnifiedRow::Service { name, .. }) => self.resolve_service_route_by_name(name),
+            _ => Err("No service selected".to_string()),
+        }
     }
 
     pub fn begin_rename_service_route(&mut self) {
@@ -751,6 +929,7 @@ impl App {
             }
         };
 
+        self.bg_reopen_routes = false; // route rename from service view → sync after
         self.loading = Some("Verifying API token...".into());
         let tx = self.bg_tx.clone();
         let api_tokens: Vec<String> = self.config.all_cf_api_tokens()
@@ -775,7 +954,7 @@ impl App {
                 }
                 None => {
                     let _ = tx.send(BgResult::VerifyTokenFailed(
-                        "No API token with access — press T to add one".into()
+                        "No API token with access — press t then a to add one".into()
                     ));
                 }
             }
@@ -813,7 +992,7 @@ impl App {
                 Some(t) => t.to_string(),
                 None => {
                     let _ = tx.send(BgResult::VerifyTokenFailed(
-                        "No API token with access — press T to add one".into()
+                        "No API token with access — press t then a to add one".into()
                     ));
                     return;
                 }
@@ -890,6 +1069,7 @@ impl App {
                 return;
             }
             let (subdomain, domain_suffix) = split_hostname(&route.hostname);
+            self.bg_reopen_routes = true; // route rename from routes dialog → reopen routes
             self.mode = Mode::RenamingRoute {
                 tunnel_name: tunnel_name.clone(),
                 api_token: api_token.clone(),
@@ -979,7 +1159,6 @@ impl App {
     }
 
     pub fn finish_add_route(&mut self, tunnel_name: String, api_token: String, account_id: String, tunnel_id: String, hostname: String, service: String) {
-        // Normalize port shorthand
         let service = if service.parse::<u16>().is_ok() {
             format!("http://localhost:{}", service)
         } else {
@@ -1070,57 +1249,30 @@ impl App {
     // --- CF API Token methods ---
 
     pub fn begin_add_api_token(&mut self) {
-        if self.unreached.is_empty() {
-            self.status_msg = Some("All accounts have tokens".into());
-            return;
-        }
         self.mode = Mode::AddingApiToken {
             input: String::new(),
         };
     }
 
-    #[cfg(test)]
-    pub fn test_app(config: config::Config, ingress_routes: HashMap<u16, Vec<IngressRoute>>) -> Self {
-        let (tx, rx) = mpsc::channel();
-        Self {
-            config,
-            tab: Tab::Services,
-            rows: Vec::new(),
-            service_rows: Vec::new(),
-            tunnel_info: HashMap::new(),
-            ingress_routes,
-            unreached: Vec::new(),
-            selected: 0,
-            service_selected: 0,
-            mode: Mode::Normal,
-            status_msg: None,
-            should_quit: false,
-            submenu: false,
-            loading: None,
-            spinner_tick: 0,
-            bg_tx: tx,
-            bg_rx: rx,
-        }
-    }
-
     pub fn finish_add_api_token(&mut self, token: String) {
-        // verify_token is blocking but it's a single HTTP call per unreached account — keep sync for now
         let matched: Option<&UnreachedAccount> = self.unreached.iter().find(|a| {
             cloudflare::verify_token(&token, &a.account_id, &a.tunnel_id)
         });
 
-        let matched_names = match matched {
-            Some(a) => a.tunnel_names.join(", "),
-            None => {
-                self.status_msg = Some("Token rejected — doesn't match any unreached account".into());
-                return;
-            }
+        let description = if let Some(a) = matched {
+            a.tunnel_names.join(", ")
+        } else if let Some(zones) = cloudflare::verify_token_has_zones(&token) {
+            format!("DNS zones: {}", zones.join(", "))
+        } else {
+            self.status_msg = Some(
+                "Token rejected — doesn't match any tunnel account or DNS zone".into(),
+            );
+            return;
         };
 
-        // Save it
         match self.config.add_api_token(token) {
             Ok(()) => {
-                self.status_msg = Some(format!("Token added for {}", matched_names));
+                self.status_msg = Some(format!("Token added for {}", description));
             }
             Err(e) => {
                 self.status_msg = Some(format!("Error: {}", e));
@@ -1130,6 +1282,30 @@ impl App {
         self.mode = Mode::Normal;
         self.loading = Some("Syncing Cloudflare...".into());
         self.spawn_cf_sync();
+    }
+
+    #[cfg(test)]
+    pub fn test_app(config: config::Config, ingress_routes: HashMap<u16, Vec<IngressRoute>>) -> Self {
+        let (tx, rx) = mpsc::channel();
+        let mut app = Self {
+            config,
+            unified_rows: Vec::new(),
+            tunnel_info: HashMap::new(),
+            ingress_routes,
+            unreached: Vec::new(),
+            selected: 0,
+            collapsed: HashSet::new(),
+            mode: Mode::Normal,
+            status_msg: None,
+            should_quit: false,
+            loading: None,
+            spinner_tick: 0,
+            bg_reopen_routes: false,
+            bg_tx: tx,
+            bg_rx: rx,
+        };
+        app.rebuild_unified_rows();
+        app
     }
 }
 
@@ -1196,7 +1372,7 @@ mod tests {
         }]);
 
         let app = make_app(services, tunnels, ingress);
-        let result = app.resolve_service_route();
+        let result = app.resolve_service_route_by_name("katulong");
         assert!(result.is_ok(), "Expected Ok, got: {:?}", result);
         let (tunnel_name, _, hostname, service_url) = result.unwrap();
         assert_eq!(tunnel_name, "my-tunnel");
@@ -1207,7 +1383,7 @@ mod tests {
     #[test]
     fn resolve_service_route_no_service_selected() {
         let app = make_app(Vec::new(), Vec::new(), HashMap::new());
-        let result = app.resolve_service_route();
+        let result = app.resolve_service_route_by_name("nonexistent");
         assert_eq!(result, Err("No service selected".into()));
     }
 
@@ -1222,7 +1398,7 @@ mod tests {
         }];
 
         let app = make_app(services, Vec::new(), HashMap::new());
-        let result = app.resolve_service_route();
+        let result = app.resolve_service_route_by_name("postgres");
         assert_eq!(result, Err("No route found for this service".into()));
     }
 
@@ -1245,7 +1421,7 @@ mod tests {
         }]);
 
         let app = make_app(services, Vec::new(), ingress);
-        let result = app.resolve_service_route();
+        let result = app.resolve_service_route_by_name("katulong");
         assert_eq!(result, Err("Tunnel not found for this route".into()));
     }
 
@@ -1272,8 +1448,7 @@ mod tests {
         }]);
 
         let app = make_app(services, tunnels, ingress);
-        let (_, token, _, _) = app.resolve_service_route().unwrap();
-        // Verify the token can be decoded to get account_id
+        let (_, token, _, _) = app.resolve_service_route_by_name("katulong").unwrap();
         let payload = config::decode_token(&token).unwrap();
         assert_eq!(payload.account_id, "acct123");
         assert_eq!(payload.tunnel_id, "tun456");
@@ -1316,9 +1491,9 @@ mod tests {
             scheme: "https".into(),
         }]);
 
-        let mut app = make_app(services, tunnels, ingress);
-        app.service_selected = 1; // katulong
-        let result = app.resolve_service_route();
+        let app = make_app(services, tunnels, ingress);
+        // Use by-name variant to directly test the correct service
+        let result = app.resolve_service_route_by_name("katulong");
         assert!(result.is_ok());
         let (_, _, hostname, _) = result.unwrap();
         assert_eq!(hostname, "katulong-mini.felixflor.es");
@@ -1334,6 +1509,11 @@ mod tests {
             memo: Some("levee db".into()),
         }];
         let mut app = make_app(services, Vec::new(), HashMap::new());
+        // Select the postgres service in unified rows (it'll be unlinked: Separator at 0, service at 1)
+        app.selected = match app.unified_rows.iter().position(|r| matches!(r, UnifiedRow::Service { name, .. } if name == "postgres")) {
+            Some(idx) => idx,
+            None => { panic!("postgres not found in unified rows"); }
+        };
         app.begin_rename_service_route();
         assert_eq!(app.mode, Mode::Normal);
         assert_eq!(app.status_msg, Some("No route found for this service".into()));
@@ -1357,6 +1537,11 @@ mod tests {
         }]);
 
         let mut app = make_app(services, Vec::new(), ingress);
+        // Select katulong service
+        app.selected = match app.unified_rows.iter().position(|r| matches!(r, UnifiedRow::Service { name, .. } if name == "katulong")) {
+            Some(idx) => idx,
+            None => { panic!("katulong not found in unified rows"); }
+        };
         app.begin_rename_service_route();
         assert_eq!(app.mode, Mode::Normal);
         assert_eq!(app.status_msg, Some("Tunnel not found for this route".into()));
@@ -1385,14 +1570,16 @@ mod tests {
         }]);
 
         let mut app = make_app(services, tunnels, ingress);
-        // No cf_api_tokens configured, so verify_token can't find a match
+        // Select katulong service (tunnel at 0, katulong at 1)
+        app.selected = match app.unified_rows.iter().position(|r| matches!(r, UnifiedRow::Service { name, .. } if name == "katulong")) {
+            Some(idx) => idx,
+            None => { panic!("katulong not found in unified rows"); }
+        };
         app.begin_rename_service_route();
-        // This now runs in a background thread — wait for it
         assert!(app.loading.is_some());
         std::thread::sleep(std::time::Duration::from_millis(500));
         app.poll_bg();
         assert_eq!(app.mode, Mode::Normal);
-        assert_eq!(app.status_msg, Some("No API token with access — press T to add one".into()));
+        assert_eq!(app.status_msg, Some("No API token with access — press t then a to add one".into()));
     }
 }
-
