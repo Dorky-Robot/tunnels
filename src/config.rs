@@ -58,6 +58,18 @@ impl Config {
         tokens
     }
 
+    pub fn find_tunnel_by_tunnel_id(&self, tunnel_id: &str) -> Option<&Tunnel> {
+        self.tunnels.iter().find(|t| {
+            decode_token(&t.token)
+                .map(|p| p.tunnel_id == tunnel_id)
+                .unwrap_or(false)
+        })
+    }
+
+    pub fn owned_api_tokens(&self) -> Vec<String> {
+        self.all_cf_api_tokens().into_iter().map(|s| s.to_string()).collect()
+    }
+
     pub fn path() -> PathBuf {
         dirs::home_dir().map(|h| h.join(".config"))
             .unwrap_or_else(|| PathBuf::from("."))

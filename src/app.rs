@@ -74,7 +74,6 @@ pub enum Mode {
     Normal,
     Linking {
         port: u16,
-        name: String,
         hostname: String,
         tunnel_name: String,
         old_hostname: Option<String>,
@@ -121,15 +120,6 @@ pub enum Mode {
         content: String,
     },
     Help,
-}
-
-/// Split a hostname into (subdomain, domain_suffix).
-fn split_hostname(hostname: &str) -> (String, String) {
-    if let Some(dot_pos) = hostname.find('.') {
-        (hostname[..dot_pos].to_string(), hostname[dot_pos..].to_string())
-    } else {
-        (hostname.to_string(), String::new())
-    }
 }
 
 pub fn settings_item_selectable(kind: &SettingsItemKind) -> bool {
@@ -239,12 +229,8 @@ impl App {
                         self.begin_add_api_token();
                     }
                 }
-                BgResult::LinkComplete { status_msg } => {
-                    self.status_msg = Some(status_msg);
-                    self.loading = Some("Syncing...".into());
-                    self.spawn_cf_sync();
-                }
-                BgResult::UnlinkComplete { status_msg } => {
+                BgResult::LinkComplete { status_msg }
+                | BgResult::UnlinkComplete { status_msg } => {
                     self.status_msg = Some(status_msg);
                     self.loading = Some("Syncing...".into());
                     self.spawn_cf_sync();
@@ -296,14 +282,13 @@ impl App {
 
         self.mode = Mode::Linking {
             port: row.port,
-            name: row.name.clone(),
             hostname,
             tunnel_name,
             old_hostname,
         };
     }
 
-    pub fn finish_link(&mut self, port: u16, _name: String, new_hostname: String, tunnel_name: String, old_hostname: Option<String>) {
+    pub fn finish_link(&mut self, port: u16, new_hostname: String, tunnel_name: String, old_hostname: Option<String>) {
         if new_hostname.is_empty() {
             self.status_msg = Some("Hostname cannot be empty".into());
             self.mode = Mode::Normal;
@@ -343,8 +328,7 @@ impl App {
         self.loading = Some("Linking...".into());
         self.mode = Mode::Normal;
         let tx = self.bg_tx.clone();
-        let api_tokens: Vec<String> = self.config.all_cf_api_tokens()
-            .into_iter().map(|s| s.to_string()).collect();
+        let api_tokens = self.config.owned_api_tokens();
         let account_id = payload.account_id;
         let tunnel_id = payload.tunnel_id;
         let service_url = format!("http://localhost:{}", port);
@@ -409,30 +393,24 @@ impl App {
             None => return,
         };
 
-        if row.url.is_some() {
+        if let Some(hostname) = row.url {
             self.mode = Mode::ConfirmingUnlink {
                 port: row.port,
-                hostname: row.url.unwrap(),
+                hostname,
             };
-        } else {
-            if let Some(idx) = self.config.services.iter().position(|s| s.port == row.port) {
-                let svc = &self.config.services[idx];
-                self.mode = Mode::ConfirmingServiceDelete {
-                    idx,
-                    name: svc.name.clone(),
-                    port: svc.port,
-                };
-            }
+        } else if let Some(idx) = self.config.services.iter().position(|s| s.port == row.port) {
+            let svc = &self.config.services[idx];
+            self.mode = Mode::ConfirmingServiceDelete {
+                idx,
+                name: svc.name.clone(),
+                port: svc.port,
+            };
         }
     }
 
     pub fn finish_unlink(&mut self, port: u16, hostname: String) {
-        let tunnel_id = self.ingress_routes.get(&port)
-            .and_then(|routes| routes.first())
-            .map(|r| r.tunnel_id.clone());
-
-        let tunnel_id = match tunnel_id {
-            Some(id) => id,
+        let tunnel_id = match self.ingress_routes.get(&port).and_then(|r| r.first()) {
+            Some(r) => r.tunnel_id.clone(),
             None => {
                 self.status_msg = Some("No route found".into());
                 self.mode = Mode::Normal;
@@ -440,13 +418,7 @@ impl App {
             }
         };
 
-        let tunnel = self.config.tunnels.iter().find(|t| {
-            config::decode_token(&t.token)
-                .map(|p| p.tunnel_id == tunnel_id)
-                .unwrap_or(false)
-        });
-
-        let tunnel = match tunnel {
+        let tunnel = match self.config.find_tunnel_by_tunnel_id(&tunnel_id) {
             Some(t) => t.clone(),
             None => {
                 self.status_msg = Some("Tunnel not found for this route".into());
@@ -467,8 +439,7 @@ impl App {
         self.loading = Some("Unlinking...".into());
         self.mode = Mode::Normal;
         let tx = self.bg_tx.clone();
-        let api_tokens: Vec<String> = self.config.all_cf_api_tokens()
-            .into_iter().map(|s| s.to_string()).collect();
+        let api_tokens = self.config.owned_api_tokens();
         let account_id = payload.account_id;
         let tunnel_id_owned = payload.tunnel_id;
 
@@ -579,21 +550,32 @@ impl App {
         }
 
         // Determine which accounts have API tokens based on cached sync data.
-        // If an account has tunnel_info (from last sync), an API token worked for it.
-        // If it's in unreached, no token matched. No network calls needed.
+        // Unreached accounts have no working token. Reached accounts have at least
+        // one token that worked — show the first configured token whose account
+        // matches (by checking if tunnel_info has data for any tunnel in that account).
         let unreached_ids: HashSet<String> = self.unreached.iter()
             .map(|u| u.account_id.clone())
             .collect();
 
-        let api_tokens = self.config.all_cf_api_tokens();
         let mut matched_api: HashMap<String, String> = HashMap::new();
-        for account_id in accounts.keys() {
+        for (account_id, tunnels) in &accounts {
             if unreached_ids.contains(account_id) {
-                continue; // no token for this account
+                continue;
             }
-            // Account was reached — find which token (just show the first configured one)
-            if let Some(tok) = api_tokens.first() {
-                matched_api.insert(account_id.clone(), tok.to_string());
+            // Check if any tunnel in this account has info (meaning sync reached it)
+            let reached = tunnels.iter().any(|t| {
+                config::decode_token(&t.token)
+                    .map(|p| self.tunnel_info.contains_key(&p.tunnel_id))
+                    .unwrap_or(false)
+            });
+            if reached {
+                // Find the per-tunnel API token or first global one
+                let tok = tunnels.iter()
+                    .find_map(|t| t.api_token.as_ref())
+                    .or_else(|| self.config.cf_api_tokens.first());
+                if let Some(tok) = tok {
+                    matched_api.insert(account_id.clone(), tok.clone());
+                }
             }
         }
 
@@ -674,6 +656,16 @@ impl App {
         items
     }
 
+    /// Return to settings if we came from there, otherwise Normal mode.
+    pub fn dismiss_or_settings(&mut self) {
+        if self.return_to_settings {
+            self.return_to_settings = false;
+            self.open_settings();
+        } else {
+            self.mode = Mode::Normal;
+        }
+    }
+
     // --- Tunnel CRUD (from settings) ---
 
     pub fn begin_add(&mut self) {
@@ -689,12 +681,7 @@ impl App {
             Ok(()) => self.status_msg = Some(format!("Added tunnel '{}'", name)),
             Err(e) => self.status_msg = Some(format!("Error: {}", e)),
         }
-        if self.return_to_settings {
-            self.return_to_settings = false;
-            self.open_settings();
-        } else {
-            self.mode = Mode::Normal;
-        }
+        self.dismiss_or_settings();
         self.rebuild_rows();
     }
 
@@ -710,12 +697,7 @@ impl App {
             }
             Err(e) => self.status_msg = Some(format!("Error: {}", e)),
         }
-        if self.return_to_settings {
-            self.return_to_settings = false;
-            self.open_settings();
-        } else {
-            self.mode = Mode::Normal;
-        }
+        self.dismiss_or_settings();
         self.rebuild_rows();
     }
 
@@ -786,8 +768,7 @@ impl App {
         let tunnel_tokens: Vec<(String, String)> = self.config.tunnels.iter()
             .map(|t| (t.name.clone(), t.token.clone()))
             .collect();
-        let cf_tokens: Vec<String> = self.config.all_cf_api_tokens()
-            .into_iter().map(|s| s.to_string()).collect();
+        let cf_tokens = self.config.owned_api_tokens();
 
         std::thread::spawn(move || {
             let refs: Vec<&str> = cf_tokens.iter().map(|s| s.as_str()).collect();
@@ -894,11 +875,7 @@ impl App {
         // 2. Check existing routes from sync data
         if let Some(routes) = self.ingress_routes.get(&port) {
             if let Some(route) = routes.first() {
-                if let Some(tunnel) = self.config.tunnels.iter().find(|t| {
-                    config::decode_token(&t.token)
-                        .map(|p| p.tunnel_id == route.tunnel_id)
-                        .unwrap_or(false)
-                }) {
+                if let Some(tunnel) = self.config.find_tunnel_by_tunnel_id(&route.tunnel_id) {
                     return Some(tunnel.name.clone());
                 }
             }
@@ -906,30 +883,6 @@ impl App {
 
         // 3. First available tunnel
         self.config.tunnels.first().map(|t| t.name.clone())
-    }
-
-    /// Look up the route info for a service by name.
-    pub fn resolve_service_route_by_name(&self, service_name: &str) -> Result<(String, String, String, String), String> {
-        let service = self.config.services.iter()
-            .find(|s| s.name == service_name)
-            .ok_or_else(|| "No service selected".to_string())?;
-
-        let routes = self.ingress_routes.get(&service.port)
-            .filter(|r| !r.is_empty())
-            .ok_or_else(|| "No route found for this service".to_string())?;
-
-        let route = &routes[0];
-        let service_url = format!("http://localhost:{}", service.port);
-
-        let tunnel = self.config.tunnels.iter()
-            .find(|t| {
-                config::decode_token(&t.token)
-                    .map(|p| p.tunnel_id == route.tunnel_id)
-                    .unwrap_or(false)
-            })
-            .ok_or_else(|| "Tunnel not found for this route".to_string())?;
-
-        Ok((tunnel.name.clone(), tunnel.token.clone(), route.hostname.clone(), service_url))
     }
 
     #[cfg(test)]
@@ -977,172 +930,32 @@ mod tests {
     }
 
     #[test]
-    fn split_hostname_splits_correctly() {
-        let (sub, domain) = super::split_hostname("katulong-mini.felixflor.es");
-        assert_eq!(sub, "katulong-mini");
-        assert_eq!(domain, ".felixflor.es");
-    }
-
-    #[test]
-    fn split_hostname_single_dot() {
-        let (sub, domain) = super::split_hostname("simple.com");
-        assert_eq!(sub, "simple");
-        assert_eq!(domain, ".com");
-    }
-
-    #[test]
-    fn split_hostname_no_dot() {
-        let (sub, domain) = super::split_hostname("bare");
-        assert_eq!(sub, "bare");
-        assert_eq!(domain, "");
-    }
-
-    #[test]
-    fn resolve_service_route_finds_route_by_port() {
-        let services = vec![Service {
-            name: "katulong".into(),
-            port: 3001,
-            machine: String::new(),
-            tunnel: None,
-            memo: None,
-        }];
+    fn find_tunnel_by_tunnel_id_found() {
         let tunnels = vec![Tunnel {
             name: "my-tunnel".into(),
             token: TEST_TOKEN.into(),
             api_token: None,
         }];
-        let mut ingress = HashMap::new();
-        ingress.insert(3001, vec![IngressRoute {
-            hostname: "katulong-mini.felixflor.es".into(),
-            tunnel_name: "my-tunnel".into(),
-            tunnel_id: "tun456".into(),
-            scheme: "https".into(),
-        }]);
-
-        let app = make_app(services, tunnels, ingress);
-        let result = app.resolve_service_route_by_name("katulong");
-        assert!(result.is_ok(), "Expected Ok, got: {:?}", result);
-        let (tunnel_name, _, hostname, service_url) = result.unwrap();
-        assert_eq!(tunnel_name, "my-tunnel");
-        assert_eq!(hostname, "katulong-mini.felixflor.es");
-        assert_eq!(service_url, "http://localhost:3001");
+        let config = Config {
+            tunnels,
+            services: Vec::new(),
+            cf_api_tokens: Vec::new(),
+            cf_api_token: None,
+        };
+        let result = config.find_tunnel_by_tunnel_id("tun456");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "my-tunnel");
     }
 
     #[test]
-    fn resolve_service_route_no_service_selected() {
-        let app = make_app(Vec::new(), Vec::new(), HashMap::new());
-        let result = app.resolve_service_route_by_name("nonexistent");
-        assert_eq!(result, Err("No service selected".into()));
-    }
-
-    #[test]
-    fn resolve_service_route_no_route_for_port() {
-        let services = vec![Service {
-            name: "postgres".into(),
-            port: 5432,
-            machine: String::new(),
-            tunnel: None,
-            memo: Some("levee db".into()),
-        }];
-
-        let app = make_app(services, Vec::new(), HashMap::new());
-        let result = app.resolve_service_route_by_name("postgres");
-        assert_eq!(result, Err("No route found for this service".into()));
-    }
-
-    #[test]
-    fn resolve_service_route_no_matching_tunnel() {
-        let services = vec![Service {
-            name: "katulong".into(),
-            port: 3001,
-            machine: String::new(),
-            tunnel: None,
-            memo: None,
-        }];
-        let mut ingress = HashMap::new();
-        ingress.insert(3001, vec![IngressRoute {
-            hostname: "katulong-mini.felixflor.es".into(),
-            tunnel_name: "my-tunnel".into(),
-            tunnel_id: "tun456".into(),
-            scheme: "https".into(),
-        }]);
-
-        let app = make_app(services, Vec::new(), ingress);
-        let result = app.resolve_service_route_by_name("katulong");
-        assert_eq!(result, Err("Tunnel not found for this route".into()));
-    }
-
-    #[test]
-    fn resolve_service_route_returns_decoded_token_data() {
-        let services = vec![Service {
-            name: "katulong".into(),
-            port: 3001,
-            machine: String::new(),
-            tunnel: None,
-            memo: None,
-        }];
-        let tunnels = vec![Tunnel {
-            name: "my-tunnel".into(),
-            token: TEST_TOKEN.into(),
-            api_token: None,
-        }];
-        let mut ingress = HashMap::new();
-        ingress.insert(3001, vec![IngressRoute {
-            hostname: "katulong-mini.felixflor.es".into(),
-            tunnel_name: "my-tunnel".into(),
-            tunnel_id: "tun456".into(),
-            scheme: "https".into(),
-        }]);
-
-        let app = make_app(services, tunnels, ingress);
-        let (_, token, _, _) = app.resolve_service_route_by_name("katulong").unwrap();
-        let payload = config::decode_token(&token).unwrap();
-        assert_eq!(payload.account_id, "acct123");
-        assert_eq!(payload.tunnel_id, "tun456");
-    }
-
-    #[test]
-    fn resolve_service_route_selects_correct_service() {
-        let services = vec![
-            Service {
-                name: "dogtopia".into(),
-                port: 3000,
-                machine: String::new(),
-                tunnel: None,
-                memo: None,
-            },
-            Service {
-                name: "katulong".into(),
-                port: 3001,
-                machine: String::new(),
-                tunnel: None,
-                memo: None,
-            },
-        ];
-        let tunnels = vec![Tunnel {
-            name: "my-tunnel".into(),
-            token: TEST_TOKEN.into(),
-            api_token: None,
-        }];
-        let mut ingress = HashMap::new();
-        ingress.insert(3000, vec![IngressRoute {
-            hostname: "dogtopia.everyday.vet".into(),
-            tunnel_name: "my-tunnel".into(),
-            tunnel_id: "tun456".into(),
-            scheme: "https".into(),
-        }]);
-        ingress.insert(3001, vec![IngressRoute {
-            hostname: "katulong-mini.felixflor.es".into(),
-            tunnel_name: "my-tunnel".into(),
-            tunnel_id: "tun456".into(),
-            scheme: "https".into(),
-        }]);
-
-        let app = make_app(services, tunnels, ingress);
-        let result = app.resolve_service_route_by_name("katulong");
-        assert!(result.is_ok());
-        let (_, _, hostname, _) = result.unwrap();
-        assert_eq!(hostname, "katulong-mini.felixflor.es");
+    fn find_tunnel_by_tunnel_id_not_found() {
+        let config = Config {
+            tunnels: Vec::new(),
+            services: Vec::new(),
+            cf_api_tokens: Vec::new(),
+            cf_api_token: None,
+        };
+        assert!(config.find_tunnel_by_tunnel_id("nonexistent").is_none());
     }
 
     #[test]

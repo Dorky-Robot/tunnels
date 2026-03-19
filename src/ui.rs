@@ -30,7 +30,7 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     // Overlays
     match &app.mode {
-        Mode::Linking { port, name: _, hostname, tunnel_name, old_hostname } => {
+        Mode::Linking { port, hostname, tunnel_name, old_hostname } => {
             let title = if old_hostname.is_some() {
                 format!(" Edit :{} ", port)
             } else {
@@ -251,6 +251,16 @@ fn draw_keybindings(f: &mut Frame, app: &App, area: Rect) {
 
 // --- Dialogs ---
 
+fn format_input_display(input: &str) -> String {
+    if input.is_empty() {
+        "_".to_string()
+    } else if input.len() > 40 {
+        format!("...{}_", &input[input.len() - 37..])
+    } else {
+        format!("{}_", input)
+    }
+}
+
 fn draw_link_dialog(f: &mut Frame, title: &str, tunnel_name: &str, hostname: &str) {
     let area = fixed_centered_rect(55, 7, f.area());
     f.render_widget(Clear, area);
@@ -406,23 +416,12 @@ fn draw_settings_modal(f: &mut Frame, items: &[crate::app::SettingsItem], select
                     ]);
                     Row::new(vec![Cell::from(line)]).style(base)
                 }
-                SettingsItemKind::AddAccount => {
-                    let base = if is_selected {
-                        Style::default().bg(Color::Rgb(30, 40, 55)).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(DIM)
-                    };
-                    let prefix = if is_selected { "▸ " } else { "  " };
-                    let line = Line::from(vec![
-                        Span::styled(prefix, base),
-                        Span::styled(&item.label, base),
-                    ]);
-                    Row::new(vec![Cell::from(line)]).style(base)
-                }
                 _ => {
-                    // Action items
+                    let dim_default = matches!(item.kind, SettingsItemKind::AddAccount);
                     let base = if is_selected {
                         Style::default().bg(Color::Rgb(30, 40, 55)).add_modifier(Modifier::BOLD)
+                    } else if dim_default {
+                        Style::default().fg(DIM)
                     } else {
                         Style::default()
                     };
@@ -540,16 +539,8 @@ fn draw_edit_dialog(f: &mut Frame, name: &str, token: &str) {
         chunks[5],
     );
 
-    let display = if token.is_empty() {
-        "_".to_string()
-    } else if token.len() > 40 {
-        format!("...{}_", &token[token.len()-37..])
-    } else {
-        format!("{}_", token)
-    };
-
     f.render_widget(
-        Paragraph::new(format!("  Token: {}", display))
+        Paragraph::new(format!("  Token: {}", format_input_display(token)))
             .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
         chunks[8],
     );
@@ -710,16 +701,8 @@ fn draw_add_api_token_dialog(
         chunks[6],
     );
 
-    let display = if input.is_empty() {
-        "_".to_string()
-    } else if input.len() > 40 {
-        format!("...{}_", &input[input.len() - 37..])
-    } else {
-        format!("{}_", input)
-    };
-
     f.render_widget(
-        Paragraph::new(format!("  Token: {}", display))
+        Paragraph::new(format!("  Token: {}", format_input_display(input)))
             .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
         chunks[8],
     );

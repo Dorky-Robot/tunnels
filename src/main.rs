@@ -164,7 +164,7 @@ fn handle_normal(app: &mut App, code: KeyCode) {
 }
 
 fn handle_linking(app: &mut App, code: KeyCode) {
-    let Mode::Linking { port, name, hostname, tunnel_name, old_hostname } = &mut app.mode else {
+    let Mode::Linking { port, hostname, tunnel_name, old_hostname } = &mut app.mode else {
         return;
     };
 
@@ -172,11 +172,11 @@ fn handle_linking(app: &mut App, code: KeyCode) {
         KeyCode::Esc => app.mode = Mode::Normal,
         KeyCode::Enter => {
             if !hostname.is_empty() {
-                let (p, n, h, tn, oh) = (
-                    *port, name.clone(), hostname.clone(),
+                let (p, h, tn, oh) = (
+                    *port, hostname.clone(),
                     tunnel_name.clone(), old_hostname.clone(),
                 );
-                app.finish_link(p, n, h, tn, oh);
+                app.finish_link(p, h, tn, oh);
             }
         }
         KeyCode::Backspace => { hostname.pop(); }
@@ -303,16 +303,12 @@ fn handle_settings(app: &mut App, code: KeyCode) {
             }
         }
         KeyCode::Char('a') => {
-            // Context-aware add: find which account section cursor is in
             let item = items[*selected].clone();
             match &item.kind {
-                // If on an api key or tunnel row, add a tunnel to that account
-                SettingsItemKind::ApiKey(account_id) | SettingsItemKind::AccountHeader(account_id) => {
-                    // For now, just open add tunnel dialog
-                    app.mode = Mode::Normal;
-                    app.begin_add();
-                }
-                SettingsItemKind::Tunnel(_) => {
+                SettingsItemKind::ApiKey(_)
+                | SettingsItemKind::AccountHeader(_)
+                | SettingsItemKind::Tunnel(_) => {
+                    app.return_to_settings = true;
                     app.mode = Mode::Normal;
                     app.begin_add();
                 }
@@ -353,12 +349,7 @@ fn handle_settings(app: &mut App, code: KeyCode) {
 }
 
 fn dismiss_to(app: &mut App) {
-    if app.return_to_settings {
-        app.return_to_settings = false;
-        app.open_settings();
-    } else {
-        app.mode = Mode::Normal;
-    }
+    app.dismiss_or_settings();
 }
 
 fn handle_adding_api_token(app: &mut App, code: KeyCode) {
