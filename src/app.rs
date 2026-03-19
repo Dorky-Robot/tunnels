@@ -1,5 +1,5 @@
 use crate::cloudflare::{self, IngressRoute, TunnelInfo, UnreachedAccount};
-use crate::config::{self, Config, Tunnel};
+use crate::config::{self, Config};
 use crate::launchd;
 use crate::scan;
 use std::collections::{HashMap, HashSet};
@@ -7,153 +7,55 @@ use std::sync::mpsc;
 
 pub const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+// --- Background result types ---
+
 pub enum BgResult {
     CfSync(cloudflare::SyncResult),
-    Routes {
-        tunnel_name: String,
-        api_token: String,
-        account_id: String,
-        tunnel_id: String,
-        routes: Vec<RouteRow>,
-        status_msg: Option<String>,
-    },
-    RouteRenamed {
-        status_msg: String,
-        tunnel_name: String,
-        api_token: String,
-        account_id: String,
-        tunnel_id: String,
-    },
-    RouteAdded {
-        status_msg: String,
-        tunnel_name: String,
-        api_token: String,
-        account_id: String,
-        tunnel_id: String,
-    },
-    RouteDeleted {
-        status_msg: String,
-        tunnel_name: String,
-        api_token: String,
-        account_id: String,
-        tunnel_id: String,
-    },
-    VerifyToken {
-        tunnel_name: String,
-        api_token: String,
-        account_id: String,
-        tunnel_id: String,
-        hostname: String,
-        service_url: String,
-    },
-    VerifyTokenFailed(String),
+    LinkComplete { status_msg: String },
+    UnlinkComplete { status_msg: String },
 }
 
-// --- Unified tree view types ---
+// --- View model ---
 
 #[derive(Debug, Clone)]
-pub enum UnifiedRow {
-    Tunnel {
-        name: String,
-        status: launchd::Status,
-        #[allow(dead_code)]
-        cf_name: String,
-        cf_conns: String,
-        service_count: usize,
-    },
-    Service {
-        name: String,
-        port: u16,
-        #[allow(dead_code)]
-        tunnel_name: Option<String>,
-        tunnel_status: String,
-        url: String,
-        memo: String,
-        is_last: bool,
-    },
-    Separator,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PrefixKey {
-    Add,
-    Token,
-    Global,
+pub struct PortRow {
+    pub port: u16,
+    pub name: String,
+    pub url: Option<String>,
+    pub health: Health,
+    pub tunnel_name: Option<String>,
+    pub memo: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ContextAction {
-    StartTunnel,
-    StopTunnel,
-    RestartTunnel,
-    ManageRoutes,
-    ViewLogs,
-    EditConnToken,
-    RenameTunnel,
-    DeleteTunnel,
-    EditService,
-    RenameUrl,
-    UntrackService,
+pub enum Health {
+    Healthy,   // ✓  linked + tunnel running + edge connected
+    Unhealthy, // ✗  linked but something wrong
+    Active,    // ●  in config, not linked
+}
+
+// --- Settings ---
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsItem {
+    pub kind: SettingsItemKind,
+    pub label: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingsItemKind {
+    AccountHeader(String),  // account_id
+    ApiKey(String),         // account_id
+    Tunnel(String),         // tunnel name
+    Spacer,
+    AddAccount,
+    ActionScanPorts,
+    ActionImportPlists,
+    ActionSyncCf,
 }
 
 // --- Mode and field enums ---
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Mode {
-    Normal,
-    Prefix(PrefixKey),
-    ContextMenu {
-        items: Vec<(char, String, ContextAction)>,
-        selected: usize,
-    },
-    Adding { field: AddField, name: String, token: String },
-    Editing { name: String, token: String },
-    Renaming { old_name: String, new_name: String },
-    Confirming { action: String, target: String },
-    Logs { name: String, content: String },
-    Migrating { daemon_plists: Vec<std::path::PathBuf> },
-    AddingService { field: ServiceField, name: String, port: String, tunnel: String, memo: String },
-    EditingService { idx: usize, field: ServiceField, name: String, port: String, tunnel: String, memo: String },
-    ConfirmingServiceDelete { idx: usize, name: String, port: u16 },
-    AddingApiToken {
-        input: String,
-    },
-    Routes {
-        tunnel_name: String,
-        api_token: String,
-        account_id: String,
-        tunnel_id: String,
-        routes: Vec<RouteRow>,
-        selected: usize,
-    },
-    AddingRoute {
-        tunnel_name: String,
-        api_token: String,
-        account_id: String,
-        tunnel_id: String,
-        field: RouteField,
-        hostname: String,
-        service: String,
-    },
-    RenamingRoute {
-        tunnel_name: String,
-        api_token: String,
-        account_id: String,
-        tunnel_id: String,
-        old_hostname: String,
-        service: String,
-        new_subdomain: String,
-        domain_suffix: String,
-    },
-    ConfirmingRouteDelete {
-        tunnel_name: String,
-        api_token: String,
-        account_id: String,
-        tunnel_id: String,
-        hostname: String,
-    },
-    Help,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AddField {
@@ -162,37 +64,66 @@ pub enum AddField {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ServiceField {
-    Name,
+pub enum AddPortField {
     Port,
-    Tunnel,
-    Memo,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RouteField {
-    Hostname,
-    Service,
+    Name,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DnsStatus {
-    Ok,
-    Missing,
-    Unknown,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RouteRow {
-    pub hostname: String,
-    pub service: String,
-    pub dns: DnsStatus,
+pub enum Mode {
+    Normal,
+    Linking {
+        port: u16,
+        name: String,
+        hostname: String,
+        tunnel_name: String,
+        old_hostname: Option<String>,
+    },
+    ConfirmingUnlink {
+        port: u16,
+        hostname: String,
+    },
+    AddingPort {
+        field: AddPortField,
+        port: String,
+        name: String,
+    },
+    Settings {
+        items: Vec<SettingsItem>,
+        selected: usize,
+    },
+    Adding {
+        field: AddField,
+        name: String,
+        token: String,
+    },
+    Editing {
+        name: String,
+        token: String,
+    },
+    AddingApiToken {
+        input: String,
+    },
+    Confirming {
+        action: String,
+        target: String,
+    },
+    ConfirmingServiceDelete {
+        idx: usize,
+        name: String,
+        port: u16,
+    },
+    Migrating {
+        daemon_plists: Vec<std::path::PathBuf>,
+    },
+    Logs {
+        name: String,
+        content: String,
+    },
+    Help,
 }
 
 /// Split a hostname into (subdomain, domain_suffix).
-/// e.g. "katulong-mini.felixflor.es" → ("katulong-mini", ".felixflor.es")
-/// "simple.com" → ("simple", ".com")
-/// "bare" → ("bare", "")
 fn split_hostname(hostname: &str) -> (String, String) {
     if let Some(dot_pos) = hostname.find('.') {
         (hostname[..dot_pos].to_string(), hostname[dot_pos..].to_string())
@@ -201,21 +132,24 @@ fn split_hostname(hostname: &str) -> (String, String) {
     }
 }
 
+pub fn settings_item_selectable(kind: &SettingsItemKind) -> bool {
+    !matches!(kind, SettingsItemKind::AccountHeader(_) | SettingsItemKind::Spacer)
+}
+
 pub struct App {
     pub config: Config,
-    pub unified_rows: Vec<UnifiedRow>,
+    pub rows: Vec<PortRow>,
     pub tunnel_info: HashMap<String, TunnelInfo>,
     pub ingress_routes: HashMap<u16, Vec<IngressRoute>>,
     pub unreached: Vec<UnreachedAccount>,
     pub selected: usize,
-    pub collapsed: HashSet<String>,
     pub mode: Mode,
     pub status_msg: Option<String>,
     pub should_quit: bool,
     pub loading: Option<String>,
     pub spinner_tick: usize,
-    /// When true, route bg results will reopen the Routes dialog instead of just syncing
-    bg_reopen_routes: bool,
+    pub last_sync: Option<std::time::Instant>,
+    pub return_to_settings: bool,
     bg_tx: mpsc::Sender<BgResult>,
     bg_rx: mpsc::Receiver<BgResult>,
 }
@@ -226,232 +160,621 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let mut app = Self {
             config,
-            unified_rows: Vec::new(),
+            rows: Vec::new(),
             tunnel_info: HashMap::new(),
             ingress_routes: HashMap::new(),
             unreached: Vec::new(),
             selected: 0,
-            collapsed: HashSet::new(),
             mode: Mode::Normal,
             status_msg: None,
             should_quit: false,
             loading: Some("Syncing Cloudflare...".into()),
             spinner_tick: 0,
-            bg_reopen_routes: false,
+            last_sync: None,
+            return_to_settings: false,
             bg_tx: tx,
             bg_rx: rx,
         };
-        app.rebuild_unified_rows();
+        app.rebuild_rows();
         app.spawn_cf_sync();
         app
     }
 
-    pub fn rebuild_unified_rows(&mut self) {
-        self.unified_rows.clear();
-        let mut claimed_services: HashSet<String> = HashSet::new();
+    pub fn rebuild_rows(&mut self) {
+        self.rows.clear();
 
-        for tunnel_cfg in &self.config.tunnels {
-            let status = launchd::status(&tunnel_cfg.name);
-            let tunnel_id = config::decode_token(&tunnel_cfg.token)
-                .map(|p| p.tunnel_id)
-                .unwrap_or_default();
+        for svc in &self.config.services {
+            let routes = self.ingress_routes.get(&svc.port);
+            let (url, health, tunnel_name) = if let Some(routes) = routes.filter(|r| !r.is_empty()) {
+                let best = routes.iter()
+                    .find(|r| {
+                        self.tunnel_info.get(&r.tunnel_id)
+                            .map_or(false, |info| info.connection_count > 0)
+                    })
+                    .or(routes.first());
 
-            let (cf_name, cf_conns) = self.tunnel_info.get(&tunnel_id)
-                .map(|info| (info.cf_name.clone(), info.connections.clone()))
-                .unwrap_or_else(|| ("—".into(), "—".into()));
-
-            // Find services linked to this tunnel
-            let mut linked_services: Vec<&config::Service> = Vec::new();
-            for svc in &self.config.services {
-                let linked_by_route = self.ingress_routes.get(&svc.port)
-                    .map_or(false, |routes| routes.iter().any(|r| r.tunnel_id == tunnel_id));
-                let linked_by_name = svc.tunnel.as_deref() == Some(&tunnel_cfg.name);
-                if linked_by_route || linked_by_name {
-                    linked_services.push(svc);
-                    claimed_services.insert(svc.name.clone());
+                if let Some(route) = best {
+                    let tunnel_healthy = self.tunnel_info.get(&route.tunnel_id)
+                        .map_or(false, |info| info.connection_count > 0);
+                    let health = if tunnel_healthy { Health::Healthy } else { Health::Unhealthy };
+                    (Some(route.hostname.clone()), health, Some(route.tunnel_name.clone()))
+                } else {
+                    (None, Health::Active, svc.tunnel.clone())
                 }
-            }
+            } else {
+                (None, Health::Active, svc.tunnel.clone())
+            };
 
-            let service_count = linked_services.len();
-            self.unified_rows.push(UnifiedRow::Tunnel {
-                name: tunnel_cfg.name.clone(),
-                status: status.clone(),
-                cf_name,
-                cf_conns,
-                service_count,
+            self.rows.push(PortRow {
+                port: svc.port,
+                name: svc.name.clone(),
+                url,
+                health,
+                tunnel_name,
+                memo: svc.memo.clone(),
             });
+        }
 
-            if !self.collapsed.contains(&tunnel_cfg.name) {
-                let total = linked_services.len();
-                for (j, svc) in linked_services.iter().enumerate() {
-                    let (tunnel_status, url) = self.resolve_service_display(svc, Some(&status));
-                    self.unified_rows.push(UnifiedRow::Service {
-                        name: svc.name.clone(),
-                        port: svc.port,
-                        tunnel_name: Some(tunnel_cfg.name.clone()),
-                        tunnel_status,
-                        url,
-                        memo: svc.memo.clone().unwrap_or_default(),
-                        is_last: j == total - 1,
-                    });
+        self.rows.sort_by_key(|r| r.port);
+
+        if self.rows.is_empty() {
+            self.selected = 0;
+        } else if self.selected >= self.rows.len() {
+            self.selected = self.rows.len() - 1;
+        }
+    }
+
+    pub fn poll_bg(&mut self) {
+        while let Ok(result) = self.bg_rx.try_recv() {
+            self.loading = None;
+            match result {
+                BgResult::CfSync(sync) => {
+                    self.tunnel_info = sync.tunnel_info;
+                    self.ingress_routes = sync.ingress_routes;
+                    self.unreached = sync.unreached;
+                    self.status_msg = Some(sync.status);
+                    self.last_sync = Some(std::time::Instant::now());
+                    self.rebuild_rows();
+                    if !self.unreached.is_empty() {
+                        self.begin_add_api_token();
+                    }
+                }
+                BgResult::LinkComplete { status_msg } => {
+                    self.status_msg = Some(status_msg);
+                    self.loading = Some("Syncing...".into());
+                    self.spawn_cf_sync();
+                }
+                BgResult::UnlinkComplete { status_msg } => {
+                    self.status_msg = Some(status_msg);
+                    self.loading = Some("Syncing...".into());
+                    self.spawn_cf_sync();
                 }
             }
         }
+    }
 
-        // Unlinked services
-        let unlinked: Vec<&config::Service> = self.config.services.iter()
-            .filter(|s| !claimed_services.contains(&s.name))
-            .collect();
+    // --- Navigation ---
 
-        if !unlinked.is_empty() {
-            self.unified_rows.push(UnifiedRow::Separator);
-            let total = unlinked.len();
-            for (j, svc) in unlinked.iter().enumerate() {
-                let (tunnel_status, url) = self.resolve_service_display(svc, None);
-                self.unified_rows.push(UnifiedRow::Service {
+    pub fn move_up(&mut self) {
+        if self.selected > 0 {
+            self.selected -= 1;
+        }
+    }
+
+    pub fn move_down(&mut self) {
+        if !self.rows.is_empty() && self.selected < self.rows.len() - 1 {
+            self.selected += 1;
+        }
+    }
+
+    pub fn selected_row(&self) -> Option<&PortRow> {
+        self.rows.get(self.selected)
+    }
+
+    // --- Link / Unlink ---
+
+    pub fn begin_link(&mut self) {
+        let row = match self.selected_row().cloned() {
+            Some(r) => r,
+            None => return,
+        };
+
+        let tunnel_name = match self.resolve_tunnel_name_for_port(row.port) {
+            Some(name) => name,
+            None => {
+                if self.config.tunnels.is_empty() {
+                    self.status_msg = Some("No tunnels — press . to add one".into());
+                } else {
+                    self.status_msg = Some("Could not resolve tunnel".into());
+                }
+                return;
+            }
+        };
+
+        let old_hostname = row.url.clone();
+        let hostname = old_hostname.clone().unwrap_or_default();
+
+        self.mode = Mode::Linking {
+            port: row.port,
+            name: row.name.clone(),
+            hostname,
+            tunnel_name,
+            old_hostname,
+        };
+    }
+
+    pub fn finish_link(&mut self, port: u16, _name: String, new_hostname: String, tunnel_name: String, old_hostname: Option<String>) {
+        if new_hostname.is_empty() {
+            self.status_msg = Some("Hostname cannot be empty".into());
+            self.mode = Mode::Normal;
+            return;
+        }
+
+        // If hostname unchanged, nothing to do
+        if old_hostname.as_deref() == Some(&new_hostname) {
+            self.status_msg = Some("Unchanged".into());
+            self.mode = Mode::Normal;
+            return;
+        }
+
+        let tunnel = match self.config.tunnels.iter().find(|t| t.name == tunnel_name) {
+            Some(t) => t.clone(),
+            None => {
+                self.status_msg = Some("Tunnel not found".into());
+                self.mode = Mode::Normal;
+                return;
+            }
+        };
+
+        let payload = match config::decode_token(&tunnel.token) {
+            Ok(p) => p,
+            Err(_) => {
+                self.status_msg = Some("Could not decode tunnel token".into());
+                self.mode = Mode::Normal;
+                return;
+            }
+        };
+
+        // Auto-start tunnel if not running
+        if !matches!(launchd::status(&tunnel.name), launchd::Status::Running { .. }) {
+            let _ = launchd::start(&tunnel.name, &tunnel.token);
+        }
+
+        self.loading = Some("Linking...".into());
+        self.mode = Mode::Normal;
+        let tx = self.bg_tx.clone();
+        let api_tokens: Vec<String> = self.config.all_cf_api_tokens()
+            .into_iter().map(|s| s.to_string()).collect();
+        let account_id = payload.account_id;
+        let tunnel_id = payload.tunnel_id;
+        let service_url = format!("http://localhost:{}", port);
+
+        std::thread::spawn(move || {
+            let api_token = match api_tokens.iter().find(|t| {
+                cloudflare::verify_token(t, &account_id, &tunnel_id)
+            }) {
+                Some(t) => t.clone(),
+                None => {
+                    let _ = tx.send(BgResult::LinkComplete {
+                        status_msg: "No API token with access — press . to add one".into(),
+                    });
+                    return;
+                }
+            };
+
+            // Add new route
+            let add_result = cloudflare::add_route(&api_token, &account_id, &tunnel_id, &new_hostname, &service_url);
+            let add_ok = match &add_result {
+                Ok(cloudflare::RouteResult::Ok) | Ok(cloudflare::RouteResult::AlreadyExists) => true,
+                Ok(cloudflare::RouteResult::DnsFailure(_)) => true, // route added, DNS failed
+                Err(_) => false,
+            };
+
+            // If we're renaming (old hostname exists), remove old route
+            if add_ok {
+                if let Some(ref old) = old_hostname {
+                    let _ = cloudflare::remove_route(&api_token, &account_id, &tunnel_id, old);
+                }
+            }
+
+            let status_msg = match add_result {
+                Ok(cloudflare::RouteResult::Ok) => {
+                    if old_hostname.is_some() {
+                        format!("✓ :{} → {}", port, new_hostname)
+                    } else {
+                        format!("✓ :{} → {} (route + DNS)", port, new_hostname)
+                    }
+                }
+                Ok(cloudflare::RouteResult::AlreadyExists) => {
+                    format!("✓ :{} → {} (exists)", port, new_hostname)
+                }
+                Ok(cloudflare::RouteResult::DnsFailure(ref e)) => {
+                    format!("⚠ Route ok, DNS failed: {}", e)
+                }
+                Err(e) => {
+                    if e.contains("10000") || e.contains("Authentication") {
+                        format!("✗ API token needs Tunnel:Edit permission — {}", e)
+                    } else {
+                        format!("✗ {}", e)
+                    }
+                }
+            };
+            let _ = tx.send(BgResult::LinkComplete { status_msg });
+        });
+    }
+
+    pub fn handle_delete(&mut self) {
+        let row = match self.selected_row().cloned() {
+            Some(r) => r,
+            None => return,
+        };
+
+        if row.url.is_some() {
+            self.mode = Mode::ConfirmingUnlink {
+                port: row.port,
+                hostname: row.url.unwrap(),
+            };
+        } else {
+            if let Some(idx) = self.config.services.iter().position(|s| s.port == row.port) {
+                let svc = &self.config.services[idx];
+                self.mode = Mode::ConfirmingServiceDelete {
+                    idx,
                     name: svc.name.clone(),
                     port: svc.port,
-                    tunnel_name: None,
-                    tunnel_status,
-                    url,
-                    memo: svc.memo.clone().unwrap_or_default(),
-                    is_last: j == total - 1,
+                };
+            }
+        }
+    }
+
+    pub fn finish_unlink(&mut self, port: u16, hostname: String) {
+        let tunnel_id = self.ingress_routes.get(&port)
+            .and_then(|routes| routes.first())
+            .map(|r| r.tunnel_id.clone());
+
+        let tunnel_id = match tunnel_id {
+            Some(id) => id,
+            None => {
+                self.status_msg = Some("No route found".into());
+                self.mode = Mode::Normal;
+                return;
+            }
+        };
+
+        let tunnel = self.config.tunnels.iter().find(|t| {
+            config::decode_token(&t.token)
+                .map(|p| p.tunnel_id == tunnel_id)
+                .unwrap_or(false)
+        });
+
+        let tunnel = match tunnel {
+            Some(t) => t.clone(),
+            None => {
+                self.status_msg = Some("Tunnel not found for this route".into());
+                self.mode = Mode::Normal;
+                return;
+            }
+        };
+
+        let payload = match config::decode_token(&tunnel.token) {
+            Ok(p) => p,
+            Err(_) => {
+                self.status_msg = Some("Could not decode tunnel token".into());
+                self.mode = Mode::Normal;
+                return;
+            }
+        };
+
+        self.loading = Some("Unlinking...".into());
+        self.mode = Mode::Normal;
+        let tx = self.bg_tx.clone();
+        let api_tokens: Vec<String> = self.config.all_cf_api_tokens()
+            .into_iter().map(|s| s.to_string()).collect();
+        let account_id = payload.account_id;
+        let tunnel_id_owned = payload.tunnel_id;
+
+        std::thread::spawn(move || {
+            let api_token = match api_tokens.iter().find(|t| {
+                cloudflare::verify_token(t, &account_id, &tunnel_id_owned)
+            }) {
+                Some(t) => t.clone(),
+                None => {
+                    let _ = tx.send(BgResult::UnlinkComplete {
+                        status_msg: "No API token with access — press . to add one".into(),
+                    });
+                    return;
+                }
+            };
+
+            let status_msg = match cloudflare::remove_route(&api_token, &account_id, &tunnel_id_owned, &hostname) {
+                Ok(cloudflare::RouteResult::Ok) => format!("✓ Unlinked {}", hostname),
+                Ok(cloudflare::RouteResult::DnsFailure(ref e)) => format!("⚠ Route removed, DNS failed: {}", e),
+                Ok(cloudflare::RouteResult::AlreadyExists) => unreachable!(),
+                Err(e) => format!("✗ {}", e),
+            };
+            let _ = tx.send(BgResult::UnlinkComplete { status_msg });
+        });
+    }
+
+    pub fn delete_service(&mut self, idx: usize) {
+        let name = self.config.services.get(idx).map(|s| s.name.clone());
+        match self.config.remove_service_by_idx(idx) {
+            Ok(()) => self.status_msg = Some(format!("Removed '{}'", name.unwrap_or_default())),
+            Err(e) => self.status_msg = Some(format!("Error: {}", e)),
+        }
+        self.rebuild_rows();
+    }
+
+    // --- Add port ---
+
+    pub fn begin_add_port(&mut self) {
+        self.mode = Mode::AddingPort {
+            field: AddPortField::Port,
+            port: String::new(),
+            name: String::new(),
+        };
+    }
+
+    pub fn finish_add_port(&mut self, port_str: String, name: String) {
+        let port: u16 = match port_str.parse() {
+            Ok(p) => p,
+            Err(_) => {
+                self.status_msg = Some("Invalid port number".into());
+                self.mode = Mode::Normal;
+                return;
+            }
+        };
+        let name = if name.is_empty() { format!("port-{}", port) } else { name };
+        let tunnel = self.config.tunnels.first().map(|t| t.name.clone());
+        match self.config.add_service(name.clone(), port, tunnel, None) {
+            Ok(()) => self.status_msg = Some(format!("Added :{}", port)),
+            Err(e) => self.status_msg = Some(format!("Error: {}", e)),
+        }
+        self.mode = Mode::Normal;
+        self.rebuild_rows();
+    }
+
+    // --- Logs ---
+
+    pub fn show_logs_for_port(&mut self) {
+        let row = match self.selected_row().cloned() {
+            Some(r) => r,
+            None => return,
+        };
+
+        let tunnel_name = row.tunnel_name.or_else(|| {
+            self.resolve_tunnel_name_for_port(row.port)
+        });
+
+        match tunnel_name {
+            Some(name) => {
+                let content = launchd::read_logs(&name, 40).unwrap_or_default();
+                self.mode = Mode::Logs { name, content };
+            }
+            None => {
+                self.status_msg = Some("No tunnel associated".into());
+            }
+        }
+    }
+
+    // --- Settings ---
+
+    pub fn open_settings(&mut self) {
+        let items = self.build_settings_items();
+        let selected = items.iter()
+            .position(|i| settings_item_selectable(&i.kind))
+            .unwrap_or(0);
+        self.mode = Mode::Settings { items, selected };
+    }
+
+    pub fn build_settings_items(&self) -> Vec<SettingsItem> {
+        use std::collections::BTreeMap;
+
+        // Group tunnels by account_id
+        let mut accounts: BTreeMap<String, Vec<&config::Tunnel>> = BTreeMap::new();
+        for tunnel in &self.config.tunnels {
+            let account_id = config::decode_token(&tunnel.token)
+                .map(|p| p.account_id)
+                .unwrap_or_else(|_| "unknown".into());
+            accounts.entry(account_id).or_default().push(tunnel);
+        }
+
+        // Determine which accounts have API tokens based on cached sync data.
+        // If an account has tunnel_info (from last sync), an API token worked for it.
+        // If it's in unreached, no token matched. No network calls needed.
+        let unreached_ids: HashSet<String> = self.unreached.iter()
+            .map(|u| u.account_id.clone())
+            .collect();
+
+        let api_tokens = self.config.all_cf_api_tokens();
+        let mut matched_api: HashMap<String, String> = HashMap::new();
+        for account_id in accounts.keys() {
+            if unreached_ids.contains(account_id) {
+                continue; // no token for this account
+            }
+            // Account was reached — find which token (just show the first configured one)
+            if let Some(tok) = api_tokens.first() {
+                matched_api.insert(account_id.clone(), tok.to_string());
+            }
+        }
+
+        let mut items = Vec::new();
+
+        for (account_id, tunnels) in &accounts {
+            // Account header — use short account_id or CF name if available
+            let account_label = if account_id.len() > 12 {
+                format!("{}…", &account_id[..12])
+            } else {
+                account_id.clone()
+            };
+            items.push(SettingsItem {
+                kind: SettingsItemKind::AccountHeader(account_id.clone()),
+                label: account_label,
+                detail: String::new(),
+            });
+
+            // API key row
+            let api_detail = if let Some(tok) = matched_api.get(account_id) {
+                let masked = if tok.len() > 4 {
+                    format!("••••{}", &tok[tok.len()-4..])
+                } else {
+                    "••••".into()
+                };
+                masked
+            } else {
+                "(none)".into()
+            };
+            items.push(SettingsItem {
+                kind: SettingsItemKind::ApiKey(account_id.clone()),
+                label: "api key".into(),
+                detail: api_detail,
+            });
+
+            // Tunnel rows
+            for tunnel in tunnels {
+                let status = launchd::status(&tunnel.name);
+                let status_str = match status {
+                    launchd::Status::Running { .. } => "running",
+                    launchd::Status::Stopped => "stopped",
+                    launchd::Status::Inactive => "inactive",
+                };
+                items.push(SettingsItem {
+                    kind: SettingsItemKind::Tunnel(tunnel.name.clone()),
+                    label: tunnel.name.clone(),
+                    detail: status_str.into(),
                 });
             }
+
+            // Spacer between accounts
+            items.push(SettingsItem {
+                kind: SettingsItemKind::Spacer,
+                label: String::new(),
+                detail: String::new(),
+            });
         }
 
-        // Adjust selection
-        if self.unified_rows.is_empty() {
-            self.selected = 0;
-        } else if self.selected >= self.unified_rows.len() {
-            self.selected = self.unified_rows.len() - 1;
-        }
-        // Skip separator if landed on one
-        self.skip_separator();
+        // Add account
+        items.push(SettingsItem {
+            kind: SettingsItemKind::AddAccount,
+            label: "+ add account".into(),
+            detail: String::new(),
+        });
+
+        // Spacer
+        items.push(SettingsItem {
+            kind: SettingsItemKind::Spacer,
+            label: String::new(),
+            detail: String::new(),
+        });
+
+        // Utility actions
+        items.push(SettingsItem { kind: SettingsItemKind::ActionScanPorts, label: "Scan ports".into(), detail: String::new() });
+        items.push(SettingsItem { kind: SettingsItemKind::ActionImportPlists, label: "Import plists".into(), detail: String::new() });
+        items.push(SettingsItem { kind: SettingsItemKind::ActionSyncCf, label: "Sync from Cloudflare".into(), detail: String::new() });
+
+        items
     }
 
-    /// Compute display status and URL for a service
-    fn resolve_service_display(&self, svc: &config::Service, parent_status: Option<&launchd::Status>) -> (String, String) {
-        let routes = self.ingress_routes.get(&svc.port);
-        if let Some(routes) = routes {
-            let best = routes.iter()
-                .find(|r| {
-                    self.tunnel_info.get(&r.tunnel_id)
-                        .map_or(false, |info| info.connection_count > 0)
-                })
-                .or(routes.first());
-            if let Some(route) = best {
-                let status = self.tunnel_info.get(&route.tunnel_id)
-                    .map(|info| if info.connection_count == 0 { "no edge" } else { "connected" })
-                    .unwrap_or("—")
-                    .to_string();
-                return (status, format!("{}://{}", route.scheme, route.hostname));
-            }
+    // --- Tunnel CRUD (from settings) ---
+
+    pub fn begin_add(&mut self) {
+        self.mode = Mode::Adding {
+            field: AddField::Name,
+            name: String::new(),
+            token: String::new(),
+        };
+    }
+
+    pub fn finish_add(&mut self, name: String, token: String) {
+        match self.config.add(name.clone(), token) {
+            Ok(()) => self.status_msg = Some(format!("Added tunnel '{}'", name)),
+            Err(e) => self.status_msg = Some(format!("Error: {}", e)),
         }
-        if let Some(name) = &svc.tunnel {
-            let st = parent_status.cloned().unwrap_or_else(|| launchd::status(name));
-            let status_str = match &st {
-                launchd::Status::Running { .. } => "running".to_string(),
-                launchd::Status::Stopped => "stopped".to_string(),
-                launchd::Status::Inactive => "inactive".to_string(),
-            };
-            (status_str, "—".to_string())
+        if self.return_to_settings {
+            self.return_to_settings = false;
+            self.open_settings();
         } else {
-            ("—".to_string(), "—".to_string())
+            self.mode = Mode::Normal;
         }
+        self.rebuild_rows();
     }
 
-    fn skip_separator(&mut self) {
-        if matches!(self.unified_rows.get(self.selected), Some(UnifiedRow::Separator)) {
-            // Try moving down first, then up
-            if self.selected + 1 < self.unified_rows.len() {
-                self.selected += 1;
-            } else if self.selected > 0 {
-                self.selected -= 1;
-            }
-        }
-    }
-
-    pub fn selected_row(&self) -> Option<&UnifiedRow> {
-        self.unified_rows.get(self.selected)
-    }
-
-    pub fn is_tunnel_selected(&self) -> bool {
-        matches!(self.selected_row(), Some(UnifiedRow::Tunnel { .. }))
-    }
-
-    pub fn is_service_selected(&self) -> bool {
-        matches!(self.selected_row(), Some(UnifiedRow::Service { .. }))
-    }
-
-    pub fn selected_tunnel(&self) -> Option<&Tunnel> {
-        match self.selected_row()? {
-            UnifiedRow::Tunnel { name, .. } => self.config.tunnels.iter().find(|t| &t.name == name),
-            _ => None,
-        }
-    }
-
-    pub fn selected_service_idx(&self) -> Option<usize> {
-        match self.selected_row()? {
-            UnifiedRow::Service { name, .. } => self.config.services.iter().position(|s| &s.name == name),
-            _ => None,
-        }
-    }
-
-    pub fn build_context_menu(&self) -> Option<Mode> {
-        match self.selected_row()? {
-            UnifiedRow::Tunnel { status, .. } => {
-                let mut items: Vec<(char, String, ContextAction)> = Vec::new();
-                match status {
-                    launchd::Status::Running { .. } => {
-                        items.push(('x', "Stop".into(), ContextAction::StopTunnel));
-                        items.push(('r', "Restart".into(), ContextAction::RestartTunnel));
-                    }
-                    _ => {
-                        items.push(('s', "Start".into(), ContextAction::StartTunnel));
+    pub fn finish_edit(&mut self, name: String, token: String) {
+        match self.config.update_token(&name, token) {
+            Ok(()) => {
+                self.status_msg = Some(format!("Updated '{}'", name));
+                if matches!(launchd::status(&name), launchd::Status::Running { .. }) {
+                    if let Some(t) = self.config.tunnels.iter().find(|t| t.name == name) {
+                        let _ = launchd::restart(&t.name, &t.token);
                     }
                 }
-                items.push(('m', "Manage routes".into(), ContextAction::ManageRoutes));
-                items.push(('l', "View logs".into(), ContextAction::ViewLogs));
-                items.push(('e', "Edit conn. token".into(), ContextAction::EditConnToken));
-                items.push(('n', "Rename".into(), ContextAction::RenameTunnel));
-                items.push(('d', "Delete".into(), ContextAction::DeleteTunnel));
-
-                Some(Mode::ContextMenu {
-                    items,
-                    selected: 0,
-                })
             }
-            UnifiedRow::Service { .. } => {
-                let items = vec![
-                    ('e', "Edit service".into(), ContextAction::EditService),
-                    ('n', "Rename URL".into(), ContextAction::RenameUrl),
-                    ('d', "Untrack".into(), ContextAction::UntrackService),
-                ];
-                Some(Mode::ContextMenu {
-                    items,
-                    selected: 0,
-                })
-            }
-            UnifiedRow::Separator => None,
+            Err(e) => self.status_msg = Some(format!("Error: {}", e)),
         }
+        if self.return_to_settings {
+            self.return_to_settings = false;
+            self.open_settings();
+        } else {
+            self.mode = Mode::Normal;
+        }
+        self.rebuild_rows();
     }
 
-    pub fn execute_context_action(&mut self, action: ContextAction) {
-        match action {
-            ContextAction::StartTunnel => { self.mode = Mode::Normal; self.start_selected(); }
-            ContextAction::StopTunnel => { self.mode = Mode::Normal; self.stop_selected(); }
-            ContextAction::RestartTunnel => { self.mode = Mode::Normal; self.restart_selected(); }
-            ContextAction::ManageRoutes => { self.mode = Mode::Normal; self.begin_routes(); }
-            ContextAction::ViewLogs => { self.mode = Mode::Normal; self.show_logs(); }
-            ContextAction::EditConnToken => { self.mode = Mode::Normal; self.begin_edit(); }
-            ContextAction::RenameTunnel => { self.mode = Mode::Normal; self.begin_rename(); }
-            ContextAction::DeleteTunnel => { self.mode = Mode::Normal; self.confirm_delete(); }
-            ContextAction::EditService => { self.mode = Mode::Normal; self.begin_edit_service(); }
-            ContextAction::RenameUrl => { self.mode = Mode::Normal; self.begin_rename_service_route(); }
-            ContextAction::UntrackService => { self.mode = Mode::Normal; self.confirm_delete_service(); }
+    pub fn delete_tunnel_by_name(&mut self, name: &str) {
+        let _ = launchd::stop(name);
+        match self.config.remove(name) {
+            Ok(()) => self.status_msg = Some(format!("Deleted '{}'", name)),
+            Err(e) => self.status_msg = Some(format!("Error: {}", e)),
         }
+        self.rebuild_rows();
     }
+
+    // --- API token ---
+
+    pub fn begin_add_api_token(&mut self) {
+        self.mode = Mode::AddingApiToken {
+            input: String::new(),
+        };
+    }
+
+    pub fn finish_add_api_token(&mut self, token: String) {
+        let matched_unreached: Option<&UnreachedAccount> = self.unreached.iter().find(|a| {
+            cloudflare::verify_token(&token, &a.account_id, &a.tunnel_id)
+        });
+
+        let description = if let Some(a) = matched_unreached {
+            a.tunnel_names.join(", ")
+        } else {
+            let matched_tunnel = self.config.tunnels.iter().find(|t| {
+                if let Ok(p) = config::decode_token(&t.token) {
+                    cloudflare::verify_token(&token, &p.account_id, &p.tunnel_id)
+                } else {
+                    false
+                }
+            });
+            if let Some(t) = matched_tunnel {
+                t.name.clone()
+            } else if let Some(zones) = cloudflare::verify_token_has_zones(&token) {
+                format!("DNS zones: {}", zones.join(", "))
+            } else {
+                self.status_msg = Some(
+                    "Token rejected — doesn't match any tunnel account or DNS zone".into(),
+                );
+                return;
+            }
+        };
+
+        match self.config.add_api_token(token) {
+            Ok(()) => self.status_msg = Some(format!("Token added for {}", description)),
+            Err(e) => self.status_msg = Some(format!("Error: {}", e)),
+        }
+
+        self.return_to_settings = false; // sync will rebuild everything
+        self.mode = Mode::Normal;
+        self.loading = Some("Syncing Cloudflare...".into());
+        self.spawn_cf_sync();
+    }
+
+    // --- CF sync ---
 
     pub fn refresh_cf(&mut self) {
         self.loading = Some("Syncing Cloudflare...".into());
@@ -473,248 +796,7 @@ impl App {
         });
     }
 
-    pub fn poll_bg(&mut self) {
-        while let Ok(result) = self.bg_rx.try_recv() {
-            self.loading = None;
-            match result {
-                BgResult::CfSync(sync) => {
-                    self.tunnel_info = sync.tunnel_info;
-                    self.ingress_routes = sync.ingress_routes;
-                    self.unreached = sync.unreached;
-                    self.status_msg = Some(sync.status);
-                    self.rebuild_unified_rows();
-                    if !self.unreached.is_empty() {
-                        self.begin_add_api_token();
-                    }
-                }
-                BgResult::Routes { tunnel_name, api_token, account_id, tunnel_id, routes, status_msg } => {
-                    if let Some(msg) = status_msg {
-                        self.status_msg = Some(msg);
-                    }
-                    self.mode = Mode::Routes {
-                        tunnel_name,
-                        api_token,
-                        account_id,
-                        tunnel_id,
-                        routes,
-                        selected: 0,
-                    };
-                }
-                BgResult::RouteRenamed { status_msg, tunnel_name, api_token, account_id, tunnel_id } => {
-                    self.status_msg = Some(status_msg);
-                    if self.bg_reopen_routes {
-                        self.bg_reopen_routes = false;
-                        self.loading = Some("Reloading routes...".into());
-                        self.spawn_reload_routes(tunnel_name, api_token, account_id, tunnel_id);
-                    } else {
-                        self.loading = Some("Syncing...".into());
-                        self.spawn_cf_sync();
-                    }
-                }
-                BgResult::RouteAdded { status_msg, tunnel_name, api_token, account_id, tunnel_id } => {
-                    self.status_msg = Some(status_msg);
-                    self.loading = Some("Reloading routes...".into());
-                    self.spawn_reload_routes(tunnel_name, api_token, account_id, tunnel_id);
-                }
-                BgResult::RouteDeleted { status_msg, tunnel_name, api_token, account_id, tunnel_id } => {
-                    self.status_msg = Some(status_msg);
-                    self.loading = Some("Reloading routes...".into());
-                    self.spawn_reload_routes(tunnel_name, api_token, account_id, tunnel_id);
-                }
-                BgResult::VerifyToken { tunnel_name, api_token, account_id, tunnel_id, hostname, service_url } => {
-                    let (subdomain, domain_suffix) = split_hostname(&hostname);
-                    self.mode = Mode::RenamingRoute {
-                        tunnel_name,
-                        api_token,
-                        account_id,
-                        tunnel_id,
-                        old_hostname: hostname,
-                        service: service_url,
-                        new_subdomain: subdomain,
-                        domain_suffix,
-                    };
-                }
-                BgResult::VerifyTokenFailed(msg) => {
-                    self.status_msg = Some(msg);
-                }
-            }
-        }
-    }
-
-    // --- Navigation ---
-
-    pub fn move_up(&mut self) {
-        if self.selected == 0 {
-            return;
-        }
-        self.selected -= 1;
-        // Skip separator
-        if matches!(self.unified_rows.get(self.selected), Some(UnifiedRow::Separator)) {
-            if self.selected > 0 {
-                self.selected -= 1;
-            } else {
-                self.selected += 1;
-            }
-        }
-    }
-
-    pub fn move_down(&mut self) {
-        if self.unified_rows.is_empty() || self.selected >= self.unified_rows.len() - 1 {
-            return;
-        }
-        self.selected += 1;
-        // Skip separator
-        if matches!(self.unified_rows.get(self.selected), Some(UnifiedRow::Separator)) {
-            if self.selected + 1 < self.unified_rows.len() {
-                self.selected += 1;
-            } else {
-                self.selected -= 1;
-            }
-        }
-    }
-
-    pub fn toggle_expand(&mut self) {
-        if let Some(UnifiedRow::Tunnel { name, .. }) = self.selected_row() {
-            let name = name.clone();
-            if self.collapsed.contains(&name) {
-                self.collapsed.remove(&name);
-            } else {
-                self.collapsed.insert(name);
-            }
-            self.rebuild_unified_rows();
-        }
-    }
-
-    // --- Tunnel actions ---
-
-    pub fn start_selected(&mut self) {
-        if let Some(t) = self.selected_tunnel().cloned() {
-            match launchd::start(&t.name, &t.token) {
-                Ok(()) => self.status_msg = Some(format!("Started '{}'", t.name)),
-                Err(e) => self.status_msg = Some(format!("Error: {}", e)),
-            }
-            self.rebuild_unified_rows();
-        }
-    }
-
-    pub fn stop_selected(&mut self) {
-        if let Some(t) = self.selected_tunnel().cloned() {
-            match launchd::stop(&t.name) {
-                Ok(()) => self.status_msg = Some(format!("Stopped '{}'", t.name)),
-                Err(e) => self.status_msg = Some(format!("Error: {}", e)),
-            }
-            self.rebuild_unified_rows();
-        }
-    }
-
-    pub fn restart_selected(&mut self) {
-        if let Some(t) = self.selected_tunnel().cloned() {
-            match launchd::restart(&t.name, &t.token) {
-                Ok(()) => self.status_msg = Some(format!("Restarted '{}'", t.name)),
-                Err(e) => self.status_msg = Some(format!("Error: {}", e)),
-            }
-            self.rebuild_unified_rows();
-        }
-    }
-
-    pub fn delete_tunnel_by_name(&mut self, name: &str) {
-        let _ = launchd::stop(name);
-        match self.config.remove(name) {
-            Ok(()) => self.status_msg = Some(format!("Deleted '{}'", name)),
-            Err(e) => self.status_msg = Some(format!("Error: {}", e)),
-        }
-        self.rebuild_unified_rows();
-    }
-
-    pub fn show_logs(&mut self) {
-        if let Some(t) = self.selected_tunnel().cloned() {
-            let content = launchd::read_logs(&t.name, 40).unwrap_or_default();
-            self.mode = Mode::Logs {
-                name: t.name,
-                content,
-            };
-        }
-    }
-
-    pub fn begin_add(&mut self) {
-        self.mode = Mode::Adding {
-            field: AddField::Name,
-            name: String::new(),
-            token: String::new(),
-        };
-    }
-
-    pub fn begin_rename(&mut self) {
-        if let Some(t) = self.selected_tunnel().cloned() {
-            self.mode = Mode::Renaming {
-                old_name: t.name.clone(),
-                new_name: t.name,
-            };
-        }
-    }
-
-    pub fn finish_rename(&mut self, old_name: String, new_name: String) {
-        let was_running = matches!(launchd::status(&old_name), launchd::Status::Running { .. });
-        if was_running {
-            let _ = launchd::stop(&old_name);
-        }
-        match self.config.rename(&old_name, new_name.clone()) {
-            Ok(()) => {
-                self.status_msg = Some(format!("Renamed '{}' -> '{}'", old_name, new_name));
-                if was_running {
-                    if let Some(t) = self.config.tunnels.iter().find(|t| t.name == new_name) {
-                        let _ = launchd::start(&t.name, &t.token);
-                    }
-                }
-            }
-            Err(e) => self.status_msg = Some(format!("Error: {}", e)),
-        }
-        self.mode = Mode::Normal;
-        self.rebuild_unified_rows();
-    }
-
-    pub fn begin_edit(&mut self) {
-        if let Some(t) = self.selected_tunnel().cloned() {
-            self.mode = Mode::Editing {
-                name: t.name,
-                token: String::new(),
-            };
-        }
-    }
-
-    pub fn confirm_delete(&mut self) {
-        if let Some(t) = self.selected_tunnel() {
-            self.mode = Mode::Confirming {
-                action: "delete".into(),
-                target: t.name.clone(),
-            };
-        }
-    }
-
-    pub fn finish_add(&mut self, name: String, token: String) {
-        match self.config.add(name.clone(), token) {
-            Ok(()) => self.status_msg = Some(format!("Added '{}'", name)),
-            Err(e) => self.status_msg = Some(format!("Error: {}", e)),
-        }
-        self.mode = Mode::Normal;
-        self.rebuild_unified_rows();
-    }
-
-    pub fn finish_edit(&mut self, name: String, token: String) {
-        match self.config.update_token(&name, token) {
-            Ok(()) => {
-                self.status_msg = Some(format!("Updated '{}'", name));
-                if matches!(launchd::status(&name), launchd::Status::Running { .. }) {
-                    if let Some(t) = self.config.tunnels.iter().find(|t| t.name == name) {
-                        let _ = launchd::restart(&t.name, &t.token);
-                    }
-                }
-            }
-            Err(e) => self.status_msg = Some(format!("Error: {}", e)),
-        }
-        self.mode = Mode::Normal;
-        self.rebuild_unified_rows();
-    }
+    // --- Import / Migrate ---
 
     pub fn import_existing(&mut self) {
         let found = launchd::discover_existing();
@@ -740,118 +822,10 @@ impl App {
                 count, daemon_plists.len()
             ));
             self.mode = Mode::Migrating { daemon_plists };
-            self.rebuild_unified_rows();
+            self.rebuild_rows();
             return;
         }
-        self.rebuild_unified_rows();
-    }
-
-    // --- Service actions ---
-
-    pub fn begin_add_service(&mut self) {
-        self.mode = Mode::AddingService {
-            field: ServiceField::Name,
-            name: String::new(),
-            port: String::new(),
-            tunnel: String::new(),
-            memo: String::new(),
-        };
-    }
-
-    pub fn finish_add_service(&mut self, name: String, port: String, tunnel: String, memo: String) {
-        let port: u16 = match port.parse() {
-            Ok(p) => p,
-            Err(_) => {
-                self.status_msg = Some("Invalid port number".into());
-                self.mode = Mode::Normal;
-                return;
-            }
-        };
-        let tunnel = if tunnel.is_empty() { None } else { Some(tunnel) };
-        let memo = if memo.is_empty() { None } else { Some(memo) };
-        match self.config.add_service(name.clone(), port, tunnel, memo) {
-            Ok(()) => self.status_msg = Some(format!("Added service '{}'", name)),
-            Err(e) => self.status_msg = Some(format!("Error: {}", e)),
-        }
-        self.mode = Mode::Normal;
-        self.rebuild_unified_rows();
-    }
-
-    pub fn begin_edit_service(&mut self) {
-        if let Some(idx) = self.selected_service_idx() {
-            if let Some(s) = self.config.services.get(idx) {
-                self.mode = Mode::EditingService {
-                    idx,
-                    field: ServiceField::Name,
-                    name: s.name.clone(),
-                    port: s.port.to_string(),
-                    tunnel: s.tunnel.clone().unwrap_or_default(),
-                    memo: s.memo.clone().unwrap_or_default(),
-                };
-            }
-        }
-    }
-
-    pub fn finish_edit_service(&mut self, idx: usize, name: String, port: String, tunnel: String, memo: String) {
-        let port: u16 = match port.parse() {
-            Ok(p) => p,
-            Err(_) => {
-                self.status_msg = Some("Invalid port number".into());
-                self.mode = Mode::Normal;
-                return;
-            }
-        };
-        let tunnel = if tunnel.is_empty() { None } else { Some(tunnel) };
-        let memo = if memo.is_empty() { None } else { Some(memo) };
-        match self.config.update_service(idx, name.clone(), port, tunnel, memo) {
-            Ok(()) => self.status_msg = Some(format!("Updated service '{}'", name)),
-            Err(e) => self.status_msg = Some(format!("Error: {}", e)),
-        }
-        self.mode = Mode::Normal;
-        self.rebuild_unified_rows();
-    }
-
-    pub fn scan_services(&mut self) {
-        let found = scan::scan_services();
-        let mut count = 0;
-
-        for s in &found {
-            if self.config.services.iter().any(|existing| existing.port == s.port) {
-                continue;
-            }
-
-            let tunnel = self.config.tunnels.iter()
-                .find(|t| t.name.contains(&s.name) || s.name.contains(&t.name))
-                .map(|t| t.name.clone());
-
-            if self.config.add_service(s.name.clone(), s.port, tunnel, None).is_ok() {
-                count += 1;
-            }
-        }
-
-        self.status_msg = Some(format!("Scanned — found {} new service(s)", count));
-        self.rebuild_unified_rows();
-    }
-
-    pub fn confirm_delete_service(&mut self) {
-        if let Some(idx) = self.selected_service_idx() {
-            if let Some(s) = self.config.services.get(idx) {
-                self.mode = Mode::ConfirmingServiceDelete {
-                    idx,
-                    name: s.name.clone(),
-                    port: s.port,
-                };
-            }
-        }
-    }
-
-    pub fn delete_service(&mut self, idx: usize) {
-        let name = self.config.services.get(idx).map(|s| s.name.clone());
-        match self.config.remove_service_by_idx(idx) {
-            Ok(()) => self.status_msg = Some(format!("Untracked '{}'", name.unwrap_or_default())),
-            Err(e) => self.status_msg = Some(format!("Error: {}", e)),
-        }
-        self.rebuild_unified_rows();
+        self.rebuild_rows();
     }
 
     pub fn do_migrate(&mut self, plists: Vec<std::path::PathBuf>) {
@@ -877,7 +851,61 @@ impl App {
             self.status_msg = Some(format!("Migrated {} — errors: {}", migrated, errors.join(", ")));
         }
         self.mode = Mode::Normal;
-        self.rebuild_unified_rows();
+        self.rebuild_rows();
+    }
+
+    // --- Scan ---
+
+    pub fn scan_services(&mut self) {
+        let found = scan::scan_services();
+        let mut count = 0;
+
+        for s in &found {
+            if self.config.services.iter().any(|existing| existing.port == s.port) {
+                continue;
+            }
+
+            let tunnel = self.config.tunnels.iter()
+                .find(|t| t.name.contains(&s.name) || s.name.contains(&t.name))
+                .map(|t| t.name.clone());
+
+            if self.config.add_service(s.name.clone(), s.port, tunnel, None).is_ok() {
+                count += 1;
+            }
+        }
+
+        self.status_msg = Some(format!("Scanned — found {} new service(s)", count));
+        self.rebuild_rows();
+    }
+
+    // --- Internal helpers ---
+
+    fn resolve_tunnel_name_for_port(&self, port: u16) -> Option<String> {
+        // 1. Check service.tunnel field
+        let service = self.config.services.iter().find(|s| s.port == port);
+        if let Some(svc) = service {
+            if let Some(ref name) = svc.tunnel {
+                if self.config.tunnels.iter().any(|t| t.name == *name) {
+                    return Some(name.clone());
+                }
+            }
+        }
+
+        // 2. Check existing routes from sync data
+        if let Some(routes) = self.ingress_routes.get(&port) {
+            if let Some(route) = routes.first() {
+                if let Some(tunnel) = self.config.tunnels.iter().find(|t| {
+                    config::decode_token(&t.token)
+                        .map(|p| p.tunnel_id == route.tunnel_id)
+                        .unwrap_or(false)
+                }) {
+                    return Some(tunnel.name.clone());
+                }
+            }
+        }
+
+        // 3. First available tunnel
+        self.config.tunnels.first().map(|t| t.name.clone())
     }
 
     /// Look up the route info for a service by name.
@@ -904,407 +932,27 @@ impl App {
         Ok((tunnel.name.clone(), tunnel.token.clone(), route.hostname.clone(), service_url))
     }
 
-    /// Look up route info for the currently selected service
-    pub fn resolve_service_route(&self) -> Result<(String, String, String, String), String> {
-        match self.selected_row() {
-            Some(UnifiedRow::Service { name, .. }) => self.resolve_service_route_by_name(name),
-            _ => Err("No service selected".to_string()),
-        }
-    }
-
-    pub fn begin_rename_service_route(&mut self) {
-        let (tunnel_name, tunnel_token, hostname, service_url) = match self.resolve_service_route() {
-            Ok(v) => v,
-            Err(msg) => {
-                self.status_msg = Some(msg);
-                return;
-            }
-        };
-
-        let payload = match config::decode_token(&tunnel_token) {
-            Ok(p) => p,
-            Err(_) => {
-                self.status_msg = Some("Could not decode tunnel token".into());
-                return;
-            }
-        };
-
-        self.bg_reopen_routes = false; // route rename from service view → sync after
-        self.loading = Some("Verifying API token...".into());
-        let tx = self.bg_tx.clone();
-        let api_tokens: Vec<String> = self.config.all_cf_api_tokens()
-            .into_iter().map(|s| s.to_string()).collect();
-        let account_id = payload.account_id.clone();
-        let tunnel_id = payload.tunnel_id.clone();
-
-        std::thread::spawn(move || {
-            let api_token = api_tokens.iter().find(|t| {
-                cloudflare::verify_token(t, &account_id, &tunnel_id)
-            });
-            match api_token {
-                Some(t) => {
-                    let _ = tx.send(BgResult::VerifyToken {
-                        tunnel_name,
-                        api_token: t.to_string(),
-                        account_id,
-                        tunnel_id,
-                        hostname,
-                        service_url,
-                    });
-                }
-                None => {
-                    let _ = tx.send(BgResult::VerifyTokenFailed(
-                        "No API token with access — press t then a to add one".into()
-                    ));
-                }
-            }
-        });
-    }
-
-    // --- Route management methods ---
-
-    pub fn begin_routes(&mut self) {
-        let tunnel = match self.selected_tunnel().cloned() {
-            Some(t) => t,
-            None => return,
-        };
-
-        let payload = match config::decode_token(&tunnel.token) {
-            Ok(p) => p,
-            Err(_) => {
-                self.status_msg = Some("Could not decode tunnel token".into());
-                return;
-            }
-        };
-
-        self.loading = Some("Loading routes...".into());
-        let tx = self.bg_tx.clone();
-        let api_tokens: Vec<String> = self.config.all_cf_api_tokens()
-            .into_iter().map(|s| s.to_string()).collect();
-        let tunnel_name = tunnel.name.clone();
-        let account_id = payload.account_id.clone();
-        let tunnel_id = payload.tunnel_id.clone();
-
-        std::thread::spawn(move || {
-            let api_token = match api_tokens.iter().find(|t| {
-                cloudflare::verify_token(t, &account_id, &tunnel_id)
-            }) {
-                Some(t) => t.to_string(),
-                None => {
-                    let _ = tx.send(BgResult::VerifyTokenFailed(
-                        "No API token with access — press t then a to add one".into()
-                    ));
-                    return;
-                }
-            };
-
-            let cf_routes = cloudflare::list_routes(&api_token, &account_id, &tunnel_id);
-            let mut fixed = 0;
-            let mut fix_failed = 0;
-            let routes: Vec<RouteRow> = cf_routes.iter()
-                .map(|r| {
-                    let hostname = r.hostname.clone().unwrap_or_else(|| "(catch-all)".into());
-                    let dns = if r.hostname.is_none() {
-                        DnsStatus::Ok
-                    } else {
-                        match cloudflare::check_dns(&api_token, &hostname) {
-                            Ok(true) => DnsStatus::Ok,
-                            Ok(false) => {
-                                match cloudflare::ensure_dns(&api_token, &hostname, &tunnel_id) {
-                                    Ok(cloudflare::RouteResult::Ok) => {
-                                        fixed += 1;
-                                        DnsStatus::Ok
-                                    }
-                                    _ => {
-                                        fix_failed += 1;
-                                        DnsStatus::Missing
-                                    }
-                                }
-                            }
-                            Err(_) => DnsStatus::Unknown,
-                        }
-                    };
-                    RouteRow { hostname, service: r.service.clone(), dns }
-                })
-                .collect();
-
-            let status_msg = if fixed > 0 && fix_failed == 0 {
-                Some(format!("✓ Fixed DNS for {} route(s)", fixed))
-            } else if fixed > 0 {
-                Some(format!("✓ Fixed {} route(s), ⚠ {} still need DNS (token needs Zone>DNS>Edit)", fixed, fix_failed))
-            } else if fix_failed > 0 {
-                Some(format!("⚠ {} route(s) missing DNS — token needs Zone>Zone>Read + Zone>DNS>Edit", fix_failed))
-            } else {
-                None
-            };
-
-            let _ = tx.send(BgResult::Routes {
-                tunnel_name, api_token, account_id, tunnel_id, routes, status_msg,
-            });
-        });
-    }
-
-    pub fn begin_add_route(&mut self) {
-        let Mode::Routes { tunnel_name, api_token, account_id, tunnel_id, .. } = &self.mode else {
-            return;
-        };
-        self.mode = Mode::AddingRoute {
-            tunnel_name: tunnel_name.clone(),
-            api_token: api_token.clone(),
-            account_id: account_id.clone(),
-            tunnel_id: tunnel_id.clone(),
-            field: RouteField::Hostname,
-            hostname: String::new(),
-            service: "http://localhost:".into(),
-        };
-    }
-
-    pub fn begin_rename_route(&mut self) {
-        let Mode::Routes { tunnel_name, api_token, account_id, tunnel_id, routes, selected } = &self.mode else {
-            return;
-        };
-        if let Some(route) = routes.get(*selected) {
-            if route.hostname == "(catch-all)" {
-                self.status_msg = Some("Cannot rename catch-all route".into());
-                return;
-            }
-            let (subdomain, domain_suffix) = split_hostname(&route.hostname);
-            self.bg_reopen_routes = true; // route rename from routes dialog → reopen routes
-            self.mode = Mode::RenamingRoute {
-                tunnel_name: tunnel_name.clone(),
-                api_token: api_token.clone(),
-                account_id: account_id.clone(),
-                tunnel_id: tunnel_id.clone(),
-                old_hostname: route.hostname.clone(),
-                service: route.service.clone(),
-                new_subdomain: subdomain,
-                domain_suffix,
-            };
-        }
-    }
-
-    pub fn finish_rename_route(&mut self, tunnel_name: String, api_token: String, account_id: String, tunnel_id: String, old_hostname: String, service: String, new_hostname: String) {
-        if old_hostname == new_hostname {
-            self.status_msg = Some("Name unchanged".into());
-            self.mode = Mode::Normal;
-            return;
-        }
-
-        self.loading = Some("Renaming route...".into());
-        self.mode = Mode::Normal;
-        let tx = self.bg_tx.clone();
-
-        std::thread::spawn(move || {
-            // Add new route first
-            match cloudflare::add_route(&api_token, &account_id, &tunnel_id, &new_hostname, &service) {
-                Ok(cloudflare::RouteResult::Ok | cloudflare::RouteResult::AlreadyExists) => {}
-                Ok(cloudflare::RouteResult::DnsFailure(ref e)) => {
-                    let _ = tx.send(BgResult::RouteRenamed {
-                        status_msg: format!("⚠ New route ok, DNS failed: {} — re-run m to fix", e),
-                        tunnel_name, api_token, account_id, tunnel_id,
-                    });
-                    return;
-                }
-                Err(e) => {
-                    let msg = if e.contains("10000") || e.contains("Authentication") {
-                        format!("✗ API token needs Cloudflare Tunnel:Edit permission — {}", e)
-                    } else {
-                        format!("✗ Failed to create {}: {}", new_hostname, e)
-                    };
-                    let _ = tx.send(BgResult::RouteRenamed {
-                        status_msg: msg,
-                        tunnel_name, api_token, account_id, tunnel_id,
-                    });
-                    return;
-                }
-            }
-
-            // Remove old route
-            let status_msg = match cloudflare::remove_route(&api_token, &account_id, &tunnel_id, &old_hostname) {
-                Ok(cloudflare::RouteResult::Ok) => {
-                    format!("✓ Renamed {} → {}", old_hostname, new_hostname)
-                }
-                Ok(cloudflare::RouteResult::DnsFailure(ref e)) => {
-                    format!("⚠ Renamed, old DNS cleanup failed: {}", e)
-                }
-                Ok(cloudflare::RouteResult::AlreadyExists) => unreachable!(),
-                Err(e) => {
-                    format!("⚠ New route ok, old removal failed: {}", e)
-                }
-            };
-
-            let _ = tx.send(BgResult::RouteRenamed {
-                status_msg, tunnel_name, api_token, account_id, tunnel_id,
-            });
-        });
-    }
-
-    pub fn confirm_delete_route(&mut self) {
-        let Mode::Routes { tunnel_name, api_token, account_id, tunnel_id, routes, selected } = &self.mode else {
-            return;
-        };
-        if let Some(route) = routes.get(*selected) {
-            if route.hostname == "(catch-all)" {
-                self.status_msg = Some("Cannot delete catch-all route".into());
-                return;
-            }
-            self.mode = Mode::ConfirmingRouteDelete {
-                tunnel_name: tunnel_name.clone(),
-                api_token: api_token.clone(),
-                account_id: account_id.clone(),
-                tunnel_id: tunnel_id.clone(),
-                hostname: route.hostname.clone(),
-            };
-        }
-    }
-
-    pub fn finish_add_route(&mut self, tunnel_name: String, api_token: String, account_id: String, tunnel_id: String, hostname: String, service: String) {
-        let service = if service.parse::<u16>().is_ok() {
-            format!("http://localhost:{}", service)
-        } else {
-            service
-        };
-
-        self.loading = Some("Adding route...".into());
-        self.mode = Mode::Normal;
-        let tx = self.bg_tx.clone();
-
-        std::thread::spawn(move || {
-            let status_msg = match cloudflare::add_route(&api_token, &account_id, &tunnel_id, &hostname, &service) {
-                Ok(cloudflare::RouteResult::Ok) => {
-                    format!("✓ {} → {} (route + DNS)", hostname, service)
-                }
-                Ok(cloudflare::RouteResult::AlreadyExists) => {
-                    format!("✓ {} — route exists, DNS ok", hostname)
-                }
-                Ok(cloudflare::RouteResult::DnsFailure(ref e)) => {
-                    format!("⚠ Route ok, DNS failed: {} — re-run or add CNAME: {} → {}.cfargotunnel.com", e, hostname, tunnel_id)
-                }
-                Err(e) => {
-                    format!("✗ {}", e)
-                }
-            };
-            let _ = tx.send(BgResult::RouteAdded {
-                status_msg, tunnel_name, api_token, account_id, tunnel_id,
-            });
-        });
-    }
-
-    pub fn finish_delete_route(&mut self, tunnel_name: String, api_token: String, account_id: String, tunnel_id: String, hostname: String) {
-        self.loading = Some("Removing route...".into());
-        self.mode = Mode::Normal;
-        let tx = self.bg_tx.clone();
-
-        std::thread::spawn(move || {
-            let status_msg = match cloudflare::remove_route(&api_token, &account_id, &tunnel_id, &hostname) {
-                Ok(cloudflare::RouteResult::Ok) => {
-                    format!("✓ Removed {} (route + DNS)", hostname)
-                }
-                Ok(cloudflare::RouteResult::DnsFailure(ref e)) => {
-                    format!("⚠ Route removed, DNS cleanup failed: {} — manually delete CNAME for {}", e, hostname)
-                }
-                Ok(cloudflare::RouteResult::AlreadyExists) => unreachable!(),
-                Err(e) => {
-                    format!("✗ {}", e)
-                }
-            };
-            let _ = tx.send(BgResult::RouteDeleted {
-                status_msg, tunnel_name, api_token, account_id, tunnel_id,
-            });
-        });
-    }
-
-    fn spawn_reload_routes(&self, tunnel_name: String, api_token: String, account_id: String, tunnel_id: String) {
-        let tx = self.bg_tx.clone();
-
-        std::thread::spawn(move || {
-            let cf_routes = cloudflare::list_routes(&api_token, &account_id, &tunnel_id);
-            let routes: Vec<RouteRow> = cf_routes.iter()
-                .map(|r| {
-                    let hostname = r.hostname.clone().unwrap_or_else(|| "(catch-all)".into());
-                    let dns = if r.hostname.is_none() {
-                        DnsStatus::Ok
-                    } else {
-                        match cloudflare::check_dns(&api_token, &hostname) {
-                            Ok(true) => DnsStatus::Ok,
-                            Ok(false) => {
-                                match cloudflare::ensure_dns(&api_token, &hostname, &tunnel_id) {
-                                    Ok(cloudflare::RouteResult::Ok) => DnsStatus::Ok,
-                                    _ => DnsStatus::Missing,
-                                }
-                            }
-                            Err(_) => DnsStatus::Unknown,
-                        }
-                    };
-                    RouteRow { hostname, service: r.service.clone(), dns }
-                })
-                .collect();
-
-            let _ = tx.send(BgResult::Routes {
-                tunnel_name, api_token, account_id, tunnel_id, routes, status_msg: None,
-            });
-        });
-    }
-
-    // --- CF API Token methods ---
-
-    pub fn begin_add_api_token(&mut self) {
-        self.mode = Mode::AddingApiToken {
-            input: String::new(),
-        };
-    }
-
-    pub fn finish_add_api_token(&mut self, token: String) {
-        let matched: Option<&UnreachedAccount> = self.unreached.iter().find(|a| {
-            cloudflare::verify_token(&token, &a.account_id, &a.tunnel_id)
-        });
-
-        let description = if let Some(a) = matched {
-            a.tunnel_names.join(", ")
-        } else if let Some(zones) = cloudflare::verify_token_has_zones(&token) {
-            format!("DNS zones: {}", zones.join(", "))
-        } else {
-            self.status_msg = Some(
-                "Token rejected — doesn't match any tunnel account or DNS zone".into(),
-            );
-            return;
-        };
-
-        match self.config.add_api_token(token) {
-            Ok(()) => {
-                self.status_msg = Some(format!("Token added for {}", description));
-            }
-            Err(e) => {
-                self.status_msg = Some(format!("Error: {}", e));
-            }
-        }
-
-        self.mode = Mode::Normal;
-        self.loading = Some("Syncing Cloudflare...".into());
-        self.spawn_cf_sync();
-    }
-
     #[cfg(test)]
     pub fn test_app(config: config::Config, ingress_routes: HashMap<u16, Vec<IngressRoute>>) -> Self {
         let (tx, rx) = mpsc::channel();
         let mut app = Self {
             config,
-            unified_rows: Vec::new(),
+            rows: Vec::new(),
             tunnel_info: HashMap::new(),
             ingress_routes,
             unreached: Vec::new(),
             selected: 0,
-            collapsed: HashSet::new(),
             mode: Mode::Normal,
             status_msg: None,
             should_quit: false,
             loading: None,
             spinner_tick: 0,
-            bg_reopen_routes: false,
+            last_sync: None,
+            return_to_settings: false,
             bg_tx: tx,
             bg_rx: rx,
         };
-        app.rebuild_unified_rows();
+        app.rebuild_rows();
         app
     }
 }
@@ -1411,7 +1059,6 @@ mod tests {
             tunnel: None,
             memo: None,
         }];
-        // No tunnels configured
         let mut ingress = HashMap::new();
         ingress.insert(3001, vec![IngressRoute {
             hostname: "katulong-mini.felixflor.es".into(),
@@ -1492,7 +1139,6 @@ mod tests {
         }]);
 
         let app = make_app(services, tunnels, ingress);
-        // Use by-name variant to directly test the correct service
         let result = app.resolve_service_route_by_name("katulong");
         assert!(result.is_ok());
         let (_, _, hostname, _) = result.unwrap();
@@ -1500,86 +1146,24 @@ mod tests {
     }
 
     #[test]
-    fn begin_rename_service_route_sets_error_when_no_route() {
-        let services = vec![Service {
-            name: "postgres".into(),
-            port: 5432,
-            machine: String::new(),
-            tunnel: None,
-            memo: Some("levee db".into()),
-        }];
-        let mut app = make_app(services, Vec::new(), HashMap::new());
-        // Select the postgres service in unified rows (it'll be unlinked: Separator at 0, service at 1)
-        app.selected = match app.unified_rows.iter().position(|r| matches!(r, UnifiedRow::Service { name, .. } if name == "postgres")) {
-            Some(idx) => idx,
-            None => { panic!("postgres not found in unified rows"); }
-        };
-        app.begin_rename_service_route();
-        assert_eq!(app.mode, Mode::Normal);
-        assert_eq!(app.status_msg, Some("No route found for this service".into()));
+    fn rebuild_rows_sorts_by_port() {
+        let services = vec![
+            Service { name: "b".into(), port: 8080, machine: String::new(), tunnel: None, memo: None },
+            Service { name: "a".into(), port: 3000, machine: String::new(), tunnel: None, memo: None },
+        ];
+        let app = make_app(services, Vec::new(), HashMap::new());
+        assert_eq!(app.rows.len(), 2);
+        assert_eq!(app.rows[0].port, 3000);
+        assert_eq!(app.rows[1].port, 8080);
     }
 
     #[test]
-    fn begin_rename_service_route_sets_error_when_no_tunnel() {
-        let services = vec![Service {
-            name: "katulong".into(),
-            port: 3001,
-            machine: String::new(),
-            tunnel: None,
-            memo: None,
-        }];
-        let mut ingress = HashMap::new();
-        ingress.insert(3001, vec![IngressRoute {
-            hostname: "katulong-mini.felixflor.es".into(),
-            tunnel_name: "my-tunnel".into(),
-            tunnel_id: "tun456".into(),
-            scheme: "https".into(),
-        }]);
-
-        let mut app = make_app(services, Vec::new(), ingress);
-        // Select katulong service
-        app.selected = match app.unified_rows.iter().position(|r| matches!(r, UnifiedRow::Service { name, .. } if name == "katulong")) {
-            Some(idx) => idx,
-            None => { panic!("katulong not found in unified rows"); }
-        };
-        app.begin_rename_service_route();
-        assert_eq!(app.mode, Mode::Normal);
-        assert_eq!(app.status_msg, Some("Tunnel not found for this route".into()));
-    }
-
-    #[test]
-    fn begin_rename_service_route_sets_error_when_no_api_token() {
-        let services = vec![Service {
-            name: "katulong".into(),
-            port: 3001,
-            machine: String::new(),
-            tunnel: None,
-            memo: None,
-        }];
-        let tunnels = vec![Tunnel {
-            name: "my-tunnel".into(),
-            token: TEST_TOKEN.into(),
-            api_token: None,
-        }];
-        let mut ingress = HashMap::new();
-        ingress.insert(3001, vec![IngressRoute {
-            hostname: "katulong-mini.felixflor.es".into(),
-            tunnel_name: "my-tunnel".into(),
-            tunnel_id: "tun456".into(),
-            scheme: "https".into(),
-        }]);
-
-        let mut app = make_app(services, tunnels, ingress);
-        // Select katulong service (tunnel at 0, katulong at 1)
-        app.selected = match app.unified_rows.iter().position(|r| matches!(r, UnifiedRow::Service { name, .. } if name == "katulong")) {
-            Some(idx) => idx,
-            None => { panic!("katulong not found in unified rows"); }
-        };
-        app.begin_rename_service_route();
-        assert!(app.loading.is_some());
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        app.poll_bg();
-        assert_eq!(app.mode, Mode::Normal);
-        assert_eq!(app.status_msg, Some("No API token with access — press t then a to add one".into()));
+    fn rebuild_rows_health_active_when_no_routes() {
+        let services = vec![
+            Service { name: "test".into(), port: 3000, machine: String::new(), tunnel: None, memo: None },
+        ];
+        let app = make_app(services, Vec::new(), HashMap::new());
+        assert_eq!(app.rows[0].health, Health::Active);
+        assert!(app.rows[0].url.is_none());
     }
 }

@@ -1,6 +1,6 @@
 # tunnels
 
-A k9s-style TUI for managing cloudflared tunnels and local services on macOS.
+A TUI for managing cloudflared tunnels and local services on macOS. Maps local ports to public URLs.
 
 ## Architecture
 
@@ -8,9 +8,9 @@ A k9s-style TUI for managing cloudflared tunnels and local services on macOS.
 - **launchd.rs** — LaunchAgent plist generation, start/stop/status via `launchctl`, plist discovery/migration
 - **cloudflare.rs** — CF API integration via API tokens (multi-account + per-tunnel), tunnel details + ingress route fetch, route add/remove with DNS management, auto-match tokens to accounts
 - **scan.rs** — Service discovery via `lsof`: find listening TCP ports, resolve project names from process cwd
-- **app.rs** — App state, unified tree view model (UnifiedRow), mode machine with prefix keys + context menu, CF + scan integration
-- **ui.rs** — ratatui rendering: tree table (tunnels with nested services), context menu overlay, prefix-aware keybinding bar, dialogs
-- **main.rs** — crossterm event loop, unified key handler with context-sensitive dispatch, prefix key handler, context menu handler, full CLI subcommands
+- **app.rs** — App state, flat port list model (PortRow + Health), mode machine, link/unlink flows, settings modal, CF sync
+- **ui.rs** — ratatui rendering: flat port list, settings modal overlay, keybinding bar, dialogs
+- **main.rs** — crossterm event loop, 9-key normal mode handler, settings/link/unlink handlers, full CLI subcommands
 
 ## Build & Install
 
@@ -21,58 +21,30 @@ cp target/release/tunnels ~/.local/bin/
 
 Or via Homebrew: `brew install dorky-robot/tap/tunnels`
 
-## Tree View
+## TUI View
 
-Single unified view: tunnels as parent rows (▼/▶) with services nested underneath. Unlinked services appear under a separator.
+Flat list of services showing: PORT, NAME, URL (if linked), HEALTH GLYPH. Primary action is `Enter` to link a port to a URL. Tunnels are infrastructure managed via `.` settings modal.
 
-## Key Bindings
+### Health Glyphs
+- `✓` — Linked, tunnel running, edge connected
+- `✗` — Linked but unhealthy
+- `●` — Not linked
 
-### Normal mode (context-sensitive)
-| Key | On Tunnel | On Service |
-|-----|-----------|------------|
-| j/k | Navigate | Navigate |
-| Enter | Context menu | Context menu |
-| Space/←/→ | Toggle expand/collapse | (no-op) |
-| s | Start tunnel | — |
-| x | Stop tunnel | — |
-| r | Restart tunnel | — |
-| e | Edit connector token | Edit service |
-| n | Rename tunnel | Rename URL |
-| d | Delete tunnel | Untrack service |
-| l | View logs | — |
-| m | Manage routes | — |
-| a | Prefix: add... | Prefix: add... |
-| t | Prefix: token... | Prefix: token... |
-| g | Prefix: global... | Prefix: global... |
-| ? | Help | Help |
-| q/Esc | Quit | Quit |
+## Key Bindings (9 keys)
 
-### Prefix keys
-**a → add...**
 | Key | Action |
 |-----|--------|
-| t | Add tunnel |
-| s | Add service |
-| r | Add route (tunnel selected) |
-| Esc | Cancel |
+| j/k | Navigate |
+| Enter | Link port to URL (or edit existing) |
+| d | Unlink (if linked) / Remove (if not) |
+| a | Add a service |
+| l | View tunnel logs |
+| . | Settings (tokens, tunnels, scan, import) |
+| ? | Help |
+| q | Quit |
 
-**t → token...**
-| Key | Action |
-|-----|--------|
-| c | Edit connector token |
-| a | Add CF API token |
-| Esc | Cancel |
-
-**g → global...**
-| Key | Action |
-|-----|--------|
-| s | Sync from Cloudflare |
-| p | Scan listening ports |
-| i | Import existing plists |
-| Esc | Cancel |
-
-### Context menu (Enter)
-Opens a floating menu with actions for the selected row. Navigate with j/k + Enter, or press the shortcut letter.
+### Settings modal (`.`)
+Navigable list with API tokens, tunnels, and actions (add token, add tunnel, scan ports, import plists, sync CF). Enter to select, d to remove, Esc to close.
 
 ## CLI Subcommands
 

@@ -6,7 +6,7 @@ mod scan;
 mod ui;
 
 use anyhow::Result;
-use app::{AddField, App, Mode, PrefixKey, RouteField, ServiceField};
+use app::{AddField, AddPortField, App, Mode, SettingsItemKind, settings_item_selectable};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -121,30 +121,18 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mu
                     continue;
                 }
 
-                if app.loading.is_some() {
-                    continue;
-                }
-
                 match &app.mode {
                     Mode::Normal => handle_normal(app, key.code),
-                    Mode::Prefix(prefix) => {
-                        let p = *prefix;
-                        handle_prefix(app, p, key.code);
-                    }
-                    Mode::ContextMenu { .. } => handle_context_menu(app, key.code),
+                    Mode::Linking { .. } => handle_linking(app, key.code),
+                    Mode::ConfirmingUnlink { .. } => handle_confirming_unlink(app, key.code),
+                    Mode::AddingPort { .. } => handle_adding_port(app, key.code),
+                    Mode::Settings { .. } => handle_settings(app, key.code),
                     Mode::Adding { .. } => handle_adding(app, key.code),
                     Mode::Editing { .. } => handle_editing(app, key.code),
-                    Mode::Renaming { .. } => handle_renaming(app, key.code),
-                    Mode::Confirming { .. } => handle_confirming(app, key.code),
-                    Mode::Migrating { .. } => handle_migrating(app, key.code),
-                    Mode::AddingService { .. } => handle_adding_service(app, key.code),
-                    Mode::EditingService { .. } => handle_editing_service(app, key.code),
-                    Mode::ConfirmingServiceDelete { .. } => handle_confirming_service_delete(app, key.code),
                     Mode::AddingApiToken { .. } => handle_adding_api_token(app, key.code),
-                    Mode::Routes { .. } => handle_routes(app, key.code),
-                    Mode::AddingRoute { .. } => handle_adding_route(app, key.code),
-                    Mode::RenamingRoute { .. } => handle_renaming_route(app, key.code),
-                    Mode::ConfirmingRouteDelete { .. } => handle_confirming_route_delete(app, key.code),
+                    Mode::Confirming { .. } => handle_confirming(app, key.code),
+                    Mode::ConfirmingServiceDelete { .. } => handle_confirming_service_delete(app, key.code),
+                    Mode::Migrating { .. } => handle_migrating(app, key.code),
                     Mode::Logs { .. } | Mode::Help => {
                         if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                             app.mode = Mode::Normal;
@@ -165,90 +153,95 @@ fn handle_normal(app: &mut App, code: KeyCode) {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
         KeyCode::Char('j') | KeyCode::Down => app.move_down(),
         KeyCode::Char('k') | KeyCode::Up => app.move_up(),
-        KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right => app.toggle_expand(),
-        KeyCode::Enter => {
-            if let Some(menu) = app.build_context_menu() {
-                app.mode = menu;
-            }
-        }
-        // Prefix keys
-        KeyCode::Char('a') => app.mode = Mode::Prefix(PrefixKey::Add),
-        KeyCode::Char('t') => app.mode = Mode::Prefix(PrefixKey::Token),
-        KeyCode::Char('g') => app.mode = Mode::Prefix(PrefixKey::Global),
-        // Context-sensitive direct keys
-        KeyCode::Char('s') if app.is_tunnel_selected() => app.start_selected(),
-        KeyCode::Char('x') if app.is_tunnel_selected() => app.stop_selected(),
-        KeyCode::Char('r') if app.is_tunnel_selected() => app.restart_selected(),
-        KeyCode::Char('e') => {
-            if app.is_tunnel_selected() {
-                app.begin_edit();
-            } else if app.is_service_selected() {
-                app.begin_edit_service();
-            }
-        }
-        KeyCode::Char('n') => {
-            if app.is_tunnel_selected() {
-                app.begin_rename();
-            } else if app.is_service_selected() {
-                app.begin_rename_service_route();
-            }
-        }
-        KeyCode::Char('d') => {
-            if app.is_tunnel_selected() {
-                app.confirm_delete();
-            } else if app.is_service_selected() {
-                app.confirm_delete_service();
-            }
-        }
-        KeyCode::Char('l') if app.is_tunnel_selected() => app.show_logs(),
-        KeyCode::Char('m') if app.is_tunnel_selected() => app.begin_routes(),
+        KeyCode::Enter => app.begin_link(),
+        KeyCode::Char('d') => app.handle_delete(),
+        KeyCode::Char('a') => app.begin_add_port(),
+        KeyCode::Char('l') => app.show_logs_for_port(),
+        KeyCode::Char('.') => app.open_settings(),
         KeyCode::Char('?') => app.mode = Mode::Help,
         _ => {}
     }
 }
 
-fn handle_prefix(app: &mut App, prefix: PrefixKey, code: KeyCode) {
+fn handle_linking(app: &mut App, code: KeyCode) {
+    let Mode::Linking { port, name, hostname, tunnel_name, old_hostname } = &mut app.mode else {
+        return;
+    };
+
     match code {
         KeyCode::Esc => app.mode = Mode::Normal,
-        _ => match prefix {
-            PrefixKey::Add => match code {
-                KeyCode::Char('t') => { app.mode = Mode::Normal; app.begin_add(); }
-                KeyCode::Char('s') => { app.mode = Mode::Normal; app.begin_add_service(); }
-                KeyCode::Char('r') => {
-                    if app.is_tunnel_selected() {
-                        app.mode = Mode::Normal;
-                        app.begin_routes();
-                    } else {
-                        app.mode = Mode::Normal;
-                        app.status_msg = Some("Select a tunnel first to add a route".into());
-                    }
-                }
-                _ => app.mode = Mode::Normal,
-            },
-            PrefixKey::Token => match code {
-                KeyCode::Char('c') => {
-                    app.mode = Mode::Normal;
-                    if app.is_tunnel_selected() {
-                        app.begin_edit();
-                    } else {
-                        app.status_msg = Some("Select a tunnel to edit its connector token".into());
-                    }
-                }
-                KeyCode::Char('a') => { app.mode = Mode::Normal; app.begin_add_api_token(); }
-                _ => app.mode = Mode::Normal,
-            },
-            PrefixKey::Global => match code {
-                KeyCode::Char('s') => { app.mode = Mode::Normal; app.refresh_cf(); }
-                KeyCode::Char('p') => { app.mode = Mode::Normal; app.scan_services(); }
-                KeyCode::Char('i') => { app.mode = Mode::Normal; app.import_existing(); }
-                _ => app.mode = Mode::Normal,
-            },
-        },
+        KeyCode::Enter => {
+            if !hostname.is_empty() {
+                let (p, n, h, tn, oh) = (
+                    *port, name.clone(), hostname.clone(),
+                    tunnel_name.clone(), old_hostname.clone(),
+                );
+                app.finish_link(p, n, h, tn, oh);
+            }
+        }
+        KeyCode::Backspace => { hostname.pop(); }
+        KeyCode::Char(c) => { hostname.push(c); }
+        _ => {}
     }
 }
 
-fn handle_context_menu(app: &mut App, code: KeyCode) {
-    let Mode::ContextMenu { items, selected } = &mut app.mode else {
+fn handle_confirming_unlink(app: &mut App, code: KeyCode) {
+    let Mode::ConfirmingUnlink { port, hostname } = &app.mode else {
+        return;
+    };
+    let (p, h) = (*port, hostname.clone());
+
+    match code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.finish_unlink(p, h);
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            app.mode = Mode::Normal;
+        }
+        _ => {}
+    }
+}
+
+fn handle_adding_port(app: &mut App, code: KeyCode) {
+    let Mode::AddingPort { field, port, name } = &mut app.mode else {
+        return;
+    };
+
+    match code {
+        KeyCode::Esc => app.mode = Mode::Normal,
+        KeyCode::Tab | KeyCode::BackTab => {
+            *field = match field {
+                AddPortField::Port => AddPortField::Name,
+                AddPortField::Name => AddPortField::Port,
+            };
+        }
+        KeyCode::Enter => {
+            if !port.is_empty() {
+                let (p, n) = (port.clone(), name.clone());
+                app.finish_add_port(p, n);
+            }
+        }
+        KeyCode::Backspace => {
+            let s = match field {
+                AddPortField::Port => port,
+                AddPortField::Name => name,
+            };
+            s.pop();
+        }
+        KeyCode::Char(c) => {
+            match field {
+                AddPortField::Port => {
+                    if c.is_ascii_digit() { port.push(c); }
+                }
+                AddPortField::Name => { name.push(c); }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_settings(app: &mut App, code: KeyCode) {
+    let Mode::Settings { items, selected } = &mut app.mode else {
         return;
     };
 
@@ -257,151 +250,114 @@ fn handle_context_menu(app: &mut App, code: KeyCode) {
             app.mode = Mode::Normal;
         }
         KeyCode::Char('j') | KeyCode::Down => {
-            if *selected < items.len() - 1 {
-                *selected += 1;
+            let mut next = *selected + 1;
+            while next < items.len() && !settings_item_selectable(&items[next].kind) {
+                next += 1;
+            }
+            if next < items.len() {
+                *selected = next;
             }
         }
         KeyCode::Char('k') | KeyCode::Up => {
             if *selected > 0 {
-                *selected -= 1;
-            }
-        }
-        KeyCode::Enter => {
-            let action = items[*selected].2.clone();
-            app.execute_context_action(action);
-        }
-        KeyCode::Char(c) => {
-            // Direct shortcut key
-            if let Some(item) = items.iter().find(|(key, _, _)| *key == c) {
-                let action = item.2.clone();
-                app.execute_context_action(action);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn handle_adding_service(app: &mut App, code: KeyCode) {
-    let Mode::AddingService { field, name, port, tunnel, memo } = &mut app.mode else {
-        return;
-    };
-
-    match code {
-        KeyCode::Esc => app.mode = Mode::Normal,
-        KeyCode::Tab => {
-            *field = match field {
-                ServiceField::Name => ServiceField::Port,
-                ServiceField::Port => ServiceField::Tunnel,
-                ServiceField::Tunnel => ServiceField::Memo,
-                ServiceField::Memo => ServiceField::Name,
-            };
-        }
-        KeyCode::BackTab => {
-            *field = match field {
-                ServiceField::Name => ServiceField::Memo,
-                ServiceField::Port => ServiceField::Name,
-                ServiceField::Tunnel => ServiceField::Port,
-                ServiceField::Memo => ServiceField::Tunnel,
-            };
-        }
-        KeyCode::Enter => {
-            if !name.is_empty() && !port.is_empty() {
-                let (n, p, t, m) = (name.clone(), port.clone(), tunnel.clone(), memo.clone());
-                app.finish_add_service(n, p, t, m);
-            }
-        }
-        KeyCode::Backspace => {
-            let s = match field {
-                ServiceField::Name => name,
-                ServiceField::Port => port,
-                ServiceField::Tunnel => tunnel,
-                ServiceField::Memo => memo,
-            };
-            s.pop();
-        }
-        KeyCode::Char(c) => {
-            let s = match field {
-                ServiceField::Name => name,
-                ServiceField::Port => {
-                    if c.is_ascii_digit() { port } else { return; }
+                let mut prev = *selected - 1;
+                while prev > 0 && !settings_item_selectable(&items[prev].kind) {
+                    prev -= 1;
                 }
-                ServiceField::Tunnel => tunnel,
-                ServiceField::Memo => memo,
-            };
-            s.push(c);
-        }
-        _ => {}
-    }
-}
-
-fn handle_editing_service(app: &mut App, code: KeyCode) {
-    let Mode::EditingService { idx, field, name, port, tunnel, memo } = &mut app.mode else {
-        return;
-    };
-
-    match code {
-        KeyCode::Esc => app.mode = Mode::Normal,
-        KeyCode::Tab => {
-            *field = match field {
-                ServiceField::Name => ServiceField::Port,
-                ServiceField::Port => ServiceField::Tunnel,
-                ServiceField::Tunnel => ServiceField::Memo,
-                ServiceField::Memo => ServiceField::Name,
-            };
-        }
-        KeyCode::BackTab => {
-            *field = match field {
-                ServiceField::Name => ServiceField::Memo,
-                ServiceField::Port => ServiceField::Name,
-                ServiceField::Tunnel => ServiceField::Port,
-                ServiceField::Memo => ServiceField::Tunnel,
-            };
-        }
-        KeyCode::Enter => {
-            if !name.is_empty() && !port.is_empty() {
-                let (i, n, p, t, m) = (*idx, name.clone(), port.clone(), tunnel.clone(), memo.clone());
-                app.finish_edit_service(i, n, p, t, m);
+                if settings_item_selectable(&items[prev].kind) {
+                    *selected = prev;
+                }
             }
         }
-        KeyCode::Backspace => {
-            let s = match field {
-                ServiceField::Name => name,
-                ServiceField::Port => port,
-                ServiceField::Tunnel => tunnel,
-                ServiceField::Memo => memo,
-            };
-            s.pop();
-        }
-        KeyCode::Char(c) => {
-            let s = match field {
-                ServiceField::Name => name,
-                ServiceField::Port => {
-                    if c.is_ascii_digit() { port } else { return; }
+        KeyCode::Enter => {
+            let item = items[*selected].clone();
+            match &item.kind {
+                SettingsItemKind::ApiKey(_) => {
+                    app.return_to_settings = true;
+                    app.mode = Mode::Normal;
+                    app.begin_add_api_token();
                 }
-                ServiceField::Tunnel => tunnel,
-                ServiceField::Memo => memo,
-            };
-            s.push(c);
+                SettingsItemKind::Tunnel(name) => {
+                    let name = name.clone();
+                    app.return_to_settings = true;
+                    app.mode = Mode::Editing { name, token: String::new() };
+                }
+                SettingsItemKind::AddAccount => {
+                    app.return_to_settings = true;
+                    app.mode = Mode::Normal;
+                    app.begin_add();
+                }
+                SettingsItemKind::ActionScanPorts => {
+                    app.mode = Mode::Normal;
+                    app.scan_services();
+                }
+                SettingsItemKind::ActionImportPlists => {
+                    app.mode = Mode::Normal;
+                    app.import_existing();
+                }
+                SettingsItemKind::ActionSyncCf => {
+                    app.mode = Mode::Normal;
+                    app.refresh_cf();
+                }
+                _ => {}
+            }
+        }
+        KeyCode::Char('a') => {
+            // Context-aware add: find which account section cursor is in
+            let item = items[*selected].clone();
+            match &item.kind {
+                // If on an api key or tunnel row, add a tunnel to that account
+                SettingsItemKind::ApiKey(account_id) | SettingsItemKind::AccountHeader(account_id) => {
+                    // For now, just open add tunnel dialog
+                    app.mode = Mode::Normal;
+                    app.begin_add();
+                }
+                SettingsItemKind::Tunnel(_) => {
+                    app.mode = Mode::Normal;
+                    app.begin_add();
+                }
+                _ => {}
+            }
+        }
+        KeyCode::Char('d') => {
+            let item = items[*selected].clone();
+            match &item.kind {
+                SettingsItemKind::ApiKey(_account_id) => {
+                    if item.detail != "(none)" {
+                        // Remove the token that matches the displayed masked value
+                        let masked_suffix = if item.detail.len() > 4 {
+                            &item.detail[4..] // strip "••••"
+                        } else {
+                            ""
+                        };
+                        app.mode = Mode::Normal;
+                        if let Some(idx) = app.config.cf_api_tokens.iter().position(|t| {
+                            t.len() > 4 && t.ends_with(masked_suffix)
+                        }) {
+                            app.config.cf_api_tokens.remove(idx);
+                            let _ = app.config.save();
+                            app.status_msg = Some("API token removed".into());
+                        }
+                        app.open_settings();
+                    }
+                }
+                SettingsItemKind::Tunnel(name) => {
+                    let name = name.clone();
+                    app.mode = Mode::Confirming { action: "delete".into(), target: name };
+                }
+                _ => {}
+            }
         }
         _ => {}
     }
 }
 
-fn handle_confirming_service_delete(app: &mut App, code: KeyCode) {
-    let Mode::ConfirmingServiceDelete { idx, .. } = &app.mode else {
-        return;
-    };
-    let idx = *idx;
-
-    match code {
-        KeyCode::Char('y') | KeyCode::Char('Y') => {
-            app.delete_service(idx);
-            app.mode = Mode::Normal;
-        }
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-            app.mode = Mode::Normal;
-        }
-        _ => {}
+fn dismiss_to(app: &mut App) {
+    if app.return_to_settings {
+        app.return_to_settings = false;
+        app.open_settings();
+    } else {
+        app.mode = Mode::Normal;
     }
 }
 
@@ -411,21 +367,15 @@ fn handle_adding_api_token(app: &mut App, code: KeyCode) {
     };
 
     match code {
-        KeyCode::Esc => {
-            app.mode = Mode::Normal;
-        }
+        KeyCode::Esc => dismiss_to(app),
         KeyCode::Enter => {
             if !input.is_empty() {
                 let token = input.clone();
                 app.finish_add_api_token(token);
             }
         }
-        KeyCode::Backspace => {
-            input.pop();
-        }
-        KeyCode::Char(c) => {
-            input.push(c);
-        }
+        KeyCode::Backspace => { input.pop(); }
+        KeyCode::Char(c) => { input.push(c); }
         _ => {}
     }
 }
@@ -436,9 +386,7 @@ fn handle_adding(app: &mut App, code: KeyCode) {
     };
 
     match code {
-        KeyCode::Esc => {
-            app.mode = Mode::Normal;
-        }
+        KeyCode::Esc => dismiss_to(app),
         KeyCode::Tab => {
             *field = match field {
                 AddField::Name => AddField::Token,
@@ -476,9 +424,7 @@ fn handle_editing(app: &mut App, code: KeyCode) {
     };
 
     match code {
-        KeyCode::Esc => {
-            app.mode = Mode::Normal;
-        }
+        KeyCode::Esc => dismiss_to(app),
         KeyCode::Enter => {
             if !token.is_empty() {
                 let n = name.clone();
@@ -486,56 +432,8 @@ fn handle_editing(app: &mut App, code: KeyCode) {
                 app.finish_edit(n, t);
             }
         }
-        KeyCode::Backspace => {
-            token.pop();
-        }
-        KeyCode::Char(c) => {
-            token.push(c);
-        }
-        _ => {}
-    }
-}
-
-fn handle_renaming(app: &mut App, code: KeyCode) {
-    let Mode::Renaming { old_name, new_name } = &mut app.mode else {
-        return;
-    };
-
-    match code {
-        KeyCode::Esc => {
-            app.mode = Mode::Normal;
-        }
-        KeyCode::Enter => {
-            if !new_name.is_empty() {
-                let o = old_name.clone();
-                let n = new_name.clone();
-                app.finish_rename(o, n);
-            }
-        }
-        KeyCode::Backspace => {
-            new_name.pop();
-        }
-        KeyCode::Char(c) => {
-            new_name.push(c);
-        }
-        _ => {}
-    }
-}
-
-fn handle_migrating(app: &mut App, code: KeyCode) {
-    let Mode::Migrating { daemon_plists } = &app.mode else {
-        return;
-    };
-    let plists = daemon_plists.clone();
-
-    match code {
-        KeyCode::Char('y') | KeyCode::Char('Y') => {
-            app.do_migrate(plists);
-        }
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-            app.status_msg = Some("Imported — old daemon plists left in place".into());
-            app.mode = Mode::Normal;
-        }
+        KeyCode::Backspace => { token.pop(); }
+        KeyCode::Char(c) => { token.push(c); }
         _ => {}
     }
 }
@@ -558,122 +456,36 @@ fn handle_confirming(app: &mut App, code: KeyCode) {
     }
 }
 
-fn handle_routes(app: &mut App, code: KeyCode) {
-    let Mode::Routes { routes, selected, .. } = &mut app.mode else {
+fn handle_confirming_service_delete(app: &mut App, code: KeyCode) {
+    let Mode::ConfirmingServiceDelete { idx, .. } = &app.mode else {
         return;
     };
-
-    match code {
-        KeyCode::Esc | KeyCode::Char('q') => {
-            app.mode = Mode::Normal;
-        }
-        KeyCode::Char('j') | KeyCode::Down => {
-            if !routes.is_empty() && *selected < routes.len() - 1 {
-                *selected += 1;
-            }
-        }
-        KeyCode::Char('k') | KeyCode::Up => {
-            if *selected > 0 {
-                *selected -= 1;
-            }
-        }
-        KeyCode::Char('a') => {
-            app.begin_add_route();
-        }
-        KeyCode::Char('n') => {
-            app.begin_rename_route();
-        }
-        KeyCode::Char('d') => {
-            app.confirm_delete_route();
-        }
-        _ => {}
-    }
-}
-
-fn handle_adding_route(app: &mut App, code: KeyCode) {
-    let Mode::AddingRoute { tunnel_name, api_token, account_id, tunnel_id, field, hostname, service } = &mut app.mode else {
-        return;
-    };
-
-    match code {
-        KeyCode::Esc => app.mode = Mode::Normal,
-        KeyCode::Tab | KeyCode::BackTab => {
-            *field = match field {
-                RouteField::Hostname => RouteField::Service,
-                RouteField::Service => RouteField::Hostname,
-            };
-        }
-        KeyCode::Enter => {
-            if !hostname.is_empty() && !service.is_empty() {
-                let (tn, at, ai, ti, h, s) = (
-                    tunnel_name.clone(), api_token.clone(),
-                    account_id.clone(), tunnel_id.clone(),
-                    hostname.clone(), service.clone(),
-                );
-                app.finish_add_route(tn, at, ai, ti, h, s);
-            }
-        }
-        KeyCode::Backspace => {
-            let s = match field {
-                RouteField::Hostname => hostname,
-                RouteField::Service => service,
-            };
-            s.pop();
-        }
-        KeyCode::Char(c) => {
-            let s = match field {
-                RouteField::Hostname => hostname,
-                RouteField::Service => service,
-            };
-            s.push(c);
-        }
-        _ => {}
-    }
-}
-
-fn handle_renaming_route(app: &mut App, code: KeyCode) {
-    let Mode::RenamingRoute { tunnel_name, api_token, account_id, tunnel_id, old_hostname, service, new_subdomain, domain_suffix } = &mut app.mode else {
-        return;
-    };
-
-    match code {
-        KeyCode::Esc => app.mode = Mode::Normal,
-        KeyCode::Enter => {
-            if !new_subdomain.is_empty() {
-                let full_hostname = format!("{}{}", new_subdomain, domain_suffix);
-                let (tn, at, ai, ti, oh, svc) = (
-                    tunnel_name.clone(), api_token.clone(),
-                    account_id.clone(), tunnel_id.clone(),
-                    old_hostname.clone(), service.clone(),
-                );
-                app.finish_rename_route(tn, at, ai, ti, oh, svc, full_hostname);
-            }
-        }
-        KeyCode::Backspace => {
-            new_subdomain.pop();
-        }
-        KeyCode::Char(c) => {
-            new_subdomain.push(c);
-        }
-        _ => {}
-    }
-}
-
-fn handle_confirming_route_delete(app: &mut App, code: KeyCode) {
-    let Mode::ConfirmingRouteDelete { tunnel_name, api_token, account_id, tunnel_id, hostname } = &app.mode else {
-        return;
-    };
-    let (tn, at, ai, ti, h) = (
-        tunnel_name.clone(), api_token.clone(),
-        account_id.clone(), tunnel_id.clone(),
-        hostname.clone(),
-    );
+    let idx = *idx;
 
     match code {
         KeyCode::Char('y') | KeyCode::Char('Y') => {
-            app.finish_delete_route(tn, at, ai, ti, h);
+            app.delete_service(idx);
+            app.mode = Mode::Normal;
         }
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            app.mode = Mode::Normal;
+        }
+        _ => {}
+    }
+}
+
+fn handle_migrating(app: &mut App, code: KeyCode) {
+    let Mode::Migrating { daemon_plists } = &app.mode else {
+        return;
+    };
+    let plists = daemon_plists.clone();
+
+    match code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.do_migrate(plists);
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            app.status_msg = Some("Imported — old daemon plists left in place".into());
             app.mode = Mode::Normal;
         }
         _ => {}
