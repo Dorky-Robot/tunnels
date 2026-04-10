@@ -364,4 +364,24 @@ mod tests {
         let tokens = config.all_cf_api_tokens();
         assert_eq!(tokens.len(), 1);
     }
+
+    #[test]
+    fn update_token_single_tunnel_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut config, _) = test_config(dir.path());
+        let new_token = make_connector_token("new_acct", "new_tun");
+
+        // Updating by exact name should work
+        assert!(config.update_token("my-tunnel", new_token.clone()).is_ok());
+    }
+
+    #[test]
+    fn update_token_wrong_name_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut config, _) = test_config(dir.path());
+        let new_token = make_connector_token("a", "t");
+
+        let result = config.update_token("nonexistent", new_token);
+        assert!(result.is_err());
+    }
 }

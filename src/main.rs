@@ -986,16 +986,34 @@ fn cli_token_add(token: Option<&str>) -> Result<()> {
 
 fn cli_token_edit(args: &[String]) -> Result<()> {
     if args.is_empty() {
-        eprintln!("Usage: tunnels token edit <tunnel-name> --token <token>");
+        eprintln!("Usage: tunnels token edit [tunnel-name] --token <token>");
+        eprintln!("       tunnels token edit <token>  (uses default tunnel)");
         std::process::exit(1);
     }
 
-    let tunnel_name = &args[0];
-    let token = parse_flag(args, "--token")
-        .ok_or_else(|| anyhow::anyhow!("--token <token> is required"))?;
+    let config = config::Config::load()?;
 
-    let mut config = config::Config::load()?;
-    config.update_token(tunnel_name, token)?;
+    // If the first positional arg looks like a connector token and --token
+    // isn't provided, treat it as: tunnels token edit <token>
+    let (tunnel_name, token) = if let Some(flag_token) = parse_flag(args, "--token") {
+        (args[0].clone(), flag_token)
+    } else if args[0].starts_with("eyJ") {
+        // Bare token with no tunnel name — resolve default
+        let name = if config.tunnels.len() == 1 {
+            config.tunnels[0].name.clone()
+        } else {
+            anyhow::bail!(
+                "Multiple tunnels configured. Specify which one:\n  \
+                 tunnels token edit <tunnel-name> --token <token>"
+            );
+        };
+        (name, args[0].clone())
+    } else {
+        anyhow::bail!("--token <token> is required");
+    };
+
+    let mut config = config;
+    config.update_token(&tunnel_name, token)?;
     println!("✓ Token updated for '{}'", tunnel_name);
     Ok(())
 }
