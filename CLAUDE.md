@@ -8,6 +8,7 @@ A TUI for managing cloudflared tunnels and local services on macOS. Maps local p
 - **launchd.rs** — LaunchAgent plist generation, start/stop/status via `launchctl`, plist discovery/migration
 - **cloudflare.rs** — CF API integration via API tokens (multi-account + per-tunnel), tunnel details + ingress route fetch, route add/remove with DNS management, auto-match tokens to accounts
 - **scan.rs** — Service discovery via `lsof`: find listening TCP ports, resolve project names from process cwd
+- **route_import.rs** — Pure parse/retarget/group helpers for `tunnels route import` (JSON on stdin, idempotent via `cloudflare::add_route`)
 - **app.rs** — App state, flat port list model (PortRow + Health), mode machine, link/unlink flows, settings modal, CF sync
 - **ui.rs** — ratatui rendering: flat port list, settings modal overlay, keybinding bar, dialogs
 - **main.rs** — crossterm event loop, 9-key normal mode handler, settings/link/unlink handlers, full CLI subcommands
@@ -68,6 +69,8 @@ tunnels routes [TUNNEL] [--json]     # List ingress routes
 tunnels route add <host> <port> --tunnel <name>  # Idempotent
 tunnels route rm <host> --tunnel <name>
 tunnels route mv <old> <new> --tunnel <name>
+tunnels route import [--tunnel <name>] [--dry-run]  # Reads JSON from stdin
+  # e.g. tunnels routes mac-mini --json | tunnels route import --tunnel home-mesh
 
 # Services
 tunnels service list [--json]        # List tracked services
