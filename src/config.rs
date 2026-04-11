@@ -58,6 +58,18 @@ impl Config {
         tokens
     }
 
+    pub fn find_tunnel_by_tunnel_id(&self, tunnel_id: &str) -> Option<&Tunnel> {
+        self.tunnels.iter().find(|t| {
+            decode_token(&t.token)
+                .map(|p| p.tunnel_id == tunnel_id)
+                .unwrap_or(false)
+        })
+    }
+
+    pub fn owned_api_tokens(&self) -> Vec<String> {
+        self.all_cf_api_tokens().into_iter().map(|s| s.to_string()).collect()
+    }
+
     pub fn path() -> PathBuf {
         dirs::home_dir().map(|h| h.join(".config"))
             .unwrap_or_else(|| PathBuf::from("."))
@@ -351,5 +363,30 @@ mod tests {
 
         let tokens = config.all_cf_api_tokens();
         assert_eq!(tokens.len(), 1);
+    }
+
+    #[test]
+    fn update_token_single_tunnel_by_name() {
+        // Validate the find + decode logic without calling save() (which
+        // writes to the real config path). Same approach as
+        // update_token_accepts_valid_connector_token above.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut config, _) = test_config(dir.path());
+        let new_token = make_connector_token("new_acct", "new_tun");
+
+        assert!(decode_token(&new_token).is_ok());
+        let t = config.tunnels.iter_mut().find(|t| t.name == "my-tunnel");
+        assert!(t.is_some(), "should find tunnel by name");
+        t.unwrap().token = new_token;
+    }
+
+    #[test]
+    fn update_token_wrong_name_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, _) = test_config(dir.path());
+
+        // Lookup by wrong name should fail — test the find logic directly
+        let t = config.tunnels.iter().find(|t| t.name == "nonexistent");
+        assert!(t.is_none(), "should not find nonexistent tunnel");
     }
 }

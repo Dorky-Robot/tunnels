@@ -26,10 +26,10 @@ struct CfConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct CfIngress {
+pub(crate) struct CfIngress {
     #[serde(default)]
-    pub hostname: Option<String>,
-    pub service: String,
+    pub(crate) hostname: Option<String>,
+    pub(crate) service: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -49,46 +49,46 @@ struct CfTunnelDetail {
 
 /// Tunnel info fetched from CF API
 #[derive(Debug, Clone)]
-pub struct TunnelInfo {
-    pub cf_name: String,
-    pub connections: String,
-    pub connection_count: usize,
+pub(crate) struct TunnelInfo {
+    pub(crate) cf_name: String,
+    pub(crate) connections: String,
+    pub(crate) connection_count: usize,
 }
 
 /// An ingress rule resolved to a port
 #[derive(Debug, Clone)]
-pub struct IngressRoute {
-    pub hostname: String,
-    pub tunnel_name: String,
-    pub tunnel_id: String,
-    pub scheme: String,
+pub(crate) struct IngressRoute {
+    pub(crate) hostname: String,
+    pub(crate) tunnel_name: String,
+    pub(crate) tunnel_id: String,
+    pub(crate) scheme: String,
 }
 
 /// An account that needs an API token
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnreachedAccount {
-    pub account_id: String,
-    pub tunnel_names: Vec<String>,
-    pub tunnel_id: String,
+pub(crate) struct UnreachedAccount {
+    pub(crate) account_id: String,
+    pub(crate) tunnel_names: Vec<String>,
+    pub(crate) tunnel_id: String,
 }
 
 /// Result of a CF sync operation
-pub struct SyncResult {
+pub(crate) struct SyncResult {
     /// tunnel_id -> TunnelInfo (CF name + connection status)
-    pub tunnel_info: HashMap<String, TunnelInfo>,
-    pub ingress_routes: HashMap<u16, Vec<IngressRoute>>,
-    pub status: String,
-    pub unreached: Vec<UnreachedAccount>,
+    pub(crate) tunnel_info: HashMap<String, TunnelInfo>,
+    pub(crate) ingress_routes: HashMap<u16, Vec<IngressRoute>>,
+    pub(crate) status: String,
+    pub(crate) unreached: Vec<UnreachedAccount>,
 }
 
 /// Verify an API token works for a given account/tunnel
-pub fn verify_token(api_token: &str, account_id: &str, tunnel_id: &str) -> bool {
+pub(crate) fn verify_token(api_token: &str, account_id: &str, tunnel_id: &str) -> bool {
     fetch_tunnel_config_check(api_token, account_id, tunnel_id)
 }
 
 /// Check if an API token can list at least one Cloudflare zone (for DNS management).
 /// Returns the zone names if successful.
-pub fn verify_token_has_zones(api_token: &str) -> Option<Vec<String>> {
+pub(crate) fn verify_token_has_zones(api_token: &str) -> Option<Vec<String>> {
     let output = Command::new("curl")
         .args([
             "-s",
@@ -116,7 +116,7 @@ pub fn verify_token_has_zones(api_token: &str) -> Option<Vec<String>> {
 /// Sync: fetch ingress routes for all accounts using configured API tokens.
 /// cf_api_tokens: user-configured API tokens (one per CF account)
 /// tunnel_tokens: Vec<(config_name, base64_token)>
-pub fn sync(cf_api_tokens: &[&str], tunnel_tokens: &[(String, String)]) -> SyncResult {
+pub(crate) fn sync(cf_api_tokens: &[&str], tunnel_tokens: &[(String, String)]) -> SyncResult {
     // Decode all tunnel tokens to get (name, account_id, tunnel_id) triples
     let decoded: Vec<(String, String, String)> = tunnel_tokens.iter()
         .filter_map(|(name, tok)| {
@@ -323,7 +323,7 @@ fn fetch_tunnel_config(api_token: &str, account_id: &str, tunnel_id: &str) -> Ve
 
 /// Add an ingress rule (subdomain mapping) to a tunnel's configuration.
 /// Idempotent: if the route already exists, just ensures DNS is correct.
-pub fn add_route(
+pub(crate) fn add_route(
     api_token: &str,
     account_id: &str,
     tunnel_id: &str,
@@ -379,7 +379,7 @@ pub fn add_route(
 }
 
 /// Remove an ingress rule (subdomain mapping) from a tunnel's configuration.
-pub fn remove_route(
+pub(crate) fn remove_route(
     api_token: &str,
     account_id: &str,
     tunnel_id: &str,
@@ -419,7 +419,7 @@ pub fn remove_route(
 }
 
 /// List all ingress routes for a tunnel
-pub fn list_routes(
+pub(crate) fn list_routes(
     api_token: &str,
     account_id: &str,
     tunnel_id: &str,
@@ -429,7 +429,7 @@ pub fn list_routes(
 
 /// Result of a route add/remove/fix operation
 #[derive(Debug, Clone)]
-pub enum RouteResult {
+pub(crate) enum RouteResult {
     /// Everything worked
     Ok,
     /// Route existed already, DNS was ensured
@@ -445,7 +445,7 @@ Your API token needs these additional permissions for automatic DNS:
 Update at: dash.cloudflare.com/profile/api-tokens";
 
 /// Check if a CNAME DNS record exists for a hostname
-pub fn check_dns(api_token: &str, hostname: &str) -> Result<bool, String> {
+pub(crate) fn check_dns(api_token: &str, hostname: &str) -> Result<bool, String> {
     let zone_id = find_zone_id(api_token, hostname)?;
     let url = format!(
         "https://api.cloudflare.com/client/v4/zones/{}/dns_records?type=CNAME&name={}",
@@ -465,7 +465,7 @@ pub fn check_dns(api_token: &str, hostname: &str) -> Result<bool, String> {
 
 /// Ensure DNS record exists for a hostname pointing at a tunnel.
 /// This is idempotent — safe to call even if the record already exists.
-pub fn ensure_dns(
+pub(crate) fn ensure_dns(
     api_token: &str,
     hostname: &str,
     tunnel_id: &str,
@@ -518,7 +518,7 @@ fn create_dns_record(api_token: &str, hostname: &str, tunnel_id: &str) -> Result
     let zone_id = find_zone_id(api_token, hostname)?;
     let target = format!("{}.cfargotunnel.com", tunnel_id);
 
-    // Check if record already exists
+    // Check if a CNAME record already exists
     let list_url = format!(
         "https://api.cloudflare.com/client/v4/zones/{}/dns_records?type=CNAME&name={}",
         zone_id, hostname
@@ -532,7 +532,7 @@ fn create_dns_record(api_token: &str, hostname: &str, tunnel_id: &str) -> Result
         let val: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
         if let Some(results) = val.get("result").and_then(|v| v.as_array()) {
             if !results.is_empty() {
-                // Record already exists, update it
+                // CNAME already exists, update it
                 if let Some(record_id) = results[0].get("id").and_then(|v| v.as_str()) {
                     return update_dns_record(api_token, &zone_id, record_id, hostname, &target);
                 }
@@ -540,7 +540,10 @@ fn create_dns_record(api_token: &str, hostname: &str, tunnel_id: &str) -> Result
         }
     }
 
-    // Create new record
+    // Delete any conflicting A/AAAA records before creating the CNAME
+    delete_conflicting_records(api_token, &zone_id, hostname)?;
+
+    // Create new CNAME record
     let create_url = format!(
         "https://api.cloudflare.com/client/v4/zones/{}/dns_records",
         zone_id
@@ -565,6 +568,53 @@ fn create_dns_record(api_token: &str, hostname: &str, tunnel_id: &str) -> Result
         .map_err(|e| format!("curl: {}", e))?;
 
     parse_cf_response(&output.stdout).map(|_| ())
+}
+
+/// Delete A and AAAA records that would conflict with a CNAME for the same hostname.
+fn delete_conflicting_records(api_token: &str, zone_id: &str, hostname: &str) -> Result<(), String> {
+    for record_type in &["A", "AAAA"] {
+        let list_url = format!(
+            "https://api.cloudflare.com/client/v4/zones/{}/dns_records?type={}&name={}",
+            zone_id, record_type, hostname
+        );
+        let output = Command::new("curl")
+            .args(["-s", &list_url, "-H", &format!("Authorization: Bearer {}", api_token)])
+            .output()
+            .map_err(|e| format!("curl: {}", e))?;
+
+        if !output.status.success() {
+            continue;
+        }
+
+        let val: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
+        let results = match val.get("result").and_then(|v| v.as_array()) {
+            Some(r) => r,
+            None => continue,
+        };
+
+        for record in results {
+            let record_id = match record.get("id").and_then(|v| v.as_str()) {
+                Some(id) => id,
+                None => continue,
+            };
+            let delete_url = format!(
+                "https://api.cloudflare.com/client/v4/zones/{}/dns_records/{}",
+                zone_id, record_id
+            );
+            let del_output = Command::new("curl")
+                .args([
+                    "-s", "-X", "DELETE",
+                    &delete_url,
+                    "-H", &format!("Authorization: Bearer {}", api_token),
+                ])
+                .output()
+                .map_err(|e| format!("curl: {}", e))?;
+
+            // Best-effort: if deletion fails, the CNAME create will surface the error
+            let _ = parse_cf_response(&del_output.stdout);
+        }
+    }
+    Ok(())
 }
 
 fn update_dns_record(api_token: &str, zone_id: &str, record_id: &str, hostname: &str, target: &str) -> Result<(), String> {

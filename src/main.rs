@@ -2,6 +2,7 @@ mod app;
 mod cloudflare;
 mod config;
 mod launchd;
+mod route_import;
 mod scan;
 mod ui;
 
@@ -13,7 +14,7 @@ use crossterm::{
     ExecutableCommand,
 };
 use ratatui::prelude::*;
-use std::io::stdout;
+use std::io::{Read, stdout};
 use std::time::Duration;
 
 fn main() -> Result<()> {
@@ -27,13 +28,14 @@ fn main() -> Result<()> {
             "routes" => return cli_routes(args.get(2).map(|s| s.as_str()), json_flag),
             "route" => {
                 if args.len() < 3 {
-                    eprintln!("Usage: tunnels route <add|rm|mv> [args]");
+                    eprintln!("Usage: tunnels route <add|rm|mv|import> [args]");
                     std::process::exit(1);
                 }
                 match args[2].as_str() {
                     "add" => return cli_route_add(&args[3..]),
                     "rm" | "remove" => return cli_route_rm(&args[3..]),
                     "mv" | "rename" => return cli_route_mv(&args[3..]),
+                    "import" => return cli_route_import(&args[3..]),
                     _ => {
                         eprintln!("Unknown route command: {}", args[2]);
                         std::process::exit(1);
@@ -996,6 +998,120 @@ fn cli_route_mv(args: &[String]) -> Result<()> {
     println!();
     println!("✓ Renamed {} → {}", old_hostname, new_hostname);
 
+    Ok(())
+}
+
+/// `tunnels route import [--tunnel <name>] [--dry-run]`
+///
+/// Reads route entries from stdin (the JSON shape that `tunnels routes --json`
+/// emits) and creates them via `cloudflare::add_route`, which is idempotent.
+///
+/// With `--tunnel <name>`, all imported routes are retargeted to that tunnel —
+/// this is the cross-machine move case (pipe from one tunnel into another).
+/// With `--dry-run`, prints the plan without calling the Cloudflare API.
+fn cli_route_import(args: &[String]) -> Result<()> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("Usage: tunnels route import [--tunnel <name>] [--dry-run]");
+        println!();
+        println!("Reads route JSON from stdin in the format emitted by `tunnels routes --json`.");
+        println!("Uses cloudflare::add_route (idempotent — safe to re-run).");
+        println!();
+        println!("Examples:");
+        println!("  # Back up and restore routes on the same tunnel");
+        println!("  tunnels routes my-tunnel --json > routes.json");
+        println!("  tunnels route import < routes.json");
+        println!();
+        println!("  # Move all routes from one tunnel to another");
+        println!("  tunnels routes mac-mini --json | tunnels route import --tunnel home-mesh");
+        return Ok(());
+    }
+
+    let target = parse_flag(args, "--tunnel");
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .map_err(|e| anyhow::anyhow!("failed to read stdin: {}", e))?;
+
+    let entries = route_import::parse_entries(&buf)?;
+    if entries.is_empty() {
+        println!("No routes to import.");
+        return Ok(());
+    }
+
+    let entries = route_import::retarget(entries, target.as_deref());
+    let groups = route_import::group_by_tunnel(entries);
+
+    let total: usize = groups.iter().map(|(_, v)| v.len()).sum();
+    println!(
+        "Importing {} route(s) across {} tunnel(s){}",
+        total,
+        groups.len(),
+        if dry_run { " (dry run)" } else { "" }
+    );
+
+    if dry_run {
+        for (tunnel, routes) in &groups {
+            println!();
+            println!("Tunnel: {}", tunnel);
+            for r in routes {
+                println!("  + {} → {}", r.hostname, r.service);
+            }
+        }
+        return Ok(());
+    }
+
+    let config = config::Config::load()?;
+    let mut created = 0usize;
+    let mut existed = 0usize;
+    let mut failed = 0usize;
+
+    for (tunnel_name, routes) in groups {
+        println!();
+        println!("Tunnel: {}", tunnel_name);
+        let (api_token, account_id, tunnel_id) = match resolve_tunnel(&config, &tunnel_name) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("  ✗ cannot resolve tunnel '{}': {}", tunnel_name, e);
+                failed += routes.len();
+                continue;
+            }
+        };
+        for r in routes {
+            match cloudflare::add_route(&api_token, &account_id, &tunnel_id, &r.hostname, &r.service) {
+                Ok(cloudflare::RouteResult::Ok) => {
+                    println!("  ✓ {} → {}", r.hostname, r.service);
+                    created += 1;
+                }
+                Ok(cloudflare::RouteResult::AlreadyExists) => {
+                    println!("  = {} → {} (already exists)", r.hostname, r.service);
+                    existed += 1;
+                }
+                Ok(cloudflare::RouteResult::DnsFailure(ref e)) => {
+                    println!(
+                        "  ⚠ {} → {} (route ok, DNS failed: {})",
+                        r.hostname, r.service, e
+                    );
+                    failed += 1;
+                }
+                Err(e) => {
+                    eprintln!("  ✗ {} → {}: {}", r.hostname, r.service, e);
+                    failed += 1;
+                }
+            }
+        }
+    }
+
+    println!();
+    println!(
+        "Done: {} created, {} already existed, {} failed",
+        created, existed, failed
+    );
+
+    if failed > 0 {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
