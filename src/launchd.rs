@@ -1,9 +1,44 @@
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const CLOUDFLARED: &str = "/opt/homebrew/bin/cloudflared";
 const LABEL_PREFIX: &str = "com.cloudflare.cloudflared";
+
+/// Resolve the absolute path to `cloudflared` at plist-generation time.
+///
+/// Homebrew lives at `/opt/homebrew` on Apple Silicon and `/usr/local` on
+/// Intel, so we can't hardcode a single path. Resolution order:
+///   1. `TUNNELS_CLOUDFLARED` env var (explicit override)
+///   2. `/opt/homebrew/bin/cloudflared` if it exists
+///   3. `/usr/local/bin/cloudflared` if it exists
+///   4. `which cloudflared` (respects caller's PATH)
+///   5. `/opt/homebrew/bin/cloudflared` as a last-ditch default (matches
+///      the legacy behavior so we don't silently start generating a
+///      different path when cloudflared isn't installed at all).
+fn cloudflared_path() -> String {
+    if let Ok(p) = std::env::var("TUNNELS_CLOUDFLARED") {
+        if !p.is_empty() {
+            return p;
+        }
+    }
+    for candidate in [
+        "/opt/homebrew/bin/cloudflared",
+        "/usr/local/bin/cloudflared",
+    ] {
+        if Path::new(candidate).exists() {
+            return candidate.to_string();
+        }
+    }
+    if let Ok(out) = Command::new("/usr/bin/which").arg("cloudflared").output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() {
+                return s;
+            }
+        }
+    }
+    "/opt/homebrew/bin/cloudflared".to_string()
+}
 
 fn plist_dir() -> PathBuf {
     dirs::home_dir()
@@ -33,6 +68,7 @@ fn generate_plist(name: &str, token: &str) -> String {
     let label = label_for(name);
     let log_dir = log_dir();
     let log_dir_str = log_dir.to_string_lossy();
+    let cloudflared = cloudflared_path();
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -42,7 +78,7 @@ fn generate_plist(name: &str, token: &str) -> String {
 	<string>{label}</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>{CLOUDFLARED}</string>
+		<string>{cloudflared}</string>
 		<string>tunnel</string>
 		<string>run</string>
 		<string>--token</string>
@@ -153,6 +189,16 @@ pub fn stop(name: &str) -> Result<()> {
         return Ok(());
     }
 
+    // Snapshot the PID *before* we unload so we can verify the child
+    // actually died. `launchctl unload` is async and the legacy path in
+    // particular can leave a cloudflared process alive mid-retry for
+    // several seconds. We'd rather reap it ourselves than return "stopped"
+    // while a process is still holding the tunnel secret.
+    let pid_before = match status(name) {
+        Status::Running { pid } => pid,
+        _ => None,
+    };
+
     // Try modern bootout first, fall back to legacy unload
     let domain = gui_domain();
     let out = Command::new("launchctl")
@@ -168,8 +214,29 @@ pub fn stop(name: &str) -> Result<()> {
         }
     }
 
+    // Poll for the child to exit, then SIGKILL as a last resort.
+    if let Some(pid) = pid_before {
+        for _ in 0..30 {
+            if !process_alive(pid) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if process_alive(pid) {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+
     let _ = std::fs::remove_file(&path);
     Ok(())
+}
+
+/// Returns true if a process with the given pid is still alive.
+/// Uses `kill(pid, 0)` which probes without delivering a signal.
+fn process_alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
 pub fn restart(name: &str, token: &str) -> Result<()> {
@@ -332,5 +399,24 @@ mod tests {
     #[test]
     fn label_for_named_tunnel() {
         assert_eq!(label_for("staging"), "com.cloudflare.cloudflared-staging");
+    }
+
+    #[test]
+    fn cloudflared_path_respects_env_override() {
+        let override_path = "/tmp/tunnels-test-override/cloudflared-fake";
+        unsafe { std::env::set_var("TUNNELS_CLOUDFLARED", override_path); }
+        let got = cloudflared_path();
+        unsafe { std::env::remove_var("TUNNELS_CLOUDFLARED"); }
+        assert_eq!(got, override_path);
+    }
+
+    #[test]
+    fn generated_plist_uses_resolved_cloudflared() {
+        let expected = cloudflared_path();
+        let plist = generate_plist("default", "TOKEN");
+        assert!(
+            plist.contains(&format!("<string>{}</string>", expected)),
+            "plist should embed resolved cloudflared path: {expected}\nplist: {plist}"
+        );
     }
 }
