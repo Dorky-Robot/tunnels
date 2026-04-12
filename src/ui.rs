@@ -868,7 +868,7 @@ fn draw_add_api_token_dialog(
         .collect();
     let names_display = all_names.join(", ");
 
-    let area = fixed_centered_rect(70, 13, f.area());
+    let area = fixed_centered_rect(70, 16, f.area());
     f.render_widget(Clear, area);
 
     let title = format!(" Add CF API Token ({} account(s) need tokens) ", num_accounts);
@@ -883,15 +883,15 @@ fn draw_add_api_token_dialog(
     f.render_widget(block, area);
 
     let chunks = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(1), // 0: blank
+        Constraint::Length(1), // 1: needs
+        Constraint::Length(1), // 2: blank
+        Constraint::Length(1), // 3: paste instruction
+        Constraint::Length(1), // 4: blank
+        Constraint::Length(1), // 5: create-at URL
+        Constraint::Length(4), // 6: permissions (4 lines)
+        Constraint::Length(1), // 7: blank
+        Constraint::Length(1), // 8: token input
     ])
     .split(inner);
 
@@ -911,7 +911,12 @@ fn draw_add_api_token_dialog(
         chunks[5],
     );
     f.render_widget(
-        Paragraph::new("  Permissions: Account > Tunnel > Read/Edit, Zone > DNS > Edit")
+        Paragraph::new(vec![
+            Line::from("  Permissions needed:"),
+            Line::from("    Account | Cloudflare Tunnel \u{2192} Read, Edit"),
+            Line::from("    Zone    | Zone \u{2192} Read"),
+            Line::from("    Zone    | DNS \u{2192} Edit"),
+        ])
             .style(Style::default().fg(DIM)),
         chunks[6],
     );
