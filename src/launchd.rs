@@ -137,6 +137,40 @@ fn gui_domain() -> String {
     format!("gui/{}", uid)
 }
 
+/// True iff launchctl's bootstrap stderr indicates the service was already
+/// loaded (error 37). The previous heuristic also matched on the literal
+/// "Bootstrap failed" prefix, which launchctl emits on *every* failure —
+/// causing genuine errors (e.g. "Domain does not support specified action"
+/// from SSH sessions) to be silently downgraded to a kickstart attempt.
+fn is_already_bootstrapped(stderr: &str) -> bool {
+    stderr.contains(": 37:") || stderr.contains("already loaded")
+}
+
+/// True iff launchctl's stderr indicates the gui/<UID> domain isn't
+/// reachable from this process (error 125). This is the SSH symptom —
+/// the GUI session's launchd domain is only addressable from a process
+/// running inside that session.
+fn is_unreachable_domain(stderr: &str) -> bool {
+    stderr.contains(": 125:") || stderr.contains("Domain does not support")
+}
+
+fn ssh_hint() -> &'static str {
+    "\n\nHint: gui/<UID> is only reachable from your Aqua/login session. \
+     If you're connected over SSH, run this from a Terminal on the logged-in \
+     console."
+}
+
+/// Authoritative check: ask launchctl whether the label is currently loaded.
+/// Used to verify start() actually took effect, independent of which code
+/// path (bootstrap / kickstart / legacy load) we ran.
+fn is_loaded(label: &str) -> bool {
+    Command::new("launchctl")
+        .args(["list", label])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 pub fn start(name: &str, token: &str) -> Result<()> {
     let label = label_for(name);
     let path = plist_path(name);
@@ -158,27 +192,63 @@ pub fn start(name: &str, token: &str) -> Result<()> {
         .output()
         .context("launchctl bootstrap")?;
 
+    let bootstrap_stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        // error 37 = "already bootstrapped" — that's fine, just kickstart it
-        if stderr.contains("37:") || stderr.contains("already loaded") || stderr.contains("Bootstrap failed") {
-            let _ = Command::new("launchctl")
+        if is_already_bootstrapped(&bootstrap_stderr) {
+            // Already loaded — kickstart it. We MUST check kickstart's
+            // exit status; previously this was `let _ = …` which masked
+            // failures here.
+            let ks = Command::new("launchctl")
                 .args(["kickstart", "-k", &format!("{}/{}", domain, label)])
-                .output();
+                .output()
+                .context("launchctl kickstart")?;
+            if !ks.status.success() {
+                anyhow::bail!(
+                    "launchctl kickstart failed: {}",
+                    String::from_utf8_lossy(&ks.stderr).trim()
+                );
+            }
         } else {
-            // Fall back to legacy load
+            // Bootstrap failed for some reason other than "already loaded".
+            // Try the legacy `launchctl load -w` fallback (works on older
+            // launchds, though not in non-Aqua sessions either).
             let legacy = Command::new("launchctl")
-                .args(["load", &path.to_string_lossy()])
+                .args(["load", "-w", &path.to_string_lossy()])
                 .output()
                 .context("launchctl load (legacy fallback)")?;
             if !legacy.status.success() {
+                let hint = if is_unreachable_domain(&bootstrap_stderr) {
+                    ssh_hint()
+                } else {
+                    ""
+                };
                 anyhow::bail!(
-                    "launchctl start failed: {}",
-                    String::from_utf8_lossy(&legacy.stderr)
+                    "launchctl bootstrap failed: {}\nlaunchctl load fallback also failed: {}{}",
+                    bootstrap_stderr.trim(),
+                    String::from_utf8_lossy(&legacy.stderr).trim(),
+                    hint,
                 );
             }
         }
     }
+
+    // Authoritative verification: did the LaunchAgent actually load?
+    // launchctl can exit 0 from the legacy `load -w` path even when the
+    // service didn't register (this happens over SSH for the same
+    // gui/<UID> reason that breaks bootstrap), so we can't trust the
+    // earlier exit codes alone.
+    if !is_loaded(&label) {
+        let hint = if is_unreachable_domain(&bootstrap_stderr) {
+            ssh_hint()
+        } else {
+            ""
+        };
+        anyhow::bail!(
+            "launchctl reported success but {label} is not loaded.{hint}"
+        );
+    }
+
     Ok(())
 }
 
@@ -426,5 +496,46 @@ mod tests {
             plist.contains(&format!("<string>{}</string>", expected)),
             "plist should embed resolved cloudflared path: {expected}\nplist: {plist}"
         );
+    }
+
+    #[test]
+    fn already_bootstrapped_matches_error_37() {
+        assert!(is_already_bootstrapped(
+            "Bootstrap failed: 37: The specified service was already loaded\n"
+        ));
+        assert!(is_already_bootstrapped("service already loaded"));
+    }
+
+    #[test]
+    fn already_bootstrapped_does_not_match_unrelated_failures() {
+        // Regression: the previous heuristic matched on the literal
+        // "Bootstrap failed" prefix, so genuine errors (125 from SSH,
+        // 5 I/O, anything else) silently fell through to kickstart and
+        // ultimately returned Ok(()), producing a false "✓ Started".
+        assert!(!is_already_bootstrapped(
+            "Bootstrap failed: 125: Domain does not support specified action\n"
+        ));
+        assert!(!is_already_bootstrapped(
+            "Bootstrap failed: 5: Input/output error\n"
+        ));
+        assert!(!is_already_bootstrapped("Load failed: some other thing"));
+        assert!(!is_already_bootstrapped(""));
+    }
+
+    #[test]
+    fn unreachable_domain_matches_error_125() {
+        // The SSH symptom: gui/<UID> is unreachable from a non-Aqua session.
+        assert!(is_unreachable_domain(
+            "Bootstrap failed: 125: Domain does not support specified action\n"
+        ));
+        assert!(is_unreachable_domain("Domain does not support specified action"));
+    }
+
+    #[test]
+    fn unreachable_domain_does_not_match_other_errors() {
+        assert!(!is_unreachable_domain(
+            "Bootstrap failed: 37: The specified service was already loaded"
+        ));
+        assert!(!is_unreachable_domain(""));
     }
 }
