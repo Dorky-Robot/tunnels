@@ -663,7 +663,12 @@ impl App {
                 self.status_msg = Some(format!("Renamed '{}' -> '{}'", old_name, new_name));
                 if was_running {
                     if let Some(t) = self.config.tunnels.iter().find(|t| t.name == new_name) {
-                        let _ = launchd::start(&t.name, &t.token);
+                        if let Err(e) = launchd::start(&t.name, &t.token) {
+                            self.status_msg = Some(format!(
+                                "Renamed to '{}' but failed to start: {}",
+                                new_name, e
+                            ));
+                        }
                     }
                 }
             }
@@ -706,7 +711,12 @@ impl App {
                 self.status_msg = Some(format!("Updated '{}'", name));
                 if matches!(launchd::status(&name), launchd::Status::Running { .. }) {
                     if let Some(t) = self.config.tunnels.iter().find(|t| t.name == name) {
-                        let _ = launchd::restart(&t.name, &t.token);
+                        if let Err(e) = launchd::restart(&t.name, &t.token) {
+                            self.status_msg = Some(format!(
+                                "Updated '{}' but failed to restart: {}",
+                                name, e
+                            ));
+                        }
                     }
                 }
             }
@@ -867,7 +877,9 @@ impl App {
 
         for t in &self.config.tunnels {
             if !matches!(launchd::status(&t.name), launchd::Status::Running { .. }) {
-                let _ = launchd::start(&t.name, &t.token);
+                if let Err(e) = launchd::start(&t.name, &t.token) {
+                    errors.push(format!("start {}: {}", t.name, e));
+                }
             }
         }
 
