@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# .husky/pre-push — full validation before push
+#
+# Hook chain:
+#   1. Test suite     (BLOCKING — customize per tech stack)
+#   2. Secrets scan   (gitleaks — BLOCKING)
+#
+# Activate once per clone:
+#   git config core.hooksPath .husky
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+warn() { echo "  WARN  $*" >&2; }
+fail() { echo "  ERROR $*" >&2; exit 1; }
+step() { echo ""; echo "==> $*"; }
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  pre-push checks"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# ── 1. Test suite (BLOCKING) ─────────────────────────────────────────────────
+# Customize this step for your tech stack. Examples:
+#
+#   Rust:     cargo test --workspace
+#   Node:     npm test
+#   Python:   pytest
+#   Go:       go test ./...
+#
+step "[1/2] Test suite"
+echo "      (no test runner configured — add one for your tech stack)"
+
+# ── 2. Secrets scan (BLOCKING) ───────────────────────────────────────────────
+step "[2/2] Secrets scan (gitleaks)"
+if command -v gitleaks >/dev/null 2>&1; then
+    if ! gitleaks git --no-banner --verbose; then
+        fail "Secrets detected — push blocked. Remove secrets before pushing."
+    fi
+    echo "      OK  No secrets detected"
+else
+    warn "gitleaks not installed — skipping secrets scan."
+    warn "Install: https://github.com/gitleaks/gitleaks#installing"
+fi
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  All pre-push checks passed — proceeding with push."
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
