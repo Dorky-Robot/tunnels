@@ -958,12 +958,36 @@ fn draw_add_api_token_dialog(
     input: &str,
 ) {
     let num_accounts = unreached.len();
-    let all_names: Vec<String> = unreached.iter()
-        .flat_map(|a| a.tunnel_names.iter().cloned())
-        .collect();
-    let names_display = all_names.join(", ");
 
-    let area = fixed_centered_rect(70, 16, f.area());
+    // Naming the tunnels is not enough when a machine serves more than one
+    // Cloudflare account: the question this dialog has to answer is *which
+    // account do I sign into to make the token*, and the answer is the
+    // account id — it is what the dashboard URL carries.
+    let needs: Vec<Line> = if unreached.is_empty() {
+        vec![Line::from(Span::styled(
+            "  Every account already has a token.",
+            Style::default().fg(DIM),
+        ))]
+    } else {
+        unreached
+            .iter()
+            .flat_map(|a| {
+                vec![
+                    Line::from(Span::styled(
+                        format!("  account {}", a.account_id),
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(Span::styled(
+                        format!("    for: {}", a.tunnel_names.join(", ")),
+                        Style::default().fg(DIM),
+                    )),
+                ]
+            })
+            .collect()
+    };
+    let needs_height = needs.len().min(6) as u16;
+
+    let area = fixed_centered_rect(74, 17 + needs_height.saturating_sub(1), f.area());
     f.render_widget(Clear, area);
 
     let title = format!(" Add CF API Token ({} account(s) need tokens) ", num_accounts);
@@ -978,30 +1002,30 @@ fn draw_add_api_token_dialog(
     f.render_widget(block, area);
 
     let chunks = Layout::vertical([
-        Constraint::Length(1), // 0: blank
-        Constraint::Length(1), // 1: needs
-        Constraint::Length(1), // 2: blank
-        Constraint::Length(1), // 3: paste instruction
-        Constraint::Length(1), // 4: blank
-        Constraint::Length(1), // 5: create-at URL
-        Constraint::Length(4), // 6: permissions (4 lines)
-        Constraint::Length(1), // 7: blank
-        Constraint::Length(1), // 8: token input
+        Constraint::Length(1),            // 0: blank
+        Constraint::Length(1),            // 1: heading
+        Constraint::Length(needs_height), // 2: which account(s)
+        Constraint::Length(1),            // 3: blank
+        Constraint::Length(1),            // 4: sign-in reminder
+        Constraint::Length(1),            // 5: create-at URL
+        Constraint::Length(4),            // 6: permissions (4 lines)
+        Constraint::Length(1),            // 7: blank
+        Constraint::Length(1),            // 8: token input
     ])
     .split(inner);
 
     f.render_widget(
-        Paragraph::new(format!("  Needs: {}", names_display))
-            .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Paragraph::new("  Still needs a token:").style(Style::default().fg(DIM)),
         chunks[1],
     );
+    f.render_widget(Paragraph::new(needs), chunks[2]);
     f.render_widget(
-        Paragraph::new("  Paste a token — we'll match it to the right account")
-            .style(Style::default().fg(DIM)),
-        chunks[3],
+        Paragraph::new("  Sign in to THAT account first — a token from another")
+            .style(Style::default().fg(YELLOW)),
+        chunks[4],
     );
     f.render_widget(
-        Paragraph::new("  Create at: dash.cloudflare.com/profile/api-tokens")
+        Paragraph::new("  account is valid and will not work. dash.cloudflare.com/profile/api-tokens")
             .style(Style::default().fg(DIM)),
         chunks[5],
     );

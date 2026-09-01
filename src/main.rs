@@ -1338,6 +1338,7 @@ fn cli_token_add(token: Option<&str>) -> Result<()> {
     } else {
         println!("✓ API token added — {covers}");
     }
+    println!("  See them all with: tunnels token list");
     Ok(())
 }
 

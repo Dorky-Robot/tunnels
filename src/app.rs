@@ -1297,20 +1297,38 @@ impl App {
             cloudflare::verify_token(&token, &a.account_id, &a.tunnel_id)
         });
 
-        let description = if let Some(a) = matched {
-            a.tunnel_names.join(", ")
-        } else if let Some(zones) = cloudflare::verify_token_has_zones(&token) {
-            format!("DNS zones: {}", zones.join(", "))
-        } else {
-            self.status_msg = Some(
-                "Token rejected — doesn't match any tunnel account or DNS zone".into(),
-            );
-            return;
+        let zones = cloudflare::verify_token_has_zones(&token);
+
+        // A token from the wrong Cloudflare account is perfectly valid — it
+        // just cannot see the thing you needed. Saying which account it
+        // turned out to be is the difference between a two-minute fix and
+        // an afternoon.
+        let description = match (&matched, &zones) {
+            (Some(a), Some(z)) => format!("{} · DNS zones: {}", a.tunnel_names.join(", "), z.join(", ")),
+            (Some(a), None) => a.tunnel_names.join(", "),
+            (None, Some(z)) => format!("DNS zones: {}", z.join(", ")),
+            (None, None) => {
+                self.status_msg = Some(
+                    "Token rejected — it reaches no tunnel account and no DNS zone.                      Wrong Cloudflare account, or missing permissions."
+                        .into(),
+                );
+                return;
+            }
         };
+
+        let still_waiting = matched.is_none() && !self.unreached.is_empty();
 
         match self.config.add_api_token(token, description.clone()) {
             Ok(()) => {
-                self.status_msg = Some(format!("Token added for {}", description));
+                self.status_msg = Some(if still_waiting {
+                    // it went in — it is useful — but not for what was asked
+                    format!(
+                        "Added ({description}) — but account {} still has no token; that one is from a different account",
+                        self.unreached[0].account_id
+                    )
+                } else {
+                    format!("Token added for {description}")
+                });
             }
             Err(e) => {
                 self.status_msg = Some(format!("Error: {}", e));
