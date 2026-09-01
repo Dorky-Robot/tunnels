@@ -164,7 +164,11 @@ impl Config {
         Ok(())
     }
 
-    pub fn save(&self) -> Result<()> {
+    /// Writing the whole struct is how a stale copy destroys someone
+    /// else's change, so this is private: every mutation goes through
+    /// [`Config::edit`], which reads first. If you find yourself wanting
+    /// to make this public, you want `edit` instead.
+    fn save(&self) -> Result<()> {
         let path = Self::path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -216,25 +220,29 @@ impl Config {
     }
 
     pub fn remove(&mut self, name: &str) -> Result<()> {
-        let len = self.tunnels.len();
-        self.tunnels.retain(|t| t.name != name);
-        if self.tunnels.len() == len {
-            anyhow::bail!("tunnel '{}' not found", name);
-        }
-        self.save()
+        self.edit(|c| {
+            let len = c.tunnels.len();
+            c.tunnels.retain(|t| t.name != name);
+            if c.tunnels.len() == len {
+                anyhow::bail!("tunnel '{}' not found", name);
+            }
+            Ok(())
+        })
     }
 
     pub fn rename(&mut self, old_name: &str, new_name: String) -> Result<()> {
         if self.tunnels.iter().any(|t| t.name == new_name) {
             anyhow::bail!("tunnel '{}' already exists", new_name);
         }
-        let t = self
-            .tunnels
-            .iter_mut()
-            .find(|t| t.name == old_name)
-            .with_context(|| format!("tunnel '{}' not found", old_name))?;
-        t.name = new_name;
-        self.save()
+        self.edit(|c| {
+            let t = c
+                .tunnels
+                .iter_mut()
+                .find(|t| t.name == old_name)
+                .with_context(|| format!("tunnel '{}' not found", old_name))?;
+            t.name = new_name;
+            Ok(())
+        })
     }
 
     pub fn update_token(&mut self, name: &str, token: String) -> Result<()> {
@@ -247,42 +255,50 @@ impl Config {
              If you meant to add a Cloudflare API token, use: tunnels token add <token>"
         })?;
 
-        let t = self
-            .tunnels
-            .iter_mut()
-            .find(|t| t.name == name)
-            .with_context(|| format!("tunnel '{}' not found", name))?;
-        t.token = token;
-        self.save()
+        self.edit(|c| {
+            let t = c
+                .tunnels
+                .iter_mut()
+                .find(|t| t.name == name)
+                .with_context(|| format!("tunnel '{}' not found", name))?;
+            t.token = token;
+            Ok(())
+        })
     }
 
     pub fn add_service(&mut self, name: String, port: u16, tunnel: Option<String>, memo: Option<String>) -> Result<()> {
-        if self.services.iter().any(|s| s.port == port) {
-            anyhow::bail!("port {} already tracked", port);
-        }
-        self.services.push(Service { name, port, machine: String::new(), tunnel, memo });
-        self.save()
+        self.edit(|c| {
+            if c.services.iter().any(|s| s.port == port) {
+                anyhow::bail!("port {} already tracked", port);
+            }
+            c.services.push(Service { name, port, machine: String::new(), tunnel, memo });
+            Ok(())
+        })
     }
 
     pub fn remove_service_by_idx(&mut self, idx: usize) -> Result<()> {
-        if idx < self.services.len() {
-            self.services.remove(idx);
-            self.save()
-        } else {
-            anyhow::bail!("service not found")
-        }
+        self.edit(|c| {
+            if idx < c.services.len() {
+                c.services.remove(idx);
+                Ok(())
+            } else {
+                anyhow::bail!("service not found")
+            }
+        })
     }
 
     pub fn update_service(&mut self, idx: usize, name: String, port: u16, tunnel: Option<String>, memo: Option<String>) -> Result<()> {
-        if let Some(s) = self.services.get_mut(idx) {
-            s.name = name;
-            s.port = port;
-            s.tunnel = tunnel;
-            s.memo = memo;
-            self.save()
-        } else {
-            anyhow::bail!("service index out of range")
-        }
+        self.edit(|c| {
+            if let Some(s) = c.services.get_mut(idx) {
+                s.name = name;
+                s.port = port;
+                s.tunnel = tunnel;
+                s.memo = memo;
+                Ok(())
+            } else {
+                anyhow::bail!("service index out of range")
+            }
+        })
     }
 }
 

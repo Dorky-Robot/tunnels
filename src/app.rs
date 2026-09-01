@@ -1271,7 +1271,7 @@ impl App {
     }
 
     pub fn forget_api_token(&mut self, idx: usize) {
-        match self.config.remove_api_token(idx) {
+        match crate::ops::remove_api_token(&mut self.config, idx) {
             Ok(covers) => {
                 let what = if covers.is_empty() { "token".into() } else { covers };
                 self.status_msg = Some(format!("Forgot {what}"));
@@ -1293,45 +1293,21 @@ impl App {
     }
 
     pub fn finish_add_api_token(&mut self, token: String) {
-        let matched: Option<&UnreachedAccount> = self.unreached.iter().find(|a| {
-            cloudflare::verify_token(&token, &a.account_id, &a.tunnel_id)
-        });
-
-        let zones = cloudflare::verify_token_has_zones(&token);
-
-        // A token from the wrong Cloudflare account is perfectly valid — it
-        // just cannot see the thing you needed. Saying which account it
-        // turned out to be is the difference between a two-minute fix and
-        // an afternoon.
-        let description = match (&matched, &zones) {
-            (Some(a), Some(z)) => format!("{} · DNS zones: {}", a.tunnel_names.join(", "), z.join(", ")),
-            (Some(a), None) => a.tunnel_names.join(", "),
-            (None, Some(z)) => format!("DNS zones: {}", z.join(", ")),
-            (None, None) => {
-                self.status_msg = Some(
-                    "Token rejected — it reaches no tunnel account and no DNS zone.                      Wrong Cloudflare account, or missing permissions."
-                        .into(),
-                );
-                return;
-            }
-        };
-
-        let still_waiting = matched.is_none() && !self.unreached.is_empty();
-
-        match self.config.add_api_token(token, description.clone()) {
-            Ok(()) => {
-                self.status_msg = Some(if still_waiting {
-                    // it went in — it is useful — but not for what was asked
-                    format!(
-                        "Added ({description}) — but account {} still has no token; that one is from a different account",
-                        self.unreached[0].account_id
-                    )
-                } else {
-                    format!("Token added for {description}")
+        // the same operation `tunnels token add` runs — this handler's job
+        // is the keystroke and the status line, nothing else
+        match crate::ops::add_api_token(&mut self.config, &token, &self.unreached) {
+            Ok(added) => {
+                self.status_msg = Some(match added.still_waiting {
+                    Some(account) => format!(
+                        "Added ({}) — but account {account} still has no token; that one is from a different account",
+                        added.covers
+                    ),
+                    None => format!("Token added for {}", added.covers),
                 });
             }
             Err(e) => {
-                self.status_msg = Some(format!("Error: {}", e));
+                self.status_msg = Some(format!("Token rejected — {e}"));
+                return;
             }
         }
 

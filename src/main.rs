@@ -1,6 +1,7 @@
 mod app;
 mod cloudflare;
 mod config;
+mod ops;
 mod launchd;
 mod route_import;
 mod scan;
@@ -1327,16 +1328,14 @@ fn cli_rename(args: &[String]) -> Result<()> {
 fn cli_token_add(token: Option<&str>) -> Result<()> {
     let token = token.ok_or_else(|| anyhow::anyhow!("Usage: tunnels token add <token>"))?;
     let mut config = config::Config::load()?;
-    // find out what it reaches before storing it, so the list is readable
-    // later and so a token for the wrong account is caught now
-    let covers = cloudflare::verify_token_has_zones(token)
-        .map(|z| format!("DNS zones: {}", z.join(", ")))
-        .unwrap_or_default();
-    config.add_api_token(token.to_string(), covers.clone())?;
-    if covers.is_empty() {
-        println!("✓ API token added (no DNS zones visible to it — tunnel access only)");
-    } else {
-        println!("✓ API token added — {covers}");
+    // the same operation the TUI runs, so neither front door can decide
+    // this differently from the other
+    let unreached = cloudflare::sync(&config.owned_api_tokens().iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        &config.tunnels.iter().map(|t| (t.name.clone(), t.token.clone())).collect::<Vec<_>>()).unreached;
+    let added = ops::add_api_token(&mut config, token, &unreached)?;
+    println!("✓ API token added — {}", added.covers);
+    if let Some(account) = added.still_waiting {
+        println!("  ⚠ account {account} still has no token — that one is from a different account");
     }
     println!("  See them all with: tunnels token list");
     Ok(())
@@ -1361,7 +1360,7 @@ fn cli_token_rm(which: Option<&str>) -> Result<()> {
     let which = which.ok_or_else(|| anyhow::anyhow!("Usage: tunnels token rm <#>"))?;
     let idx: usize = which.parse().context("expected a number from `tunnels token list`")?;
     let mut config = config::Config::load()?;
-    let covers = config.remove_api_token(idx)?;
+    let covers = ops::remove_api_token(&mut config, idx)?;
     println!("✓ Removed token{}", if covers.is_empty() { String::new() } else { format!(" — {covers}") });
     Ok(())
 }
