@@ -121,7 +121,17 @@ impl Config {
         self.all_cf_api_tokens().into_iter().map(|s| s.to_string()).collect()
     }
 
+    /// Where the config lives. `TUNNELS_CONFIG` overrides it — needed to
+    /// test the concurrent-write behaviour below, and useful for anyone
+    /// keeping more than one setup.
     pub fn path() -> PathBuf {
+        if let Ok(p) = std::env::var("TUNNELS_CONFIG") {
+            return PathBuf::from(p);
+        }
+        Self::default_path()
+    }
+
+    fn default_path() -> PathBuf {
         dirs::home_dir().map(|h| h.join(".config"))
             .unwrap_or_else(|| PathBuf::from("."))
             .join("tunnels")
@@ -138,6 +148,22 @@ impl Config {
         serde_json::from_str(&data).with_context(|| "parsing config")
     }
 
+    /// Apply a change to the config **on disk**, then adopt the result.
+    ///
+    /// The TUI holds one `Config` for a whole session and never re-reads
+    /// it, so writing that copy blindly discards anything else that wrote
+    /// in the meantime — a CLI invocation in another terminal, a second
+    /// TUI, a hand edit. That is how an API token can vanish without any
+    /// code ever removing one. Reading first makes the last writer merge
+    /// instead of win.
+    fn edit(&mut self, change: impl FnOnce(&mut Config) -> Result<()>) -> Result<()> {
+        let mut fresh = Config::load().unwrap_or_else(|_| self.clone());
+        change(&mut fresh)?;
+        fresh.save()?;
+        *self = fresh;
+        Ok(())
+    }
+
     pub fn save(&self) -> Result<()> {
         let path = Self::path();
         if let Some(parent) = path.parent() {
@@ -149,24 +175,29 @@ impl Config {
     }
 
     pub fn add_api_token(&mut self, token: String, covers: String) -> Result<()> {
-        // adding a token a second time relabels it rather than duplicating
-        // it — re-adding after a rescope should not leave two entries
-        if let Some(existing) = self.cf_api_tokens.iter_mut().find(|t| t.0.token == token) {
-            existing.0.covers = covers;
-        } else {
-            self.cf_api_tokens.push(ApiTokenCompat(ApiToken { token, covers }));
-        }
-        self.save()
+        self.edit(|c| {
+            // adding a token a second time relabels it rather than
+            // duplicating it — re-adding after a rescope leaves one entry
+            if let Some(existing) = c.cf_api_tokens.iter_mut().find(|t| t.0.token == token) {
+                existing.0.covers = covers;
+            } else {
+                c.cf_api_tokens.push(ApiTokenCompat(ApiToken { token, covers }));
+            }
+            Ok(())
+        })
     }
 
     /// Forget one API token, by its position in the list.
     pub fn remove_api_token(&mut self, idx: usize) -> Result<String> {
-        if idx >= self.cf_api_tokens.len() {
-            anyhow::bail!("no such token");
-        }
-        let gone = self.cf_api_tokens.remove(idx);
-        self.save()?;
-        Ok(gone.0.covers)
+        let mut covers = String::new();
+        self.edit(|c| {
+            if idx >= c.cf_api_tokens.len() {
+                anyhow::bail!("no such token");
+            }
+            covers = c.cf_api_tokens.remove(idx).0.covers;
+            Ok(())
+        })?;
+        Ok(covers)
     }
 
     /// The API tokens, as configured — for showing and for removing.
@@ -175,11 +206,13 @@ impl Config {
     }
 
     pub fn add(&mut self, name: String, token: String) -> Result<()> {
-        if self.tunnels.iter().any(|t| t.name == name) {
-            anyhow::bail!("tunnel '{}' already exists", name);
-        }
-        self.tunnels.push(Tunnel { name, token, api_token: None });
-        self.save()
+        self.edit(|c| {
+            if c.tunnels.iter().any(|t| t.name == name) {
+                anyhow::bail!("tunnel '{}' already exists", name);
+            }
+            c.tunnels.push(Tunnel { name, token, api_token: None });
+            Ok(())
+        })
     }
 
     pub fn remove(&mut self, name: &str) -> Result<()> {
@@ -427,6 +460,51 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains(r#"{"token":"bare_one"}"#), "new shape: {json}");
         assert!(json.contains(r#""covers":"DNS zones: a.example""#), "label kept: {json}");
+    }
+
+    /// The bug that lost a token: the TUI reads the config once at
+    /// startup and holds it for the session, so a blind write of that copy
+    /// discards whatever else wrote in between. Nothing "removes" the
+    /// token — it is simply not in the copy being written.
+    #[test]
+    fn a_long_running_session_does_not_clobber_a_concurrent_write() {
+        let dir = std::env::temp_dir().join(format!("tunnels-clobber-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        // Rust 2024 makes env mutation unsafe: it is process-global, and
+        // these tests run single-threaded on their own paths.
+        unsafe { std::env::set_var("TUNNELS_CONFIG", &path) };
+
+        // the config as it stands when a long-running TUI starts
+        let mut on_disk = Config::default();
+        on_disk.cf_api_tokens.push(bare("first", "account A"));
+        on_disk.save().unwrap();
+
+        // the TUI reads it, and keeps this copy for the whole session
+        let mut held_by_tui = Config::load().unwrap();
+
+        // meanwhile, something else adds a token — a CLI in another
+        // terminal, a second TUI, a hand edit
+        let mut elsewhere = Config::load().unwrap();
+        elsewhere.cf_api_tokens.push(bare("second", "account B"));
+        elsewhere.save().unwrap();
+
+        // now the session adds one of its own
+        held_by_tui.add_api_token("third".into(), "account C".into()).unwrap();
+
+        // all three survive: the session merged rather than overwrote
+        let after = Config::load().unwrap();
+        let tokens = after.all_cf_api_tokens();
+        assert!(tokens.contains(&"first"), "the original: {tokens:?}");
+        assert!(tokens.contains(&"second"), "the concurrent write was clobbered: {tokens:?}");
+        assert!(tokens.contains(&"third"), "the session's own: {tokens:?}");
+
+        // and the session's in-memory copy caught up, so its next write is
+        // not stale either
+        assert_eq!(held_by_tui.all_cf_api_tokens().len(), 3);
+
+        unsafe { std::env::remove_var("TUNNELS_CONFIG") };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
