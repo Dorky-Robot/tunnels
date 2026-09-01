@@ -61,9 +61,19 @@ Single unified view: tunnels as parent rows (▼/▶) with services nested under
 | Key | Action |
 |-----|--------|
 | l | Domains you can reach — grouped by Cloudflare account |
-| a | Add CF API token |
-| c | Replace the CONNECTOR token (restarts the tunnel) |
+| a | Add CF API token (one per CF account) |
+| n | New connector — a second tunnel, for another account |
+| c | Replace this tunnel'"'"'s CONNECTOR token (restarts it) |
 | Esc | Cancel |
+
+**One machine, several Cloudflare accounts.** This is what the tool is
+for: a box can run a connector per account side by side, each with its
+own tunnel, and hold an API token per account for routes and DNS. A
+hostname must be claimed by exactly one tunnel — and the tunnel holding
+its ingress must be the one its DNS CNAMEs to. On 2026-09-01 two tunnels
+were both named `mac-2024`, one per account; the felixflor.es DNS pointed
+at the account whose connector had stopped running, so those hostnames
+returned 530 while the ingress sat on the other tunnel.
 
 **g → global...**
 | Key | Action |

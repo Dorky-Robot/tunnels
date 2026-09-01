@@ -232,6 +232,12 @@ fn handle_prefix(app: &mut App, prefix: PrefixKey, code: KeyCode) {
                 _ => app.mode = Mode::Normal,
             },
             PrefixKey::Token => match code {
+                // running one machine's connectors for several Cloudflare
+                // accounts is the point of this tool, so adding one lives
+                // here, next to the token that replaces an existing one —
+                // not only under "add", where nobody thinking about
+                // connectors goes looking
+                KeyCode::Char('n') => { app.mode = Mode::Normal; app.begin_add(); }
                 KeyCode::Char('c') => {
                     app.mode = Mode::Normal;
                     if app.is_tunnel_selected() {

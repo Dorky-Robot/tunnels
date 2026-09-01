@@ -252,9 +252,10 @@ fn draw_keybindings(f: &mut Frame, app: &App, area: Rect) {
         ],
         Mode::Prefix(PrefixKey::Token) => vec![
             ("t ▸", "token"),
-            ("l", "list API tokens"),
+            ("l", "domains you can reach"),
             ("a", "add API token"),
-            ("c", "replace connector (restarts)"),
+            ("n", "new connector (another account)"),
+            ("c", "replace this connector (restarts)"),
             ("Esc", "cancel"),
         ],
         Mode::Prefix(PrefixKey::Global) => vec![
