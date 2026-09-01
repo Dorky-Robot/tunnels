@@ -115,6 +115,12 @@ pub enum Mode {
     AddingService { field: ServiceField, name: String, port: String, tunnel: String, memo: String },
     EditingService { idx: usize, field: ServiceField, name: String, port: String, tunnel: String, memo: String },
     ConfirmingServiceDelete { idx: usize, name: String, port: u16 },
+    /// The API tokens as configured — which accounts and zones this box
+    /// can actually reach. Without this the tokens are invisible: you
+    /// cannot audit them, and cannot tell why a route refuses to resolve.
+    ApiTokens {
+        selected: usize,
+    },
     AddingApiToken {
         input: String,
     },
@@ -1260,6 +1266,26 @@ impl App {
 
     // --- CF API Token methods ---
 
+    pub fn show_api_tokens(&mut self) {
+        self.mode = Mode::ApiTokens { selected: 0 };
+    }
+
+    pub fn forget_api_token(&mut self, idx: usize) {
+        match self.config.remove_api_token(idx) {
+            Ok(covers) => {
+                let what = if covers.is_empty() { "token".into() } else { covers };
+                self.status_msg = Some(format!("Forgot {what}"));
+                if self.config.api_tokens().is_empty() {
+                    self.mode = Mode::Normal;
+                } else {
+                    let last = self.config.api_tokens().len() - 1;
+                    self.mode = Mode::ApiTokens { selected: idx.min(last) };
+                }
+            }
+            Err(e) => self.status_msg = Some(format!("Error: {e}")),
+        }
+    }
+
     pub fn begin_add_api_token(&mut self) {
         self.mode = Mode::AddingApiToken {
             input: String::new(),
@@ -1282,7 +1308,7 @@ impl App {
             return;
         };
 
-        match self.config.add_api_token(token) {
+        match self.config.add_api_token(token, description.clone()) {
             Ok(()) => {
                 self.status_msg = Some(format!("Token added for {}", description));
             }

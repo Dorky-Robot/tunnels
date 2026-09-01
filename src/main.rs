@@ -6,7 +6,7 @@ mod route_import;
 mod scan;
 mod ui;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use app::{AddField, App, Mode, PrefixKey, RouteField, ServiceField};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -51,11 +51,13 @@ fn main() -> Result<()> {
             "rename" => return cli_rename(&args[2..]),
             "token" => {
                 if args.len() < 3 {
-                    eprintln!("Usage: tunnels token <add|edit> [args]");
+                    eprintln!("Usage: tunnels token <add|list|rm|edit> [args]");
                     std::process::exit(1);
                 }
                 match args[2].as_str() {
                     "add" => return cli_token_add(args.get(3).map(|s| s.as_str())),
+                    "list" | "ls" => return cli_token_list(),
+                    "rm" | "remove" => return cli_token_rm(args.get(3).map(|s| s.as_str())),
                     "edit" => return cli_token_edit(&args[3..]),
                     _ => {
                         eprintln!("Unknown token command: {}", args[2]);
@@ -142,6 +144,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mu
                     Mode::AddingService { .. } => handle_adding_service(app, key.code),
                     Mode::EditingService { .. } => handle_editing_service(app, key.code),
                     Mode::ConfirmingServiceDelete { .. } => handle_confirming_service_delete(app, key.code),
+                    Mode::ApiTokens { .. } => handle_api_tokens(app, key.code),
                     Mode::AddingApiToken { .. } => handle_adding_api_token(app, key.code),
                     Mode::Routes { .. } => handle_routes(app, key.code),
                     Mode::AddingRoute { .. } => handle_adding_route(app, key.code),
@@ -237,6 +240,7 @@ fn handle_prefix(app: &mut App, prefix: PrefixKey, code: KeyCode) {
                     }
                 }
                 KeyCode::Char('a') => { app.mode = Mode::Normal; app.begin_add_api_token(); }
+                KeyCode::Char('l') => { app.show_api_tokens(); }
                 _ => app.mode = Mode::Normal,
             },
             PrefixKey::Global => match code {
@@ -246,6 +250,35 @@ fn handle_prefix(app: &mut App, prefix: PrefixKey, code: KeyCode) {
                 _ => app.mode = Mode::Normal,
             },
         },
+    }
+}
+
+fn handle_api_tokens(app: &mut App, code: KeyCode) {
+    let total = app.config.api_tokens().len();
+    let Mode::ApiTokens { selected } = &mut app.mode else {
+        return;
+    };
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Normal,
+        KeyCode::Char('j') | KeyCode::Down => {
+            if total > 0 && *selected + 1 < total {
+                *selected += 1;
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            *selected = selected.saturating_sub(1);
+        }
+        KeyCode::Char('a') => {
+            app.mode = Mode::Normal;
+            app.begin_add_api_token();
+        }
+        KeyCode::Char('d') => {
+            let idx = *selected;
+            if total > 0 {
+                app.forget_api_token(idx);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1163,8 +1196,10 @@ fn print_help() {
     println!("  service scan                          Scan for listening ports (lsof)");
     println!();
     println!("TOKENS:");
-    println!("  token add <token>                     Add a Cloudflare API token");
-    println!("  token edit <tunnel> --token <token>   Set per-tunnel API token");
+    println!("  token add <token>                     Add a Cloudflare API token (one per CF account)");
+    println!("  token list                            Show what each token reaches");
+    println!("  token rm <#>                          Forget a token, by its number in the list");
+    println!("  token edit <tunnel> --token <token>   Replace a tunnel's CONNECTOR token (restarts it)");
     println!("  sync                                  Sync routes from Cloudflare API");
     println!("  heal                                  Restart tunnels with no edge connections");
     println!();
@@ -1292,8 +1327,41 @@ fn cli_rename(args: &[String]) -> Result<()> {
 fn cli_token_add(token: Option<&str>) -> Result<()> {
     let token = token.ok_or_else(|| anyhow::anyhow!("Usage: tunnels token add <token>"))?;
     let mut config = config::Config::load()?;
-    config.add_api_token(token.to_string())?;
-    println!("✓ API token added");
+    // find out what it reaches before storing it, so the list is readable
+    // later and so a token for the wrong account is caught now
+    let covers = cloudflare::verify_token_has_zones(token)
+        .map(|z| format!("DNS zones: {}", z.join(", ")))
+        .unwrap_or_default();
+    config.add_api_token(token.to_string(), covers.clone())?;
+    if covers.is_empty() {
+        println!("✓ API token added (no DNS zones visible to it — tunnel access only)");
+    } else {
+        println!("✓ API token added — {covers}");
+    }
+    Ok(())
+}
+
+fn cli_token_list() -> Result<()> {
+    let config = config::Config::load()?;
+    let tokens = config.api_tokens();
+    if tokens.is_empty() {
+        println!("No Cloudflare API tokens configured. Add one with: tunnels token add <token>");
+        return Ok(());
+    }
+    println!("{:<3} {:<22} {}", "#", "TOKEN", "COVERS");
+    for (i, t) in tokens.iter().enumerate() {
+        let covers = if t.covers.is_empty() { "—" } else { t.covers.as_str() };
+        println!("{:<3} {:<22} {}", i, t.hint(), covers);
+    }
+    Ok(())
+}
+
+fn cli_token_rm(which: Option<&str>) -> Result<()> {
+    let which = which.ok_or_else(|| anyhow::anyhow!("Usage: tunnels token rm <#>"))?;
+    let idx: usize = which.parse().context("expected a number from `tunnels token list`")?;
+    let mut config = config::Config::load()?;
+    let covers = config.remove_api_token(idx)?;
+    println!("✓ Removed token{}", if covers.is_empty() { String::new() } else { format!(" — {covers}") });
     Ok(())
 }
 

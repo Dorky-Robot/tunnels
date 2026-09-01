@@ -62,6 +62,9 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::AddingApiToken { input } => {
             draw_add_api_token_dialog(f, &app.unreached, input);
         }
+        Mode::ApiTokens { selected } => {
+            draw_api_tokens(f, &app.config, *selected);
+        }
         Mode::Routes { tunnel_name, routes, selected, .. } => {
             draw_routes_dialog(f, tunnel_name, routes, *selected);
         }
@@ -249,8 +252,9 @@ fn draw_keybindings(f: &mut Frame, app: &App, area: Rect) {
         ],
         Mode::Prefix(PrefixKey::Token) => vec![
             ("t ▸", "token"),
-            ("c", "connector"),
-            ("a", "API token"),
+            ("l", "list API tokens"),
+            ("a", "add API token"),
+            ("c", "replace connector (restarts)"),
             ("Esc", "cancel"),
         ],
         Mode::Prefix(PrefixKey::Global) => vec![
@@ -318,6 +322,12 @@ fn draw_keybindings(f: &mut Frame, app: &App, area: Rect) {
         Mode::AddingApiToken { .. } => vec![
             ("Enter", "save"),
             ("Esc", "cancel"),
+        ],
+        Mode::ApiTokens { .. } => vec![
+            ("j/k", "move"),
+            ("a", "add"),
+            ("d", "forget"),
+            ("Esc", "close"),
         ],
         Mode::Adding { .. } | Mode::Editing { .. } | Mode::Renaming { .. } => vec![
             ("Enter", "confirm"),
@@ -444,19 +454,25 @@ fn draw_input_dialog(f: &mut Frame, title: &str, field: &AddField, name: &str, t
 }
 
 fn draw_edit_dialog(f: &mut Frame, name: &str, token: &str) {
-    let area = fixed_centered_rect(60, 7, f.area());
+    let area = fixed_centered_rect(66, 9, f.area());
     f.render_widget(Clear, area);
 
+    // This dialog replaces the tunnel's CONNECTOR token and restarts it.
+    // It sits one keystroke from "add API token" (t,c against t,a), and
+    // pasting the wrong one here takes the tunnel down — so the dialog
+    // says which token it wants and what pressing Enter will do.
     let block = Block::default()
-        .title(format!(" Edit '{}' ", name))
-        .title_style(Style::default().fg(CYAN).bold())
+        .title(format!(" Connector token for '{}' ", name))
+        .title_style(Style::default().fg(YELLOW).bold())
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(CYAN));
+        .border_style(Style::default().fg(YELLOW));
 
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -472,13 +488,19 @@ fn draw_edit_dialog(f: &mut Frame, name: &str, token: &str) {
     };
 
     f.render_widget(
-        Paragraph::new("  Paste or type the new token:").style(Style::default().fg(DIM)),
+        Paragraph::new("  The tunnel's own connector token — this restarts it.")
+            .style(Style::default().fg(DIM)),
         chunks[0],
+    );
+    f.render_widget(
+        Paragraph::new("  Looking for a Cloudflare API token? Esc, then t,a.")
+            .style(Style::default().fg(DIM)),
+        chunks[1],
     );
     f.render_widget(
         Paragraph::new(format!("  > {}", display))
             .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        chunks[2],
+        chunks[3],
     );
 }
 
@@ -854,6 +876,79 @@ fn draw_rename_route_dialog(f: &mut Frame, old_hostname: &str, new_subdomain: &s
             Span::styled(domain_suffix, Style::default().fg(DIM)),
         ])),
         chunks[2],
+    );
+}
+
+/// What this box can reach, and through which token. The point of the
+/// tool is several Cloudflare accounts on one machine, and until now the
+/// tokens were invisible — so a route that would not resolve looked like
+/// a bug rather than a missing account.
+fn draw_api_tokens(f: &mut Frame, config: &crate::config::Config, selected: usize) {
+    let tokens = config.api_tokens();
+    let rows = tokens.len().max(1) as u16;
+    let area = fixed_centered_rect(78, rows + 7, f.area());
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" Cloudflare API tokens ")
+        .title_style(Style::default().fg(CYAN).bold())
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(CYAN));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+
+    f.render_widget(
+        Paragraph::new("  One per Cloudflare account. A route can only be created")
+            .style(Style::default().fg(DIM)),
+        chunks[0],
+    );
+    f.render_widget(
+        Paragraph::new("  in a zone one of these can see.").style(Style::default().fg(DIM)),
+        chunks[1],
+    );
+
+    if tokens.is_empty() {
+        f.render_widget(
+            Paragraph::new("  None yet — press a to add one.")
+                .style(Style::default().fg(YELLOW)),
+            chunks[2],
+        );
+    } else {
+        let lines: Vec<Line> = tokens
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let covers = if t.covers.is_empty() {
+                    "— nothing it could name (tunnel access only)".to_string()
+                } else {
+                    t.covers.clone()
+                };
+                let text = format!("  {:<20}  {}", t.hint(), covers);
+                if i == selected {
+                    Line::from(Span::styled(
+                        text,
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    ))
+                } else {
+                    Line::from(Span::styled(text, Style::default().fg(DIM)))
+                }
+            })
+            .collect();
+        f.render_widget(Paragraph::new(lines), chunks[2]);
+    }
+
+    f.render_widget(
+        Paragraph::new("  a add · d forget · Esc close").style(Style::default().fg(DIM)),
+        chunks[4],
     );
 }
 

@@ -23,6 +23,57 @@ pub struct Service {
     pub memo: Option<String>,
 }
 
+/// A Cloudflare API token, with what it turned out to cover.
+///
+/// The label is not decoration. This box talks to several Cloudflare
+/// accounts, and a bare token is unreadable — you cannot tell which
+/// account it belongs to, whether a zone you need is covered, or which
+/// of two tokens to remove. The label is computed when the token is
+/// added (its accounts and zones) and kept.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiToken {
+    pub token: String,
+    /// what this token reaches — accounts, or DNS zones
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub covers: String,
+}
+
+impl ApiToken {
+    /// The first few characters, for showing without revealing.
+    pub fn hint(&self) -> String {
+        let head: String = self.token.chars().take(10).collect();
+        format!("{head}… ({} chars)", self.token.len())
+    }
+}
+
+/// Older configs wrote tokens as bare strings. Read both; write the new
+/// shape. A tool that cannot open its own previous config is a tool that
+/// eats your setup on upgrade.
+impl<'de> Deserialize<'de> for ApiTokenCompat {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Either {
+            Bare(String),
+            Full { token: String, #[serde(default)] covers: String },
+        }
+        Ok(ApiTokenCompat(match Either::deserialize(d)? {
+            Either::Bare(token) => ApiToken { token, covers: String::new() },
+            Either::Full { token, covers } => ApiToken { token, covers },
+        }))
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(transparent)]
+pub struct ApiTokenCompat(pub ApiToken);
+
+impl From<&str> for ApiTokenCompat {
+    fn from(token: &str) -> Self {
+        ApiTokenCompat(ApiToken { token: token.to_string(), covers: String::new() })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     pub tunnels: Vec<Tunnel>,
@@ -32,7 +83,7 @@ pub struct Config {
     /// Create at https://dash.cloudflare.com/profile/api-tokens with
     /// "Account.Cloudflare Tunnel:Read" permission.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub cf_api_tokens: Vec<String>,
+    pub cf_api_tokens: Vec<ApiTokenCompat>,
     /// Backward compat: single token (deprecated, use cf_api_tokens)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cf_api_token: Option<String>,
@@ -41,7 +92,7 @@ pub struct Config {
 impl Config {
     /// All configured CF API tokens (merges cf_api_tokens + legacy cf_api_token + per-tunnel tokens)
     pub fn all_cf_api_tokens(&self) -> Vec<&str> {
-        let mut tokens: Vec<&str> = self.cf_api_tokens.iter().map(|s| s.as_str()).collect();
+        let mut tokens: Vec<&str> = self.cf_api_tokens.iter().map(|t| t.0.token.as_str()).collect();
         if let Some(ref t) = self.cf_api_token {
             if !t.is_empty() && !tokens.iter().any(|existing| existing == &t.as_str()) {
                 tokens.push(t.as_str());
@@ -97,11 +148,30 @@ impl Config {
         Ok(())
     }
 
-    pub fn add_api_token(&mut self, token: String) -> Result<()> {
-        if !self.cf_api_tokens.iter().any(|t| t == &token) {
-            self.cf_api_tokens.push(token);
+    pub fn add_api_token(&mut self, token: String, covers: String) -> Result<()> {
+        // adding a token a second time relabels it rather than duplicating
+        // it — re-adding after a rescope should not leave two entries
+        if let Some(existing) = self.cf_api_tokens.iter_mut().find(|t| t.0.token == token) {
+            existing.0.covers = covers;
+        } else {
+            self.cf_api_tokens.push(ApiTokenCompat(ApiToken { token, covers }));
         }
         self.save()
+    }
+
+    /// Forget one API token, by its position in the list.
+    pub fn remove_api_token(&mut self, idx: usize) -> Result<String> {
+        if idx >= self.cf_api_tokens.len() {
+            anyhow::bail!("no such token");
+        }
+        let gone = self.cf_api_tokens.remove(idx);
+        self.save()?;
+        Ok(gone.0.covers)
+    }
+
+    /// The API tokens, as configured — for showing and for removing.
+    pub fn api_tokens(&self) -> Vec<&ApiToken> {
+        self.cf_api_tokens.iter().map(|t| &t.0).collect()
     }
 
     pub fn add(&mut self, name: String, token: String) -> Result<()> {
@@ -320,16 +390,52 @@ mod tests {
         assert!(result.is_err());
     }
 
+    fn bare(token: &str, covers: &str) -> ApiTokenCompat {
+        ApiTokenCompat(ApiToken { token: token.into(), covers: covers.into() })
+    }
+
     #[test]
-    fn add_api_token_does_not_duplicate() {
+    fn adding_the_same_token_relabels_rather_than_duplicating() {
         let mut config = Config::default();
-        // Manually push instead of calling add_api_token (which calls save)
-        config.cf_api_tokens.push("tok_abc".into());
-        // Simulate add logic
-        if !config.cf_api_tokens.iter().any(|t| t == "tok_abc") {
-            config.cf_api_tokens.push("tok_abc".into());
+        config.cf_api_tokens.push(bare("tok_abc", "DNS zones: old.example"));
+        // the add path, without the save
+        let (token, covers) = ("tok_abc".to_string(), "DNS zones: new.example".to_string());
+        if let Some(existing) = config.cf_api_tokens.iter_mut().find(|t| t.0.token == token) {
+            existing.0.covers = covers;
+        } else {
+            config.cf_api_tokens.push(ApiTokenCompat(ApiToken { token, covers }));
         }
-        assert_eq!(config.cf_api_tokens.len(), 1);
+        assert_eq!(config.cf_api_tokens.len(), 1, "one entry, not two");
+        assert_eq!(config.api_tokens()[0].covers, "DNS zones: new.example", "relabelled");
+    }
+
+    /// The shape on disk changed. A tool that cannot read its own previous
+    /// config eats somebody's setup on upgrade, so both are accepted.
+    #[test]
+    fn reads_the_old_bare_string_config_and_writes_the_new_shape() {
+        let old = r#"{"tunnels":[],"cf_api_tokens":["tok_from_before"]}"#;
+        let config: Config = serde_json::from_str(old).expect("old config still opens");
+        assert_eq!(config.api_tokens().len(), 1);
+        assert_eq!(config.api_tokens()[0].token, "tok_from_before");
+        assert_eq!(config.api_tokens()[0].covers, "", "unlabelled until re-added");
+        assert_eq!(config.all_cf_api_tokens(), vec!["tok_from_before"]);
+
+        // written back out, it carries its label
+        let mixed = r#"{"tunnels":[],"cf_api_tokens":["bare_one",{"token":"full_one","covers":"DNS zones: a.example"}]}"#;
+        let config: Config = serde_json::from_str(mixed).expect("mixed config opens");
+        assert_eq!(config.all_cf_api_tokens(), vec!["bare_one", "full_one"]);
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains(r#"{"token":"bare_one"}"#), "new shape: {json}");
+        assert!(json.contains(r#""covers":"DNS zones: a.example""#), "label kept: {json}");
+    }
+
+    #[test]
+    fn forgetting_a_token_leaves_the_others() {
+        let mut config = Config::default();
+        config.cf_api_tokens.push(bare("one", "DNS zones: a.example"));
+        config.cf_api_tokens.push(bare("two", "DNS zones: b.example"));
+        config.cf_api_tokens.remove(0);
+        assert_eq!(config.all_cf_api_tokens(), vec!["two"]);
     }
 
     #[test]
