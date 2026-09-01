@@ -62,7 +62,7 @@ Single unified view: tunnels as parent rows (▼/▶) with services nested under
 |-----|--------|
 | l | Domains you can reach — grouped by Cloudflare account |
 | a | Add CF API token |
-| c | Replace the tunnel'''s CONNECTOR token (restarts it) |
+| c | Replace the CONNECTOR token (restarts the tunnel) |
 | Esc | Cancel |
 
 **g → global...**
