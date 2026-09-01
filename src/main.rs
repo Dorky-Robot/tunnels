@@ -1348,10 +1348,17 @@ fn cli_token_list() -> Result<()> {
         println!("No Cloudflare API tokens configured. Add one with: tunnels token add <token>");
         return Ok(());
     }
-    println!("{:<3} {:<22} {}", "#", "TOKEN", "COVERS");
     for (i, t) in tokens.iter().enumerate() {
-        let covers = if t.covers.is_empty() { "—" } else { t.covers.as_str() };
-        println!("{:<3} {:<22} {}", i, t.hint(), covers);
+        if t.reach.is_empty() {
+            let covers = if t.covers.is_empty() { "no domains" } else { t.covers.as_str() };
+            println!("{i}. {covers}");
+        } else {
+            for r in &t.reach {
+                println!("{}{}", if i == 0 { format!("{i}. ") } else { format!("{i}. ") }, r.account_name);
+                println!("     {}", r.zones.join(" · "));
+            }
+        }
+        println!("     via {}", t.hint());
     }
     Ok(())
 }

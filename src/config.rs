@@ -36,6 +36,11 @@ pub struct ApiToken {
     /// what this token reaches — accounts, or DNS zones
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub covers: String,
+    /// the same thing with its structure kept: which accounts, and which
+    /// domains in each. A summary string cannot be grouped or sorted, and
+    /// grouping is the whole point when there is more than one account.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reach: Vec<crate::cloudflare::Reach>,
 }
 
 impl ApiToken {
@@ -55,11 +60,19 @@ impl<'de> Deserialize<'de> for ApiTokenCompat {
         #[serde(untagged)]
         enum Either {
             Bare(String),
-            Full { token: String, #[serde(default)] covers: String },
+            Full {
+                token: String,
+                #[serde(default)]
+                covers: String,
+                #[serde(default)]
+                reach: Vec<crate::cloudflare::Reach>,
+            },
         }
         Ok(ApiTokenCompat(match Either::deserialize(d)? {
-            Either::Bare(token) => ApiToken { token, covers: String::new() },
-            Either::Full { token, covers } => ApiToken { token, covers },
+            Either::Bare(token) => {
+                ApiToken { token, covers: String::new(), reach: Vec::new() }
+            }
+            Either::Full { token, covers, reach } => ApiToken { token, covers, reach },
         }))
     }
 }
@@ -70,7 +83,11 @@ pub struct ApiTokenCompat(pub ApiToken);
 
 impl From<&str> for ApiTokenCompat {
     fn from(token: &str) -> Self {
-        ApiTokenCompat(ApiToken { token: token.to_string(), covers: String::new() })
+        ApiTokenCompat(ApiToken {
+            token: token.to_string(),
+            covers: String::new(),
+            reach: Vec::new(),
+        })
     }
 }
 
@@ -178,14 +195,20 @@ impl Config {
         Ok(())
     }
 
-    pub fn add_api_token(&mut self, token: String, covers: String) -> Result<()> {
+    pub fn add_api_token(
+        &mut self,
+        token: String,
+        covers: String,
+        reach: Vec<crate::cloudflare::Reach>,
+    ) -> Result<()> {
         self.edit(|c| {
             // adding a token a second time relabels it rather than
             // duplicating it — re-adding after a rescope leaves one entry
             if let Some(existing) = c.cf_api_tokens.iter_mut().find(|t| t.0.token == token) {
                 existing.0.covers = covers;
+                existing.0.reach = reach;
             } else {
-                c.cf_api_tokens.push(ApiTokenCompat(ApiToken { token, covers }));
+                c.cf_api_tokens.push(ApiTokenCompat(ApiToken { token, covers, reach }));
             }
             Ok(())
         })
@@ -440,7 +463,7 @@ mod tests {
     }
 
     fn bare(token: &str, covers: &str) -> ApiTokenCompat {
-        ApiTokenCompat(ApiToken { token: token.into(), covers: covers.into() })
+        ApiTokenCompat(ApiToken { token: token.into(), covers: covers.into(), reach: Vec::new() })
     }
 
     #[test]
@@ -452,7 +475,7 @@ mod tests {
         if let Some(existing) = config.cf_api_tokens.iter_mut().find(|t| t.0.token == token) {
             existing.0.covers = covers;
         } else {
-            config.cf_api_tokens.push(ApiTokenCompat(ApiToken { token, covers }));
+            config.cf_api_tokens.push(ApiTokenCompat(ApiToken { token, covers, reach: Vec::new() }));
         }
         assert_eq!(config.cf_api_tokens.len(), 1, "one entry, not two");
         assert_eq!(config.api_tokens()[0].covers, "DNS zones: new.example", "relabelled");
@@ -506,7 +529,7 @@ mod tests {
         elsewhere.save().unwrap();
 
         // now the session adds one of its own
-        held_by_tui.add_api_token("third".into(), "account C".into()).unwrap();
+        held_by_tui.add_api_token("third".into(), "account C".into(), Vec::new()).unwrap();
 
         // all three survive: the session merged rather than overwrote
         let after = Config::load().unwrap();

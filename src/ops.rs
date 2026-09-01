@@ -52,19 +52,24 @@ pub fn add_api_token(
     let matched = unreached
         .iter()
         .find(|a| cloudflare::verify_token(token, &a.account_id, &a.tunnel_id));
-    let zones = cloudflare::verify_token_has_zones(token);
+    // which accounts, and which domains in each — the shape a person with
+    // two Cloudflare accounts actually needs to see
+    let reach = cloudflare::token_reach(token);
 
-    let covers = match (&matched, &zones) {
-        (Some(a), Some(z)) => format!("{} · DNS zones: {}", a.tunnel_names.join(", "), z.join(", ")),
-        (Some(a), None) => a.tunnel_names.join(", "),
-        (None, Some(z)) => format!("DNS zones: {}", z.join(", ")),
-        (None, None) => anyhow::bail!(
+    let covers = match (&matched, reach.is_empty()) {
+        (_, false) => reach
+            .iter()
+            .map(|r| format!("{} ({})", r.account_name, r.zones.join(", ")))
+            .collect::<Vec<_>>()
+            .join(" · "),
+        (Some(a), true) => format!("tunnels: {}", a.tunnel_names.join(", ")),
+        (None, true) => anyhow::bail!(
             "this token reaches no tunnel account and no DNS zone — \
              wrong Cloudflare account, or missing permissions"
         ),
     };
 
-    config.add_api_token(token.to_string(), covers.clone())?;
+    config.add_api_token(token.to_string(), covers.clone(), reach)?;
 
     Ok(TokenAdded {
         covers,

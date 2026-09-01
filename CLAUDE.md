@@ -4,7 +4,8 @@ A k9s-style TUI for managing cloudflared tunnels and local services on macOS.
 
 ## Architecture
 
-- **config.rs** — JSON config at `~/.config/tunnels/config.json`, tunnel + service CRUD, token decode. Services have optional `memo` field.
+- **config.rs** — JSON config at `~/.config/tunnels/config.json` (override with `TUNNELS_CONFIG`), tunnel + service CRUD, token decode. Services have optional `memo` field. **Every mutation goes through `Config::edit`, which re-reads the file first**; `save` is private. A long-running TUI holds its config for a whole session, so writing that copy blindly discards anything the CLI wrote meanwhile — that is how an API token once vanished with no code ever removing one.
+- **ops.rs** — operations, once, returning values rather than printed text or UI state. Both front doors call these, so a decision cannot differ between them. If a behaviour would be surprising when the CLI and TUI disagree about it, it belongs here.
 - **launchd.rs** — LaunchAgent plist generation, start/stop/status via `launchctl`, plist discovery/migration
 - **cloudflare.rs** — CF API integration via API tokens (multi-account + per-tunnel), tunnel details + ingress route fetch, route add/remove with DNS management, auto-match tokens to accounts
 - **scan.rs** — Service discovery via `lsof`: find listening TCP ports, resolve project names from process cwd
@@ -59,8 +60,9 @@ Single unified view: tunnels as parent rows (▼/▶) with services nested under
 **t → token...**
 | Key | Action |
 |-----|--------|
-| c | Edit connector token |
+| l | Domains you can reach — grouped by Cloudflare account |
 | a | Add CF API token |
+| c | Replace the tunnel'''s CONNECTOR token (restarts it) |
 | Esc | Cancel |
 
 **g → global...**
@@ -105,7 +107,9 @@ tunnels service edit <name> [--port <p>] [--tunnel <t>] [--memo <m>]
 tunnels service scan                 # Scan for listening ports
 
 # Tokens & sync
-tunnels token add <token>            # Add CF API token
+tunnels token add <token>            # Add CF API token (one per CF account)
+tunnels token list                   # Domains reachable, grouped by account
+tunnels token rm <#>                 # Forget a token
 tunnels token edit <tunnel> --token <token>  # Set per-tunnel token
 tunnels sync                         # Sync from Cloudflare API
 ```

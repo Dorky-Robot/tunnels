@@ -86,6 +86,63 @@ pub(crate) fn verify_token(api_token: &str, account_id: &str, tunnel_id: &str) -
     fetch_tunnel_config_check(api_token, account_id, tunnel_id)
 }
 
+/// What a token can actually reach: the Cloudflare accounts it can see,
+/// each with the domains in it.
+///
+/// This is the question somebody with more than one Cloudflare account
+/// is really asking — "which domains do I have access to, and which
+/// account are they under" — and it is answerable in one call, because
+/// every zone comes back stamped with its account.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Reach {
+    pub(crate) account_id: String,
+    pub(crate) account_name: String,
+    pub(crate) zones: Vec<String>,
+}
+
+pub(crate) fn token_reach(api_token: &str) -> Vec<Reach> {
+    let output = Command::new("curl")
+        .args([
+            "-s",
+            "https://api.cloudflare.com/client/v4/zones?per_page=50",
+            "-H",
+            &format!("Authorization: Bearer {}", api_token),
+        ])
+        .output();
+    let Ok(output) = output else { return Vec::new() };
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+        return Vec::new();
+    };
+    if !val.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return Vec::new();
+    }
+    let Some(results) = val.get("result").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    let mut by_account: Vec<Reach> = Vec::new();
+    for z in results {
+        let (Some(name), Some(acct)) = (z.get("name").and_then(|n| n.as_str()), z.get("account"))
+        else {
+            continue;
+        };
+        let id = acct.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let acct_name = acct.get("name").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+        match by_account.iter_mut().find(|r| r.account_id == id) {
+            Some(r) => r.zones.push(name.to_string()),
+            None => by_account.push(Reach {
+                account_id: id,
+                account_name: acct_name,
+                zones: vec![name.to_string()],
+            }),
+        }
+    }
+    for r in &mut by_account {
+        r.zones.sort();
+    }
+    by_account
+}
+
 /// Check if an API token can list at least one Cloudflare zone (for DNS management).
 /// Returns the zone names if successful.
 pub(crate) fn verify_token_has_zones(api_token: &str) -> Option<Vec<String>> {

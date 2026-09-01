@@ -883,14 +883,60 @@ fn draw_rename_route_dialog(f: &mut Frame, old_hostname: &str, new_subdomain: &s
 /// tool is several Cloudflare accounts on one machine, and until now the
 /// tokens were invisible — so a route that would not resolve looked like
 /// a bug rather than a missing account.
+/// Which domains this box can reach, and which Cloudflare account each
+/// one is under. That pairing is the question somebody with two accounts
+/// keeps having to answer, and it was previously answerable only by
+/// signing into the dashboard and looking.
 fn draw_api_tokens(f: &mut Frame, config: &crate::config::Config, selected: usize) {
     let tokens = config.api_tokens();
-    let rows = tokens.len().max(1) as u16;
-    let area = fixed_centered_rect(78, rows + 7, f.area());
+
+    let mut body: Vec<Line> = Vec::new();
+    for (i, t) in tokens.iter().enumerate() {
+        let chosen = i == selected;
+        let mark = if chosen { "▸ " } else { "  " };
+        let head = if chosen {
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(DIM)
+        };
+
+        if t.reach.is_empty() {
+            // a token with no zones still reaches something — tunnels —
+            // and saying so beats showing an empty row
+            let what = if t.covers.is_empty() { "no domains".into() } else { t.covers.clone() };
+            body.push(Line::from(Span::styled(format!("{mark}{what}"), head)));
+        } else {
+            for (n, r) in t.reach.iter().enumerate() {
+                let lead = if n == 0 { mark } else { "  " };
+                body.push(Line::from(Span::styled(
+                    format!("{lead}{}", r.account_name),
+                    head,
+                )));
+                body.push(Line::from(Span::styled(
+                    format!("      {}", r.zones.join(" · ")),
+                    Style::default().fg(if chosen { CYAN } else { DIM }),
+                )));
+            }
+        }
+        body.push(Line::from(Span::styled(
+            format!("      via {}", t.hint()),
+            Style::default().fg(DIM),
+        )));
+        body.push(Line::from(""));
+    }
+    if tokens.is_empty() {
+        body.push(Line::from(Span::styled(
+            "  No tokens yet — press a to add one.",
+            Style::default().fg(YELLOW),
+        )));
+    }
+
+    let height = (body.len() as u16 + 6).min(f.area().height.saturating_sub(2));
+    let area = fixed_centered_rect(76, height, f.area());
     f.render_widget(Clear, area);
 
     let block = Block::default()
-        .title(" Cloudflare API tokens ")
+        .title(" Domains you can reach ")
         .title_style(Style::default().fg(CYAN).bold())
         .borders(Borders::ALL)
         .border_style(Style::default().fg(CYAN));
@@ -899,56 +945,20 @@ fn draw_api_tokens(f: &mut Frame, config: &crate::config::Config, selected: usiz
 
     let chunks = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(1),
         Constraint::Min(1),
-        Constraint::Length(1),
         Constraint::Length(1),
     ])
     .split(inner);
 
     f.render_widget(
-        Paragraph::new("  One per Cloudflare account. A route can only be created")
+        Paragraph::new("  One token per Cloudflare account. A route can only be made in a domain listed here.")
             .style(Style::default().fg(DIM)),
         chunks[0],
     );
+    f.render_widget(Paragraph::new(body), chunks[1]);
     f.render_widget(
-        Paragraph::new("  in a zone one of these can see.").style(Style::default().fg(DIM)),
-        chunks[1],
-    );
-
-    if tokens.is_empty() {
-        f.render_widget(
-            Paragraph::new("  None yet — press a to add one.")
-                .style(Style::default().fg(YELLOW)),
-            chunks[2],
-        );
-    } else {
-        let lines: Vec<Line> = tokens
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                let covers = if t.covers.is_empty() {
-                    "— nothing it could name (tunnel access only)".to_string()
-                } else {
-                    t.covers.clone()
-                };
-                let text = format!("  {:<20}  {}", t.hint(), covers);
-                if i == selected {
-                    Line::from(Span::styled(
-                        text,
-                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-                    ))
-                } else {
-                    Line::from(Span::styled(text, Style::default().fg(DIM)))
-                }
-            })
-            .collect();
-        f.render_widget(Paragraph::new(lines), chunks[2]);
-    }
-
-    f.render_widget(
-        Paragraph::new("  a add · d forget · Esc close").style(Style::default().fg(DIM)),
-        chunks[4],
+        Paragraph::new("  j/k move · a add · d forget · Esc close").style(Style::default().fg(DIM)),
+        chunks[2],
     );
 }
 
