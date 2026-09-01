@@ -190,9 +190,43 @@ fn draw_unified_table(f: &mut Frame, app: &App, area: Rect) {
                     ])
                     .style(style)
                 }
+                // a rule Cloudflare holds. The hostname is the row, because
+                // that is what exists; the local name is a note beside it
+                UnifiedRow::Route { hostname, service, port, listening, label, memo, is_last } => {
+                    let branch = if *is_last { "  └ " } else { "  ├ " };
+                    let name_display = format!("{}{}", branch, hostname);
+                    let where_to = match port {
+                        Some(p) => format!(":{p}"),
+                        None => service.clone(),
+                    };
+                    // live means something is answering here, not merely
+                    // that a rule exists
+                    let (state, state_color) = if *listening {
+                        ("live", GREEN)
+                    } else if port.is_some() {
+                        ("nothing there", YELLOW)
+                    } else {
+                        ("—", DIM)
+                    };
+                    let note = if label.is_empty() {
+                        memo.clone()
+                    } else if memo.is_empty() {
+                        label.clone()
+                    } else {
+                        format!("{label} — {memo}")
+                    };
+                    Row::new(vec![
+                        Cell::from(name_display),
+                        Cell::from(where_to).style(Style::default().fg(DIM)),
+                        Cell::from(state).style(Style::default().fg(state_color)),
+                        Cell::from(format!("https://{hostname}")).style(Style::default().fg(CYAN)),
+                        Cell::from(note).style(Style::default().fg(DIM)),
+                    ])
+                    .style(style)
+                }
                 UnifiedRow::Separator => {
                     Row::new(vec![
-                        Cell::from("── Unlinked ──").style(Style::default().fg(DIM)),
+                        Cell::from("── running here, not routed ──").style(Style::default().fg(DIM)),
                         Cell::from(""),
                         Cell::from(""),
                         Cell::from(""),

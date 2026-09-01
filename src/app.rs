@@ -71,6 +71,22 @@ pub enum UnifiedRow {
         memo: String,
         is_last: bool,
     },
+    /// A rule Cloudflare holds for this tunnel. These rows come from the
+    /// account, not from anything typed here, so a route added by another
+    /// machine shows up without being told about — and a route nobody has
+    /// tracked locally cannot hide.
+    Route {
+        hostname: String,
+        /// what the tunnel forwards to, verbatim
+        service: String,
+        port: Option<u16>,
+        /// is anything actually answering on that port, on this machine
+        listening: bool,
+        /// the local name for it, if there is one
+        label: String,
+        memo: String,
+        is_last: bool,
+    },
     Separator,
 }
 
@@ -212,6 +228,11 @@ pub struct App {
     pub unified_rows: Vec<UnifiedRow>,
     pub tunnel_info: HashMap<String, TunnelInfo>,
     pub ingress_routes: HashMap<u16, Vec<IngressRoute>>,
+    /// what Cloudflare says each tunnel routes — the source of truth
+    pub routes_by_tunnel: HashMap<String, Vec<cloudflare::TunnelRoute>>,
+    /// ports answering on THIS machine, so a route can be shown as live or
+    /// merely configured. Local, and only ever used to annotate.
+    pub listening_ports: std::collections::HashSet<u16>,
     pub unreached: Vec<UnreachedAccount>,
     pub selected: usize,
     pub collapsed: HashSet<String>,
@@ -235,6 +256,8 @@ impl App {
             unified_rows: Vec::new(),
             tunnel_info: HashMap::new(),
             ingress_routes: HashMap::new(),
+            routes_by_tunnel: HashMap::new(),
+            listening_ports: std::collections::HashSet::new(),
             unreached: Vec::new(),
             selected: 0,
             collapsed: HashSet::new(),
@@ -266,38 +289,41 @@ impl App {
                 .map(|info| (info.cf_name.clone(), info.connections.clone()))
                 .unwrap_or_else(|| ("—".into(), "—".into()));
 
-            // Find services linked to this tunnel
-            let mut linked_services: Vec<&config::Service> = Vec::new();
-            for svc in &self.config.services {
-                let linked_by_route = self.ingress_routes.get(&svc.port)
-                    .map_or(false, |routes| routes.iter().any(|r| r.tunnel_id == tunnel_id));
-                let linked_by_name = svc.tunnel.as_deref() == Some(&tunnel_cfg.name);
-                if linked_by_route || linked_by_name {
-                    linked_services.push(svc);
-                    claimed_services.insert(svc.name.clone());
-                }
-            }
+            // Cloudflare's rules for this tunnel are the rows. A hostname
+            // exists because the account says so, not because this machine
+            // was told about it.
+            let routes: Vec<&cloudflare::TunnelRoute> = self
+                .routes_by_tunnel
+                .get(&tunnel_id)
+                .map(|rs| rs.iter().filter(|r| r.hostname.is_some()).collect())
+                .unwrap_or_default();
 
-            let service_count = linked_services.len();
             self.unified_rows.push(UnifiedRow::Tunnel {
                 name: tunnel_cfg.name.clone(),
                 status: status.clone(),
                 cf_name,
                 cf_conns,
-                service_count,
+                service_count: routes.len(),
             });
 
             if !self.collapsed.contains(&tunnel_cfg.name) {
-                let total = linked_services.len();
-                for (j, svc) in linked_services.iter().enumerate() {
-                    let (tunnel_status, url) = self.resolve_service_display(svc, Some(&status));
-                    self.unified_rows.push(UnifiedRow::Service {
-                        name: svc.name.clone(),
-                        port: svc.port,
-                        tunnel_name: Some(tunnel_cfg.name.clone()),
-                        tunnel_status,
-                        url,
-                        memo: svc.memo.clone().unwrap_or_default(),
+                let total = routes.len();
+                for (j, r) in routes.iter().enumerate() {
+                    // local knowledge, layered on: a name, a memo, and
+                    // whether anything is actually answering there
+                    let local = r
+                        .port
+                        .and_then(|p| self.config.services.iter().find(|s| s.port == p));
+                    if let Some(s) = local {
+                        claimed_services.insert(s.name.clone());
+                    }
+                    self.unified_rows.push(UnifiedRow::Route {
+                        hostname: r.hostname.clone().unwrap_or_default(),
+                        service: r.service.clone(),
+                        port: r.port,
+                        listening: r.port.is_some_and(|p| self.listening_ports.contains(&p)),
+                        label: local.map(|s| s.name.clone()).unwrap_or_default(),
+                        memo: local.and_then(|s| s.memo.clone()).unwrap_or_default(),
                         is_last: j == total - 1,
                     });
                 }
@@ -406,6 +432,9 @@ impl App {
 
     pub fn build_context_menu(&self) -> Option<Mode> {
         match self.selected_row()? {
+            // a route is Cloudflare's; acting on it belongs to the routes
+            // screen, which edits the account rather than local state
+            UnifiedRow::Route { .. } => None,
             UnifiedRow::Tunnel { status, .. } => {
                 let mut items: Vec<(char, String, ContextAction)> = Vec::new();
                 match status {
@@ -486,6 +515,11 @@ impl App {
                 BgResult::CfSync(sync) => {
                     self.tunnel_info = sync.tunnel_info;
                     self.ingress_routes = sync.ingress_routes;
+                    self.routes_by_tunnel = sync.routes_by_tunnel;
+                    // refresh what is answering locally, so routes can be
+                    // shown as live rather than merely configured
+                    self.listening_ports =
+                        crate::scan::scan_services().into_iter().map(|s| s.port).collect();
                     self.unreached = sync.unreached;
                     self.status_msg = Some(sync.status);
                     self.rebuild_unified_rows();
@@ -1324,6 +1358,8 @@ impl App {
             unified_rows: Vec::new(),
             tunnel_info: HashMap::new(),
             ingress_routes,
+            routes_by_tunnel: HashMap::new(),
+            listening_ports: std::collections::HashSet::new(),
             unreached: Vec::new(),
             selected: 0,
             collapsed: HashSet::new(),

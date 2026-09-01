@@ -64,6 +64,22 @@ pub(crate) struct IngressRoute {
     pub(crate) scheme: String,
 }
 
+/// A route exactly as Cloudflare holds it, kept per tunnel.
+///
+/// Cloudflare is the source of truth for what is routed where: several
+/// machines share these accounts, so a locally-maintained mapping is a
+/// second opinion that goes stale the moment another machine changes
+/// something. Local knowledge — is anything listening on that port, what
+/// do we call it — is enrichment layered on top, never the structure.
+#[derive(Debug, Clone)]
+pub(crate) struct TunnelRoute {
+    /// `None` is the catch-all rule
+    pub(crate) hostname: Option<String>,
+    /// where the tunnel sends it, verbatim: `http://localhost:3300`, `ssh://localhost:22`
+    pub(crate) service: String,
+    pub(crate) port: Option<u16>,
+}
+
 /// An account that needs an API token
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UnreachedAccount {
@@ -77,6 +93,8 @@ pub(crate) struct SyncResult {
     /// tunnel_id -> TunnelInfo (CF name + connection status)
     pub(crate) tunnel_info: HashMap<String, TunnelInfo>,
     pub(crate) ingress_routes: HashMap<u16, Vec<IngressRoute>>,
+    /// tunnel_id → every rule Cloudflare holds for it, in order
+    pub(crate) routes_by_tunnel: HashMap<String, Vec<TunnelRoute>>,
     pub(crate) status: String,
     pub(crate) unreached: Vec<UnreachedAccount>,
 }
@@ -195,6 +213,7 @@ pub(crate) fn sync(cf_api_tokens: &[&str], tunnel_tokens: &[(String, String)]) -
         return SyncResult {
             tunnel_info: HashMap::new(),
             ingress_routes: HashMap::new(),
+            routes_by_tunnel: HashMap::new(),
             status: "No tunnels configured".into(),
             unreached: Vec::new(),
         };
@@ -217,12 +236,14 @@ pub(crate) fn sync(cf_api_tokens: &[&str], tunnel_tokens: &[(String, String)]) -
         return SyncResult {
             tunnel_info: HashMap::new(),
             ingress_routes: HashMap::new(),
+            routes_by_tunnel: HashMap::new(),
             status: format!("{} account(s) need API tokens — press T", unreached.len()),
             unreached,
         };
     }
 
     let mut port_map: HashMap<u16, Vec<IngressRoute>> = HashMap::new();
+    let mut by_tunnel: HashMap<String, Vec<TunnelRoute>> = HashMap::new();
     let mut tunnel_info: HashMap<String, TunnelInfo> = HashMap::new();
     let mut total_routes = 0;
     let mut accounts_reached = 0;
@@ -258,8 +279,19 @@ pub(crate) fn sync(cf_api_tokens: &[&str], tunnel_tokens: &[(String, String)]) -
                     });
                 }
 
-                // Fetch ingress routes
+                // Fetch ingress routes — Cloudflare's answer, kept whole
                 let ingress = fetch_tunnel_config(api_token, account_id, tunnel_id);
+                by_tunnel.insert(
+                    tunnel_id.clone(),
+                    ingress
+                        .iter()
+                        .map(|r| TunnelRoute {
+                            hostname: r.hostname.clone(),
+                            service: r.service.clone(),
+                            port: parse_port_from_service(&r.service),
+                        })
+                        .collect(),
+                );
                 for rule in ingress {
                     let hostname = match rule.hostname {
                         Some(h) => h,
@@ -301,7 +333,7 @@ pub(crate) fn sync(cf_api_tokens: &[&str], tunnel_tokens: &[(String, String)]) -
         format!("Synced {} route(s) from {} account(s)", total_routes, accounts_reached)
     };
 
-    SyncResult { tunnel_info, ingress_routes: port_map, status, unreached }
+    SyncResult { tunnel_info, ingress_routes: port_map, routes_by_tunnel: by_tunnel, status, unreached }
 }
 
 fn parse_port_from_service(service: &str) -> Option<u16> {

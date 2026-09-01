@@ -24,6 +24,18 @@ Or via Homebrew: `brew install dorky-robot/tap/tunnels`
 
 ## Tree View
 
+**Cloudflare is the source of truth.** The rows under a tunnel are the
+ingress rules the account holds, fetched at sync — not a locally
+maintained list. Several machines share these accounts, so anything
+mapped by hand here is a second opinion that goes stale the moment
+another machine changes something, and a route nobody tracked locally
+used to be invisible entirely.
+
+Local knowledge annotates those rows and never structures them: whether
+a port is answering on this machine (`live` / `nothing there`), and the
+name and memo from `service` entries matched by port. Services with no
+route appear under "running here, not routed".
+
 Single unified view: tunnels as parent rows (▼/▶) with services nested underneath. Unlinked services appear under a separator.
 
 ## Key Bindings
