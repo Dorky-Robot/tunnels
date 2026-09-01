@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
     Frame,
 };
 
@@ -931,8 +931,17 @@ fn draw_api_tokens(f: &mut Frame, config: &crate::config::Config, selected: usiz
         )));
     }
 
-    let height = (body.len() as u16 + 6).min(f.area().height.saturating_sub(2));
-    let area = fixed_centered_rect(76, height, f.area());
+    // each zone line may wrap, so allow for it when sizing the box
+    let width = 78u16;
+    let wrapped: usize = body
+        .iter()
+        .map(|l| {
+            let w: usize = l.spans.iter().map(|s| s.content.chars().count()).sum();
+            1 + w.saturating_sub(1) / (width as usize - 4)
+        })
+        .sum();
+    let height = (wrapped as u16 + 6).min(f.area().height.saturating_sub(2));
+    let area = fixed_centered_rect(width, height, f.area());
     f.render_widget(Clear, area);
 
     let block = Block::default()
@@ -951,11 +960,16 @@ fn draw_api_tokens(f: &mut Frame, config: &crate::config::Config, selected: usiz
     .split(inner);
 
     f.render_widget(
-        Paragraph::new("  One token per Cloudflare account. A route can only be made in a domain listed here.")
+        Paragraph::new("  One token per account. A route can only be made in a domain listed here.")
             .style(Style::default().fg(DIM)),
         chunks[0],
     );
-    f.render_widget(Paragraph::new(body), chunks[1]);
+    // wrap rather than clip: a long list of domains is exactly the case
+    // this panel exists for, and cutting it off hides the answer
+    f.render_widget(
+        Paragraph::new(body).wrap(Wrap { trim: false }),
+        chunks[1],
+    );
     f.render_widget(
         Paragraph::new("  j/k move · a add · d forget · Esc close").style(Style::default().fg(DIM)),
         chunks[2],
