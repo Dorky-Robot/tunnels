@@ -152,3 +152,52 @@ untested backdoor is a rumour.
    the LAN path and the tailnet path fail differently rather than together.
 3. Reboot it and confirm it comes back **without anyone logging in**. If it
    does not, the tunnel is still a user agent and that is the thing to fix.
+
+## The mesh, set up identically
+
+Every machine carries the same setup, byte for byte, from `mesh/`:
+
+| file | what it is |
+|---|---|
+| `~/.ssh/config.d/mesh.conf` | every box, reachable three ways, by the same names everywhere |
+| `~/.ssh/config.d/mesh_known_hosts` | each box's host keys, read from that box's own `/etc/ssh` |
+| `~/.local/bin/tunnel-watchdog.sh` + its agent | finds this user's cloudflared agents and brings back any that were booted out |
+
+Each machine's own `~/.ssh/config` keeps whatever it had (GitHub keys and the
+like) and gains one line, `Include ~/.ssh/config.d/mesh.conf`, placed after any
+Includes already at the top — an Include written below a `Host` line would be
+scoped to that host alone. `sh mesh/install.sh` does all of it and is safe to
+re-run.
+
+**Change it here, then push it everywhere.** Edit `mesh/mesh.conf`, commit,
+and run `mesh/install.sh` on each machine. A copy edited in place on one box
+is how one machine quietly stops reaching another while the rest look fine.
+
+Two things the file does on purpose, both learned the first time it went out:
+
+- **Every direct path says `ProxyCommand none`.** ssh takes the first value
+  of each option, but only for options a block actually sets — so a box's
+  older `Host doug-mini` block with a ProxyCommand leaked into the tailnet
+  path and sent it through cloudflared. Two of sixteen paths failed until the
+  shared file pinned it.
+- **The tunnel's ProxyCommand finds cloudflared on PATH**, because mac2019 is
+  Intel and keeps Homebrew in `/usr/local`, not `/opt/homebrew`.
+
+### Adding a machine
+
+The keys cannot be done from one machine, so this part is by hand:
+
+1. On the new machine: `ssh-keygen -t ed25519 -N "" -C "mesh:$(hostname -s)" -f ~/.ssh/id_mesh_ed25519`
+2. Append its `.pub` to `~/.ssh/authorized_keys` on every other machine, and
+   every other machine's `id_mesh_ed25519.pub` to the new one's.
+3. Add its host keys to `mesh/mesh_known_hosts` — **read from the machine
+   itself** (`cat /etc/ssh/ssh_host_*_key.pub` over a path you already
+   trust), never from `ssh-keyscan` alone — and its three Host blocks to
+   `mesh/mesh.conf`. Commit.
+4. `sh mesh/install.sh` on every machine, then run the matrix in the next
+   section from each one.
+
+### Proving it
+
+From each machine, every other machine, by every path. The last run
+(2026-09-21): tailnet 16/16, tunnel 16/16, LAN within each house.

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.dorkyrobot.tunnel-watchdog</string>
+  <!-- IDENTICAL on every machine in the mesh: no per-user paths, and it
+       finds its own tunnels. Bootstraps any cloudflared job that has been
+       booted out — the case KeepAlive cannot cover (2026-09-21). -->
+  <key>ProgramArguments</key><array>
+    <string>/bin/sh</string><string>-c</string>
+    <string>exec /bin/sh "$HOME/.local/bin/tunnel-watchdog.sh"</string>
+  </array>
+  <key>StartInterval</key><integer>300</integer>
+  <key>RunAtLoad</key><true/>
+</dict></plist>

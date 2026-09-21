@@ -1,7 +1,8 @@
 #!/bin/sh
 # Every launchd job named here should be loaded. If one is not, load it.
 #
-#   tunnel-watchdog.sh com.cloudflare.cloudflared-doug-mini …
+#   tunnel-watchdog.sh                     every cloudflared agent this user has
+#   tunnel-watchdog.sh <label> …           just these
 #
 # This exists because of 2026-09-21. A tunnel was restarted over the ssh
 # session the tunnel itself was carrying: `launchctl bootout` cut the wire
@@ -14,6 +15,15 @@
 # This does, and it runs as a daemon so it is there at boot, before anybody
 # logs in — which is the other half of why that machine could not heal.
 set -eu
+# Given no labels, watch every cloudflared agent this user has. That keeps
+# the script *and* its plist identical on every machine in the mesh, and a
+# tunnel added next month is watched without anybody remembering to add it.
+if [ "$#" -eq 0 ]; then
+  set -- $(ls "$HOME/Library/LaunchAgents" 2>/dev/null | sed -n 's/^\(com\.cloudflare\.cloudflared-.*\)\.plist$/\1/p')
+fi
+# it writes its own log, so the plist needs no per-user paths
+exec >>"$HOME/Library/Logs/tunnel-watchdog.log" 2>&1
+[ "${WATCHDOG_DRY:-}" = 1 ] && { echo "$(date -u +%FT%TZ) would watch: $*"; exit 0; }
 UID_=$(stat -f %u "$HOME")
 DOMAIN="gui/$UID_"
 AGENTS="$HOME/Library/LaunchAgents"
