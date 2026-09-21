@@ -52,6 +52,16 @@ tunnels import             # Import existing plists
 
 Route commands are idempotent — safe to re-run to fix DNS if it failed the first time.
 
+## Getting in when the tunnel is the thing that broke
+
+`ssh` to these machines rides the very tunnels this tool manages, so a
+restart done the wrong way locks you out of the machine you are restarting —
+which happened on 2026-09-21 and took a live site down until somebody could
+walk to the Mac. `docs/remote-access.md` is what came out of that evening:
+the rule (never `bootout` a service carrying your connection), a second way
+in that fails for different reasons, and a watchdog for the one case
+`KeepAlive` cannot cover — a job booted out rather than a process that died.
+
 ## Prerequisites
 
 - **macOS** (uses LaunchAgents and `lsof` for service discovery)
