@@ -135,3 +135,16 @@ tunnels token rm <#>                 # Forget a token
 tunnels token edit <tunnel> --token <token>  # Set per-tunnel token
 tunnels sync                         # Sync from Cloudflare API
 ```
+
+## Don't strand the machine you're on
+
+This tool restarts the tunnels that carry our ssh. A bootout-then-bootstrap
+over a tunneled ssh took Doug's mini offline on 2026-09-20: the bootout
+killed the session before the bootstrap could run. So `launchd::restart`
+detaches both halves whenever `SSH_CONNECTION`/`SSH_TTY` is set — keep that
+guard, and prefer `launchctl kickstart -k` for jobs that are already loaded.
+
+`mesh/` is the one source for the mesh ssh config (three paths per machine:
+tailnet, `-lan`, `cloudflare-`). Edit it here and push to every machine with
+`sh mesh/install.sh`. Why this shape, and how to add a machine:
+`docs/remote-access.md`.
