@@ -192,6 +192,17 @@ impl Config {
         }
         let data = serde_json::to_string_pretty(self)?;
         std::fs::write(&path, data)?;
+        // This file holds tunnel tokens *and* Cloudflare API tokens, and
+        // `fs::write` leaves it at whatever the umask says — 644 on these
+        // machines, readable by anyone on the box. A tunnel token runs one
+        // tunnel; an API token with Zone/DNS rewrites a whole zone. Found
+        // 2026-09-21, after the plists had been carefully hardened to 600
+        // and this file was quietly holding the same secrets in the open.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        }
         Ok(())
     }
 

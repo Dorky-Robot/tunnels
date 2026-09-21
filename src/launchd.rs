@@ -349,11 +349,64 @@ fn process_alive(pid: u32) -> bool {
 }
 
 pub fn restart(name: &str, token: &str) -> Result<()> {
-    // Always do a full stop + start cycle. launchctl kickstart -k reuses
-    // the cached service definition and won't pick up plist changes (e.g.
-    // an updated token), so we must bootout and bootstrap again.
+    // Always a full stop + start cycle: `launchctl kickstart -k` reuses the
+    // cached service definition and won't pick up plist changes such as an
+    // updated token (06354be), so bootout and bootstrap it is.
+    //
+    // The trap that leaves is this: on a machine you reach *through* the
+    // tunnel you are restarting, the bootout kills the connection carrying
+    // this very process, and the start half never runs. A job booted out of
+    // its domain is not managed any more, so KeepAlive does not bring it
+    // back, and the only route in was the tunnel. That stranded Doug's mini
+    // on 2026-09-21 and took ten hostnames down with it, including a live
+    // site, until somebody could power-cycle the machine by hand.
+    //
+    // So the two halves are handed to a process that outlives this one. If
+    // our session dies between them, the restart still completes.
+    if restarting_my_own_lifeline(name) {
+        return detached_restart(name, token);
+    }
     stop(name)?;
     start(name, token)
+}
+
+/// Is this process reaching the machine through the very tunnel it is about
+/// to stop? True when we are on the far end of an ssh session — which is
+/// how these hosts are administered, since their ssh hostname is one of the
+/// things the tunnel fronts. Conservative on purpose: when it cannot tell,
+/// it says yes and takes the safe path, which costs nothing but a second.
+fn restarting_my_own_lifeline(_name: &str) -> bool {
+    std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
+}
+
+/// Stop and start again from a child that survives the death of this
+/// process and of the terminal it was launched from: its own session, its
+/// own process group, stdio detached. `setsid` is not on macOS, so the
+/// double-fork is done by launchd itself — we hand the pair of commands to
+/// `sh` through `nohup`, which ignores SIGHUP, and do not wait for it.
+fn detached_restart(name: &str, token: &str) -> Result<()> {
+    let label = label_for(name);
+    let domain = gui_domain();
+    let path = plist_path(name);
+    // the new plist has to be on disk before we let go: the detached half
+    // only bootstraps, it does not know how to generate anything
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::create_dir_all(log_dir())?;
+    std::fs::write(&path, generate_plist(name, token))?;
+    let script = format!(
+        "launchctl bootout {domain}/{label} >/dev/null 2>&1; sleep 2; \
+         launchctl bootstrap {domain} {plist} >/dev/null 2>&1",
+        plist = path.display()
+    );
+    Command::new("nohup")
+        .args(["sh", "-c", &script])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    Ok(())
 }
 
 /// Read recent log lines for a tunnel
