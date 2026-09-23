@@ -34,6 +34,7 @@ set -u
 # `ssh -G`, so douggraham-vs-felixflores stays true in one place.
 #
 # A machine with no tunnel leaves cf empty; it simply has one fewer way in.
+# Nothing is in that state today — dorkyrobot2 was, for about an hour.
 #
 # Add a machine = add a case + a name in machines() + `desktop --install`.
 # --list warns when mesh.conf knows a machine this table does not, so the
@@ -48,11 +49,7 @@ lookup() {
     mac2024|2024)    mesh=mac2024     lan=mac2024-lan      cf=cloudflare-mac2024     port=5904 ;;
     mac2019|2019)    mesh=mac2019     lan=mac2019-lan      cf=cloudflare-mac2019     port=5903 ;;
     dorkyrobot1|dr1) mesh=dorkyrobot1 lan=dorkyrobot1-lan  cf=cloudflare-dorkyrobot1 port=5905 ;;
-    # No tunnel yet, so cf is deliberately empty rather than a guessed
-    # cloudflare-dorkyrobot2 that does not exist — ssh would take that for a
-    # literal hostname and fail with a DNS error that reads like the machine
-    # is gone. Fill it in if and when the box gets a tunnel.
-    dorkyrobot2|dr2) mesh=dorkyrobot2 lan=dorkyrobot2-lan  cf=                        port=5906 ;;
+    dorkyrobot2|dr2) mesh=dorkyrobot2 lan=dorkyrobot2-lan  cf=cloudflare-dorkyrobot2 port=5906 ;;
     *) return 1 ;;
   esac
 }
