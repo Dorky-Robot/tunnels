@@ -33,8 +33,12 @@ set -u
 # The remote login is NOT repeated here — it is read from mesh.conf with
 # `ssh -G`, so douggraham-vs-felixflores stays true in one place.
 #
+# A machine with no tunnel leaves cf empty; it simply has one fewer way in.
+#
 # Add a machine = add a case + a name in machines() + `desktop --install`.
-machines() { printf '%s\n' felix-mini doug-mini mac2024 mac2019 dorkyrobot1; }
+# --list warns when mesh.conf knows a machine this table does not, so the
+# next box announces itself instead of being quietly unreachable.
+machines() { printf '%s\n' felix-mini doug-mini mac2024 mac2019 dorkyrobot1 dorkyrobot2; }
 
 lookup() {
   case "$1" in
@@ -44,6 +48,11 @@ lookup() {
     mac2024|2024)    mesh=mac2024     lan=mac2024-lan      cf=cloudflare-mac2024     port=5904 ;;
     mac2019|2019)    mesh=mac2019     lan=mac2019-lan      cf=cloudflare-mac2019     port=5903 ;;
     dorkyrobot1|dr1) mesh=dorkyrobot1 lan=dorkyrobot1-lan  cf=cloudflare-dorkyrobot1 port=5905 ;;
+    # No tunnel yet, so cf is deliberately empty rather than a guessed
+    # cloudflare-dorkyrobot2 that does not exist — ssh would take that for a
+    # literal hostname and fail with a DNS error that reads like the machine
+    # is gone. Fill it in if and when the box gets a tunnel.
+    dorkyrobot2|dr2) mesh=dorkyrobot2 lan=dorkyrobot2-lan  cf=                        port=5906 ;;
     *) return 1 ;;
   esac
 }
@@ -87,20 +96,42 @@ do_list() {
       printf '  %-12s lan      %s:5900\n' "$m" "$host"
       continue
     fi
-    if listening "$port"; then
+    if [ -n "$cf" ] && listening "$port"; then
       pid=$(lsof -nP -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -1)
       printf '  %-12s tunnel   localhost:%s -> %s  (pid %s)\n' "$m" "$port" "$cf" "$pid"
-    else
+    elif [ -n "$cf" ]; then
       printf '  %-12s —        no screen on any path\n' "$m"
+    else
+      printf '  %-12s —        no screen on either path (no tunnel)\n' "$m"
     fi
   done
+  do_list_unknown
+}
+
+# Every machine mesh.conf lists but lookup() does not know. Without this the
+# only symptom of a new box is that nobody thinks to reach its screen.
+mesh_hosts() {
+  local f="$HOME/.ssh/config.d/mesh.conf" i
+  [ -r "$f" ] || return 0
+  awk '$1=="Host"{for(i=2;i<=NF;i++) if($i !~ /^cloudflare-/ && $i !~ /-lan$/ && $i !~ /\.local$/){print $i; break}}' "$f"
+}
+
+do_list_unknown() {
+  local h unknown=""
+  for h in $(mesh_hosts); do
+    lookup "$h" || unknown="$unknown $h"
+  done
+  [ -n "$unknown" ] && printf '\n  mesh.conf also has:%s — not in this script yet\n' "$unknown"
+  return 0
 }
 
 do_stop() {
   local m mesh lan cf port pid
   for m in "$@"; do
     lookup "$m" || die "unknown machine: $m"
-    if listening "$port"; then
+    if [ -z "$cf" ]; then
+      echo "desktop: $m has no tunnel path, so there is never one to stop"
+    elif listening "$port"; then
       # Kill only the listener holding our port, not every ssh to that host —
       # an interactive shell you have open on the same box should survive this.
       pid=$(lsof -nP -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -1)
@@ -161,6 +192,8 @@ do_connect() {
   lookup "$name" || die "unknown machine: $name (try: $(machines | tr '\n' ' '))"
   connect_direct tailnet "$mesh" && exit 0
   connect_direct lan     "$lan"  && exit 0
+  [ -n "$cf" ] || die "no way in to $name: not on the tailnet, not on the LAN, and it has no tunnel.
+     Those are the only two paths it has — see the dorkyrobot2 note in mesh.conf."
   connect_tunnel "$cf" "$port"   && exit 0
   die "no way in to $name: not on the tailnet, not on the LAN, and the tunnel would not open.
      Check \`tailscale status\`, then that the machine has a screen turned on at all —
