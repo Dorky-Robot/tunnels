@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.dorkyrobot.tunnel-watchdog</string>
+  <!-- The same watchdog as a LaunchDaemon, in /Library/LaunchDaemons. It
+       is there at boot without a login, and system daemons came through the
+       2026-09-23 upgrade that stranded every user agent. Run as root the
+       script looks after whoever is at the console. Needs sudo to install:
+       docs/remote-access.md, "The watchdog". -->
+  <key>ProgramArguments</key><array>
+    <string>/bin/sh</string><string>/usr/local/bin/tunnel-watchdog.sh</string>
+  </array>
+  <!-- Every five minutes by the clock, not StartInterval. After the macOS 27
+       upgrade (2026-09-23) launchd left every RunAtLoad/StartInterval agent
+       at runs = 0 for fourteen hours, this one included; the only agents
+       that ran were StartCalendarInterval ones. -->
+  <key>StartCalendarInterval</key><array>
+    <dict><key>Minute</key><integer>0</integer></dict><dict><key>Minute</key><integer>5</integer></dict><dict><key>Minute</key><integer>10</integer></dict><dict><key>Minute</key><integer>15</integer></dict><dict><key>Minute</key><integer>20</integer></dict><dict><key>Minute</key><integer>25</integer></dict><dict><key>Minute</key><integer>30</integer></dict><dict><key>Minute</key><integer>35</integer></dict><dict><key>Minute</key><integer>40</integer></dict><dict><key>Minute</key><integer>45</integer></dict><dict><key>Minute</key><integer>50</integer></dict><dict><key>Minute</key><integer>55</integer></dict>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StandardErrorPath</key><string>/var/log/tunnel-watchdog.log</string>
+</dict></plist>

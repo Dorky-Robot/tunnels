@@ -129,47 +129,53 @@ Host mini-lan
 
 ## The watchdog
 
-*Since tunnels 0.16 the agent (`tunnels agent install`) does this job: every
-pass it loads any cloudflared job whose plist is on disk but which launchd
-has forgotten, and `mesh/install.sh` installs the agent instead of this
-script. The agent is a user LaunchAgent, so what follows about login screens
-still applies to it — a machine that reboots to a login screen needs
-auto-login, or the system-daemon form of the watchdog below. The rest of
-this section is kept for that case, and for machines on an older tunnels.*
+`scripts/tunnel-watchdog.sh` covers the two ways a job can be
+loaded-looking but dead, neither of which `KeepAlive` sees:
 
-`~/.local/bin/tunnel-watchdog.sh` bootstraps any launchd job in its list
-that is not loaded. It exists for the one case `KeepAlive` cannot cover: a
-job that was booted out rather than a process that died.
+- **booted out** (2026-09-21): the job is gone from its domain, so launchd
+  no longer manages it. The watchdog bootstraps any cloudflared agent, and
+  the tunnels agent, that is not loaded.
+- **loaded, never started** (2026-09-23): after the macOS 27 upgrade every
+  agent that starts at load sat at `runs = 0`, `needs LWCR update`, for
+  fourteen hours, the tunnel included. The watchdog kickstarts any loaded
+  agent, tunnel or not, whose plist says it should be running (`KeepAlive`
+  true, or `RunAtLoad` with no runs) and is not.
 
-It has to run as a **LaunchDaemon**, not a user agent, or it inherits the
-weakness it is meant to cover — a user agent only loads at login, and the
-machine that needs saving may be sitting at a login screen. Installing it
-needs a password:
+Since tunnels 0.16 the agent (`tunnels agent install`) does the first job
+for tunnels, and `mesh/install.sh` installs the agent instead of the user
+watchdog; `tunnels agent install` removes the user watchdog. But the agent is
+itself a user LaunchAgent: on 2026-09-23 it sat at `runs = 0` with the rest,
+and a user agent needs a login. So on a machine nobody can walk up to
+(doug-mini), install the watchdog as a **root LaunchDaemon** as well. It is
+there at boot, system daemons came through the upgrade, and run as root the
+script looks after whoever is logged in at the console — the tunnels agent
+included. `tunnels agent install` does not touch it: it lives in
+`/Library/LaunchDaemons`, in the `system` domain. Needs a password, at the
+machine or over `ssh <name>` (the tailnet, not the tunnel):
 
 ```sh
-sudo cp ~/.local/bin/tunnel-watchdog.sh /usr/local/bin/tunnel-watchdog.sh
-sudo tee /Library/LaunchDaemons/com.dorkyrobot.tunnel-watchdog.plist >/dev/null <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>com.dorkyrobot.tunnel-watchdog</string>
-  <key>ProgramArguments</key><array>
-    <string>/bin/sh</string>
-    <string>/usr/local/bin/tunnel-watchdog.sh</string>
-    <string>com.cloudflare.cloudflared-doug-mini</string>
-  </array>
-  <key>StartInterval</key><integer>300</integer>
-  <key>RunAtLoad</key><true/>
-  <key>StandardOutPath</key><string>/var/log/tunnel-watchdog.log</string>
-  <key>StandardErrorPath</key><string>/var/log/tunnel-watchdog.log</string>
-</dict></plist>
-PLIST
+cd ~/Projects/dorky_robot/tunnels && git pull --ff-only
+sudo install -m 755 scripts/tunnel-watchdog.sh /usr/local/bin/tunnel-watchdog.sh
+sudo install -m 644 mesh/com.dorkyrobot.tunnel-watchdog.daemon.plist \
+  /Library/LaunchDaemons/com.dorkyrobot.tunnel-watchdog.plist
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.dorkyrobot.tunnel-watchdog.plist
 ```
 
-Give it the labels that matter on that machine. Proven against the real
-failure before it was written down: a job killed comes back by `KeepAlive`;
-a job booted out does not, and the watchdog returns it within one interval.
+Check it: `sudo launchctl print system/com.dorkyrobot.tunnel-watchdog`
+shows `runs` climbing every five minutes, and `/var/log/tunnel-watchdog.log`
+says what it did (it is silent when all is well). To make it run now:
+`sudo launchctl kickstart system/com.dorkyrobot.tunnel-watchdog`.
+
+install.sh never touches the daemon copy: after the script changes, re-run
+the `install` line for it; the next run picks it up. Where the agent is too
+old to exist, install.sh still puts the watchdog in as a user agent that
+fires by the clock (`StartCalendarInterval`): on 2026-09-23 those were the
+only agents that ran.
+
+Proven against the real failures before it was written down: a job killed
+comes back by `KeepAlive`; a job booted out does not, and the watchdog
+returns it within one interval; on 2026-09-23 one run of it brought seven
+stranded agents up. The root path is not yet proven on a real upgrade.
 
 ## Checking it actually works
 
