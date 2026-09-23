@@ -1,0 +1,163 @@
+#!/bin/sh
+# This machine's own key for a GitHub account, and git set up to use it.
+#
+#   github-key-setup                 make this machine's key for its account
+#                                    (mesh/machines, `github` column), or finish
+#   github-key-setup <account>       the same, for another account in mesh/accounts
+#   github-key-setup --check [acct]  sign-in, signing, pull and (dry-run) push
+#   github-key-setup --clean [acct]  delete the key it replaced, once this one works
+#   github-key-setup --git           set git's identity, signing and remotes from
+#                                    the account; install.sh runs this
+#
+# One key per machine per account, made here and never copied: retiring a
+# machine is deleting its key on GitHub, and nothing else notices. SSH rather
+# than `gh auth login`, because each new gh login revoked the one before it
+# (2026-09-23), taking every other machine's pushes with it.
+#
+# The key sits at <key>.new until GitHub takes it, so a machine is never left
+# without a working key in between. Running it twice is harmless.
+#
+# Reads the installed copies of mesh/machines and mesh/accounts in
+# ~/.ssh/config.d — run `sh mesh/install.sh` first on a new machine.
+set -eu
+H=$(hostname -s)
+S=$HOME/.ssh
+D=$S/config.d
+KH=$D/github_known_hosts
+die() { echo "github-key-setup: $*" >&2; exit 1; }
+[ -r "$D/machines" ] && [ -r "$D/accounts" ] && [ -r "$KH" ] || die "no mesh files in $D; run: sh mesh/install.sh"
+
+rows() { grep -v '^[[:space:]]*#' "$1" | awk 'NF'; }
+my_account() { rows "$D/machines" | awk -v h="$H" '$2 == h {print $7; exit}'; }
+field() {  # field <account> <n>: that column of its line in accounts, trimmed
+  rows "$D/accounts" | awk -F'|' -v a="$1" -v n="$2" '
+    { x=$1; gsub(/[ \t]/,"",x) } x == a { v=$n; gsub(/^[ \t]+|[ \t]+$/,"",v); print v; exit }'
+}
+
+mode=
+case "${1:-}" in --check|--clean|--git) mode=$1; shift ;; -h|--help) sed -n '2,24p' "$0"; exit 0 ;; esac
+ACCT=${1:-$(my_account)}
+[ -n "$ACCT" ] || die "$H is not in mesh/machines; add it, or name an account"
+if [ "$ACCT" = - ]; then [ "$mode" = --git ] && exit 0; die "$H pushes as no account (mesh/machines); name one to use anyway"; fi
+KEYNAME=$(field "$ACCT" 2)
+[ -n "$KEYNAME" ] || die "no account '$ACCT' in mesh/accounts"
+KEY=$S/$KEYNAME NEW=$S/$KEYNAME.new
+GIT_AS=$(field "$ACCT" 3)
+PRIMARY=; field "$ACCT" 4 | grep -qE '(^| )github\.com( |$)' && PRIMARY=1
+BK=$S/backups; stamp=$(date +%Y%m%d-%H%M%S)
+
+fp() { ssh-keygen -lf "$1" 2>/dev/null | cut -d' ' -f2; }
+blob() { awk '{print $2}' "$1"; }
+# does GitHub take this key, on its own (no agent, no ssh config), as $ACCT?
+works() {
+  SSH_AUTH_SOCK= ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=10 -o IdentitiesOnly=yes \
+    -o UserKnownHostsFile="$KH" -o StrictHostKeyChecking=yes -i "$1" \
+    -T git@github.com 2>&1 | grep -q "^Hi $ACCT!"
+}
+# the account's signing keys, from GitHub's public API: "type key" per line
+signing_keys() {
+  j=$(curl -fsS "https://api.github.com/users/$ACCT/ssh_signing_keys" 2>/dev/null) || return 1
+  f=$(mktemp); printf '%s' "$j" > "$f"; i=0
+  while k=$(plutil -extract "$i.key" raw -o - "$f" 2>/dev/null); do echo "$k"; i=$((i+1)); done
+  rm -f "$f"
+}
+signs() { signing_keys | awk '{print $2}' | grep -qx "$(blob "$1")"; }
+
+# ---- git: identity, remotes, signing, allowed_signers --------------------
+git_setup() {
+  [ -n "$PRIMARY" ] || return 0   # only the plain-github.com account sets git up
+  if [ "$GIT_AS" != - ]; then
+    name=${GIT_AS% <*} email=${GIT_AS##*<}; email=${email%>}
+    [ "$(git config --global user.name || true)" = "$name" ] || { git config --global user.name "$name"; echo "· git user.name: $name"; }
+    [ "$(git config --global user.email || true)" = "$email" ] || { git config --global user.email "$email"; echo "· git user.email: $email"; }
+  fi
+  # Dorky-Robot remotes written as https go over this key, so no gh token is
+  # needed; the org is named rather than all of github.com so Homebrew taps
+  # and public clones keep working with no key at all.
+  git config --global url."git@github.com:Dorky-Robot/".insteadOf "https://github.com/Dorky-Robot/"
+  if [ -f "$KEY" ]; then
+    git config --global gpg.format ssh
+    git config --global gpg.ssh.program /usr/bin/ssh-keygen
+    git config --global user.signingkey "$KEY"
+    git config --global gpg.ssh.allowedSignersFile "$S/allowed_signers"
+    git config --global commit.gpgsign true
+    # every key GitHub will call Verified for this account, plus this machine's
+    # own even before it is added there, so `git log --show-signature` checks
+    # commits from every machine, not only this one
+    email=$(git config --global user.email || echo "$ACCT@users.noreply.github.com")
+    t=$(mktemp)
+    { signing_keys || true; awk '{print $1, $2}' "$KEY.pub"; } | awk 'NF && !seen[$2]++' \
+      | sed "s/^/$email namespaces=\"git\" /" > "$t"
+    if ! cmp -s "$t" "$S/allowed_signers" 2>/dev/null; then
+      [ -f "$S/allowed_signers" ] && { mkdir -p "$BK"; cp "$S/allowed_signers" "$BK/allowed_signers.$stamp"; }
+      mv "$t" "$S/allowed_signers"; chmod 644 "$S/allowed_signers"
+      echo "· ~/.ssh/allowed_signers: $(wc -l < "$S/allowed_signers" | tr -d ' ') key(s)"
+    else rm -f "$t"; fi
+  elif [ "$(git config --global commit.gpgsign || true)" = true ]; then
+    # signing with a key that is not there fails every commit
+    git config --global --unset commit.gpgsign
+    echo "· commit signing off until this machine has a key: run github-key-setup"
+  fi
+}
+
+check() {
+  ok=1
+  if works "$KEY"; then echo "✓ signs in to GitHub as $ACCT with $(fp "$KEY.pub")"
+  else echo "✗ GitHub does not take $KEY as $ACCT"; ok=; fi
+  if [ -n "$PRIMARY" ]; then
+    if signs "$KEY"; then echo "✓ it is a signing key on GitHub: commits show Verified"
+    else echo "✗ not a signing key on GitHub: add the same key again, Key type: Signing Key"; ok=; fi
+    P=https://github.com/Dorky-Robot/tunnels.git
+    if git ls-remote "$P" HEAD >/dev/null 2>&1; then echo "✓ pulls from Dorky-Robot"; else echo "✗ cannot pull from Dorky-Robot"; ok=; fi
+    t=$(mktemp -d)
+    git -C "$t" init -q && git -C "$t" -c user.name=probe -c user.email=probe@invalid -c commit.gpgsign=false commit -q --allow-empty -m probe
+    if git -C "$t" push --dry-run "$P" HEAD:refs/heads/zz-probe 2>&1 | grep -q 'new branch'; then echo "✓ pushes to Dorky-Robot (dry run)"; else echo "✗ cannot push to Dorky-Robot"; ok=; fi
+    rm -rf "$t"
+  fi
+  [ -n "$ok" ]
+}
+
+wait_for() {  # wait_for <test> <what to ask for>
+  if [ -t 0 ]; then
+    until "$1" "$NEW"; do printf '%s — press Enter once it is added (Ctrl-C to stop, and come back later) ' "$2"; read -r _; done
+  else
+    echo "$2. Then run github-key-setup again."; exit 0
+  fi
+}
+
+case "$mode" in
+  --git)   git_setup; exit 0 ;;
+  --check) check; exit ;;
+  --clean)
+    works "$KEY" || die "$KEY does not work yet; keeping what it replaced"
+    for f in "$BK/$KEYNAME".*; do [ -e "$f" ] || continue; rm -f "$f"; echo "· deleted $f"; done
+    exit 0 ;;
+esac
+
+# ---- the key ----------------------------------------------------------------
+mkdir -p "$S"; chmod 700 "$S"
+comment=$(cut -d' ' -f3- "$KEY.pub" 2>/dev/null || true)
+if [ -f "$KEY" ] && { [ "$comment" = "$H github" ] || [ "$comment" = "$H github:$ACCT" ]; } && works "$KEY"; then
+  echo "· $KEY is this machine's own, and GitHub takes it"
+else
+  [ -f "$NEW" ] || ssh-keygen -q -t ed25519 -N "" -C "$H github:$ACCT" -f "$NEW"
+  if ! works "$NEW"; then
+    clip=; pbcopy < "$NEW.pub" 2>/dev/null && clip=" (it is on this Mac's clipboard)"
+    kinds="Authentication Key"; [ -n "$PRIMARY" ] && kinds="Authentication Key, and again as Signing Key"
+    printf '\nAdd this to GitHub as %s — https://github.com/settings/keys → New SSH key\ntitle "%s", key type: %s%s:\n\n' "$ACCT" "$H" "$kinds" "$clip"
+    cat "$NEW.pub"; echo
+    wait_for works "Signed in as $ACCT? not yet"
+  fi
+  if [ -n "$PRIMARY" ] && ! signs "$NEW"; then
+    wait_for signs "It signs in; now add the same key as a Signing Key too"
+  fi
+  if [ -f "$KEY" ]; then
+    mkdir -p "$BK"; mv "$KEY" "$BK/$KEYNAME.$stamp"; [ -f "$KEY.pub" ] && mv "$KEY.pub" "$BK/$KEYNAME.$stamp.pub"
+    echo "· the key it replaces is in $BK until --clean"
+  fi
+  mv "$NEW" "$KEY"; mv "$NEW.pub" "$KEY.pub"
+  echo "· $KEY is this machine's own now ($(fp "$KEY.pub"))"
+fi
+
+git_setup
+check
