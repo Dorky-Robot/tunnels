@@ -61,9 +61,28 @@ Then, in the admin console, for **every machine you cannot walk to**:
   silently — which is the exact failure this is insurance against, on a
   timer. This is the one setting that turns the insurance into a time bomb
   if skipped.
-- Turn on **Screen Sharing** (System Settings → General → Sharing) and reach
-  it over the tailnet. ssh cannot fix a Mac sitting at a login screen; a
-  screen can.
+- Turn on a screen (System Settings → General → Sharing) and reach it over
+  the tailnet. ssh cannot fix a Mac sitting at a login screen; a screen can.
+
+  Which toggle is an open question: the fleet today runs **Remote
+  Management**, not Screen Sharing, and the Sharing pane will not run both —
+  Remote Management takes over `screensharingd`. Follow the fleet rather than
+  this line (kapwa 9aa73). Either way it answers on 5900.
+
+  Reach it the tailnet way — the port is simply there, no forward, no tunnel:
+
+  ```sh
+  open vnc://felixs-mac-mini:5900
+  ```
+
+  Do **not** build an `ssh -L 5901:localhost:5900` tunnel for this. That was
+  the recipe before the tailnet existed, when the only way in was cloudflared
+  and a forward inside the ssh session was the only way to carry a screen. It
+  still works, so it is easy to keep reaching for and never notice it is two
+  commands and a spare port solving a problem you no longer have. And never
+  route 5900 — or ARD's 3283 — through cloudflared: those hostnames have no
+  Access policy in front of them, so a tunnel ingress would publish your
+  screen to anyone who knows the name.
 
 Deliberately **not** used: `tailscale up --ssh`, which replaces sshd's
 authentication with tailnet identity. It is good, and it makes your
