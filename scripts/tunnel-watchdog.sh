@@ -5,6 +5,9 @@
 #   tunnel-watchdog.sh                     every cloudflared agent this user has
 #   tunnel-watchdog.sh <label> …           just these
 #
+# Run as root (the LaunchDaemon), it looks after whoever is logged in at the
+# console; with nobody logged in there is no gui domain to look after.
+#
 # This exists because of 2026-09-21. A tunnel was restarted over the ssh
 # session the tunnel itself was carrying: `launchctl bootout` cut the wire
 # mid-command, the `bootstrap` half never ran, and a job booted OUT of its
@@ -22,6 +25,14 @@
 # update`, for fourteen hours. Loaded, so the check above passed it. launchd
 # had simply never tried; one `launchctl kickstart` each brought them up.
 set -eu
+if [ "$(id -u)" -eq 0 ]; then
+  who_=$(stat -f %Su /dev/console)
+  case "$who_" in root|loginwindow|_mbsetupuser) exit 0 ;; esac
+  HOME=$(dscl . -read "/Users/$who_" NFSHomeDirectory | sed 's/^NFSHomeDirectory: //')
+  LOG=/var/log/tunnel-watchdog.log
+else
+  LOG="$HOME/Library/Logs/tunnel-watchdog.log"
+fi
 # Given no labels, watch every cloudflared agent this user has. That keeps
 # the script *and* its plist identical on every machine in the mesh, and a
 # tunnel added next month is watched without anybody remembering to add it.
@@ -29,7 +40,7 @@ if [ "$#" -eq 0 ]; then
   set -- $(ls "$HOME/Library/LaunchAgents" 2>/dev/null | sed -n 's/^\(com\.cloudflare\.cloudflared-.*\)\.plist$/\1/p')
 fi
 # it writes its own log, so the plist needs no per-user paths
-exec >>"$HOME/Library/Logs/tunnel-watchdog.log" 2>&1
+exec >>"$LOG" 2>&1
 [ "${WATCHDOG_DRY:-}" = 1 ] && { echo "$(date -u +%FT%TZ) would watch: $*"; exit 0; }
 UID_=$(stat -f %u "$HOME")
 DOMAIN="gui/$UID_"
