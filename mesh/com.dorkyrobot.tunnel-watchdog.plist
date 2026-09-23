@@ -4,11 +4,18 @@
   <key>Label</key><string>com.dorkyrobot.tunnel-watchdog</string>
   <!-- IDENTICAL on every machine in the mesh: no per-user paths, and it
        finds its own tunnels. Bootstraps any cloudflared job that has been
-       booted out — the case KeepAlive cannot cover (2026-09-21). -->
+       booted out — the case KeepAlive cannot cover (2026-09-21) — and
+       kickstarts any agent loaded but never started (2026-09-23). -->
   <key>ProgramArguments</key><array>
     <string>/bin/sh</string><string>-c</string>
     <string>exec /bin/sh "$HOME/.local/bin/tunnel-watchdog.sh"</string>
   </array>
-  <key>StartInterval</key><integer>300</integer>
+  <!-- Every five minutes by the clock, not StartInterval. After the macOS 27
+       upgrade (2026-09-23) launchd left every RunAtLoad/StartInterval agent
+       at runs = 0 for fourteen hours, this one included; the only agents
+       that ran were StartCalendarInterval ones. -->
+  <key>StartCalendarInterval</key><array>
+    <dict><key>Minute</key><integer>0</integer></dict><dict><key>Minute</key><integer>5</integer></dict><dict><key>Minute</key><integer>10</integer></dict><dict><key>Minute</key><integer>15</integer></dict><dict><key>Minute</key><integer>20</integer></dict><dict><key>Minute</key><integer>25</integer></dict><dict><key>Minute</key><integer>30</integer></dict><dict><key>Minute</key><integer>35</integer></dict><dict><key>Minute</key><integer>40</integer></dict><dict><key>Minute</key><integer>45</integer></dict><dict><key>Minute</key><integer>50</integer></dict><dict><key>Minute</key><integer>55</integer></dict>
+  </array>
   <key>RunAtLoad</key><true/>
 </dict></plist>

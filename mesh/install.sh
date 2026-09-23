@@ -16,9 +16,9 @@
 #   ~/.ssh/config.d/machines, accounts  the inventory, for desktop and github-key-setup
 #   ~/.ssh/authorized_keys              the mesh block: every machine's mesh key
 #   ~/.local/bin/github-key-setup       this machine's own GitHub key, and git set up for it
-#   ~/.local/bin/tunnel-watchdog.sh     brings back a tunnel that was booted out
+#   ~/.local/bin/tunnel-watchdog.sh     brings back a tunnel booted out, starts agents launchd forgot
 #   ~/.local/bin/desktop + symlinks     desktop-<machine>, a screen in one word
-#   com.dorkyrobot.tunnel-watchdog      runs it every five minutes, finds its own tunnels
+#   com.dorkyrobot.tunnel-watchdog      runs it every five minutes by the clock, finds its own tunnels
 #
 # What it does NOT do, because it cannot be done from one machine:
 #   - make this machine's mesh key or GitHub key (docs/remote-access.md,
