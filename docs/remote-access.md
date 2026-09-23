@@ -178,25 +178,46 @@ untested backdoor is a rumour.
 
 ## The mesh, set up identically
 
-Every machine carries the same setup, byte for byte, from `mesh/`:
+Every machine carries the same setup, byte for byte, from `mesh/`. The
+machines and GitHub accounts are listed once, and the rest is generated:
 
-| file | what it is |
+| edit this | what it is |
 |---|---|
-| `~/.ssh/config.d/mesh.conf` | every box, reachable three ways, by the same names everywhere |
-| `~/.ssh/config.d/mesh_known_hosts` | each box's host keys, read from that box's own `/etc/ssh` |
-| `~/.local/bin/tunnel-watchdog.sh` + its agent | finds this user's cloudflared agents and brings back any that were booted out |
+| `mesh/machines` | every machine, one line: name, tailnet host, login, address, tunnel, vnc port, GitHub account, aliases |
+| `mesh/accounts` | every GitHub account a machine can push as: its key file, its git author, its ssh names |
+| `mesh/hostkeys/<name>` | that machine's `/etc/ssh` host keys, read from the machine itself |
+| `mesh/keys/<name>.pub` | that machine's `id_mesh_ed25519.pub` |
 
-Each machine's own `~/.ssh/config` keeps whatever it had (GitHub keys and the
-like) and gains one line, `Include ~/.ssh/config.d/mesh.conf`, placed after any
-Includes already at the top — an Include written below a `Host` line would be
-scoped to that host alone. `sh mesh/install.sh` does all of it and is safe to
-re-run.
+`sh mesh/build` turns those into the files below and `sh mesh/build --check`
+says whether what is committed is what they make; install.sh refuses to run
+if it is not.
 
-**Change it here, then push it everywhere.** Edit `mesh/mesh.conf`, commit,
-and run `mesh/install.sh` on each machine. A copy edited in place on one box
-is how one machine quietly stops reaching another while the rest look fine.
+| on every machine | from | what it is |
+|---|---|---|
+| `~/.ssh/config.d/mesh.conf` | machines | every box, reachable three ways, by the same names everywhere |
+| `~/.ssh/config.d/mesh_known_hosts` | hostkeys/ | each box's host keys, under every name it answers to |
+| `~/.ssh/config.d/github.conf` | accounts | every GitHub account, by alias, with its key |
+| `~/.ssh/config.d/github_known_hosts` | GitHub | GitHub's published host keys (`build --github-hostkeys` refreshes them, checked against GitHub's published fingerprint) |
+| `~/.ssh/authorized_keys`, between markers | keys/ | every machine's mesh key; take one out of `keys/` and the next install everywhere stops letting it in |
+| `~/.local/bin/github-key-setup` | | this machine's own GitHub key, and git set up to push and sign with it |
+| `~/.local/bin/desktop` + `desktop-<name>` | machines | a screen in one word; reads the installed `machines` |
+| `~/.local/bin/tunnel-watchdog.sh` + its agent | | finds this user's cloudflared agents and brings back any that were booted out |
 
-Two things the file does on purpose, both learned the first time it went out:
+Each machine's own `~/.ssh/config` keeps whatever it had and gains one line,
+`Include ~/.ssh/config.d/*.conf`, placed after any Includes already at the
+top — an Include written below a `Host` line would be scoped to that host
+alone. GitHub blocks there are removed, since `github.conf` names the same
+keys; older mesh blocks are listed, and removed with `install.sh --tidy`
+(they are shadowed, but `IdentityFile` and `LocalForward` add up across every
+block that matches). Anything it edits is copied to `~/.ssh/backups/` first.
+`sh mesh/install.sh` does all of it and is safe to re-run.
+
+**Change it here, then push it everywhere.** Edit the inventory, `sh mesh/build`,
+commit, and run `mesh/install.sh` on each machine. A copy edited in place on
+one box is how one machine quietly stops reaching another while the rest look
+fine.
+
+Two things mesh.conf does on purpose, both learned the first time it went out:
 
 - **Every direct path says `ProxyCommand none`.** ssh takes the first value
   of each option, but only for options a block actually sets — so a box's
@@ -206,19 +227,50 @@ Two things the file does on purpose, both learned the first time it went out:
 - **The tunnel's ProxyCommand finds cloudflared on PATH**, because mac2019 is
   Intel and keeps Homebrew in `/usr/local`, not `/opt/homebrew`.
 
+### GitHub
+
+One key per machine per account, made on that machine by `github-key-setup`
+and never copied: retiring a machine is deleting one key on GitHub. It is an
+SSH key rather than a `gh auth login` because, on 2026-09-23, every new gh
+login revoked the previous machine's token, and pushes died one box at a time.
+
+- `github-key-setup` makes the key for this machine's account (the `github`
+  column), prints it, and waits while you add it at
+  https://github.com/settings/keys **twice** — as an Authentication Key and
+  again as a Signing Key — then swaps it in, sets git's author, turns on
+  commit signing, and proves pull and a dry-run push. Until GitHub takes the
+  new key it sits at `<key>.new`, so a machine is never without a working one.
+- `github-key-setup --check` proves it again; `--clean` deletes the key it
+  replaced (kept in `~/.ssh/backups/` until then).
+- `~/.ssh/allowed_signers` is every signing key GitHub lists for the account,
+  so `git log --show-signature` verifies commits from every machine.
+- Dorky-Robot remotes written as `https://github.com/Dorky-Robot/…` go over
+  the key too (`url.git@github.com:Dorky-Robot/.insteadOf`), so no machine
+  needs a gh token to push.
+
+**Another account** is a line in `mesh/accounts` with its own alias
+(`github.com-<account>`) and key file, then `sh mesh/build` and install. On a
+machine that should use it, `github-key-setup <account>`. A repo picks the
+account by the alias in its remote: `git@github.com-nerdnest:org/repo.git`.
+
 ### Adding a machine
 
-The keys cannot be done from one machine, so this part is by hand:
-
 1. On the new machine: `ssh-keygen -t ed25519 -N "" -C "mesh:$(hostname -s)" -f ~/.ssh/id_mesh_ed25519`
-2. Append its `.pub` to `~/.ssh/authorized_keys` on every other machine, and
-   every other machine's `id_mesh_ed25519.pub` to the new one's.
-3. Add its host keys to `mesh/mesh_known_hosts` — **read from the machine
-   itself** (`cat /etc/ssh/ssh_host_*_key.pub` over a path you already
-   trust), never from `ssh-keyscan` alone — and its three Host blocks to
-   `mesh/mesh.conf`. Commit.
-4. `sh mesh/install.sh` on every machine, then run the matrix in the next
-   section from each one.
+2. Copy that `.pub` into `mesh/keys/<name>.pub`, and its host keys —
+   `cat /etc/ssh/ssh_host_ed25519_key.pub /etc/ssh/ssh_host_rsa_key.pub` —
+   into `mesh/hostkeys/<name>`. **Read them from the machine itself** over a
+   path you already trust (its screen, or a machine already in the mesh on the
+   same LAN), never from `ssh-keyscan` alone: that is the step that makes
+   every later connection trustworthy.
+3. Add its line to `mesh/machines`: a free vnc port, and its GitHub account
+   (or `-`). A note about the box goes on comment lines directly above it.
+4. `sh mesh/build`, commit, push.
+5. `sh mesh/install.sh` on every machine — the others learn the new box, and
+   the new box learns them. On the new one, then `github-key-setup`.
+6. Run the matrix in the next section from each one.
+
+Taking one out is the reverse: delete its line, its `keys/` and `hostkeys/`
+files, build, commit, install everywhere, and delete its key on GitHub.
 
 ### Proving it
 
