@@ -40,16 +40,70 @@ fn cloudflared_path() -> String {
     "/opt/homebrew/bin/cloudflared".to_string()
 }
 
-fn plist_dir() -> PathBuf {
+pub fn plist_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("TUNNELS_LAUNCH_AGENTS") {
+        return PathBuf::from(p);
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("Library/LaunchAgents")
 }
 
-fn log_dir() -> PathBuf {
+pub fn log_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("TUNNELS_LOG_DIR") {
+        return PathBuf::from(p);
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("Library/Logs/tunnels")
+}
+
+/// `launchctl`, or a stand-in the tests provide so they never touch the
+/// real launchd.
+fn launchctl() -> Command {
+    Command::new(std::env::var("TUNNELS_LAUNCHCTL").unwrap_or_else(|_| "launchctl".into()))
+}
+
+/// Where a tunnel's connector token is kept: a 0600 file the plist points
+/// cloudflared at with `--token-file`. It used to sit in the plist's
+/// ProgramArguments, which is also where `ps` shows it to anyone on the box,
+/// and rotating it meant rewriting the plist and a full bootout/bootstrap.
+/// With a file, a new token is a write and a `kickstart -k`.
+pub fn token_file(tunnel_id: &str) -> PathBuf {
+    crate::config::Config::dir().join("tokens").join(tunnel_id)
+}
+
+pub fn write_token_file(token: &str) -> Result<PathBuf> {
+    let id = crate::config::decode_token(token)?.tunnel_id;
+    let path = token_file(&id);
+    let dir = path.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    crate::util::write_atomic(&path, token.as_bytes(), 0o600)?;
+    Ok(path)
+}
+
+/// Does this tunnel's plist still carry its token inline?
+pub fn plist_has_inline_token(name: &str) -> bool {
+    std::fs::read_to_string(plist_path(name))
+        .map(|s| s.contains("<string>--token</string>"))
+        .unwrap_or(false)
+}
+
+/// Does the plist on disk point at this token (inline, or via its token file)?
+pub fn plist_runs_token(name: &str, token: &str) -> bool {
+    let Ok(plist) = std::fs::read_to_string(plist_path(name)) else { return false };
+    if plist.contains(&format!("<string>{token}</string>")) {
+        return true;
+    }
+    let Ok(id) = crate::config::decode_token(token).map(|p| p.tunnel_id) else { return false };
+    let file = token_file(&id);
+    plist.contains(&format!("<string>{}</string>", file.display()))
+        && std::fs::read_to_string(&file).map(|t| t.trim() == token).unwrap_or(false)
 }
 
 pub fn label_for(name: &str) -> String {
@@ -65,6 +119,16 @@ pub fn plist_path(name: &str) -> PathBuf {
 }
 
 fn generate_plist(name: &str, token: &str) -> String {
+    // the token goes in a file beside the config, not on the command line;
+    // if the token cannot be decoded (it always can for a real one) fall
+    // back to passing it inline rather than writing a plist that cannot run
+    match write_token_file(token) {
+        Ok(path) => plist_xml(name, "--token-file", &path.to_string_lossy()),
+        Err(_) => plist_xml(name, "--token", token),
+    }
+}
+
+fn plist_xml(name: &str, flag: &str, value: &str) -> String {
     let label = label_for(name);
     let log_dir = log_dir();
     let log_dir_str = log_dir.to_string_lossy();
@@ -81,8 +145,8 @@ fn generate_plist(name: &str, token: &str) -> String {
 		<string>{cloudflared}</string>
 		<string>tunnel</string>
 		<string>run</string>
-		<string>--token</string>
-		<string>{token}</string>
+		<string>{flag}</string>
+		<string>{value}</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
@@ -108,7 +172,7 @@ pub enum Status {
 
 pub fn status(name: &str) -> Status {
     let label = label_for(name);
-    let output = Command::new("launchctl")
+    let output = launchctl()
         .args(["list", &label])
         .output();
 
@@ -185,11 +249,46 @@ fn hint_for(diag: &str) -> &'static str {
 /// Used to verify start() actually took effect, independent of which code
 /// path (bootstrap / kickstart / legacy load) we ran.
 fn is_loaded(label: &str) -> bool {
-    Command::new("launchctl")
+    launchctl()
         .args(["list", label])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+pub fn is_loaded_name(name: &str) -> bool {
+    is_loaded(&label_for(name))
+}
+
+/// Restart a loaded job in place. The job stays loaded throughout, so if the
+/// connection carrying this command dies half way, nothing is stranded —
+/// the rule from 2026-09-21.
+pub fn kickstart(name: &str) -> Result<()> {
+    let out = launchctl()
+        .args(["kickstart", "-k", &format!("{}/{}", gui_domain(), label_for(name))])
+        .output()
+        .context("launchctl kickstart")?;
+    if !out.status.success() {
+        anyhow::bail!("launchctl kickstart failed: {}{}", diagnostic(&out).trim(), hint_for(&diagnostic(&out)));
+    }
+    Ok(())
+}
+
+/// Load a job whose plist is on disk but which launchd has forgotten — the
+/// case KeepAlive cannot cover, and what the watchdog script used to do.
+pub fn bootstrap_existing(name: &str) -> Result<()> {
+    let path = plist_path(name);
+    if !path.exists() {
+        anyhow::bail!("no plist at {}", path.display());
+    }
+    let out = launchctl()
+        .args(["bootstrap", &gui_domain(), &path.to_string_lossy()])
+        .output()
+        .context("launchctl bootstrap")?;
+    if !out.status.success() && !is_already_bootstrapped(&diagnostic(&out)) {
+        anyhow::bail!("launchctl bootstrap failed: {}{}", diagnostic(&out).trim(), hint_for(&diagnostic(&out)));
+    }
+    Ok(())
 }
 
 /// Poll `is_loaded(label)` for up to ~1.5 s. `launchctl bootstrap` and
@@ -232,7 +331,7 @@ pub fn start(name: &str, token: &str) -> Result<()> {
 
     // Try modern bootstrap first, fall back to legacy load
     let domain = gui_domain();
-    let out = Command::new("launchctl")
+    let out = launchctl()
         .args(["bootstrap", &domain, &path.to_string_lossy()])
         .output()
         .context("launchctl bootstrap")?;
@@ -244,7 +343,7 @@ pub fn start(name: &str, token: &str) -> Result<()> {
             // ago — the service is registered now. Kickstart to make sure
             // it's actually running, and surface failures (previously
             // ignored via `let _ = …`).
-            let ks = Command::new("launchctl")
+            let ks = launchctl()
                 .args(["kickstart", "-k", &format!("{}/{}", domain, label)])
                 .output()
                 .context("launchctl kickstart")?;
@@ -261,7 +360,7 @@ pub fn start(name: &str, token: &str) -> Result<()> {
             // launchds). Plain `load` (not `load -w`) — `-w` rewrites the
             // user's per-domain Disabled override and would silently
             // re-enable a service the user had explicitly disabled.
-            let legacy = Command::new("launchctl")
+            let legacy = launchctl()
                 .args(["load", &path.to_string_lossy()])
                 .output()
                 .context("launchctl load (legacy fallback)")?;
@@ -310,14 +409,14 @@ pub fn stop(name: &str) -> Result<()> {
 
     // Try modern bootout first, fall back to legacy unload
     let domain = gui_domain();
-    let out = Command::new("launchctl")
+    let out = launchctl()
         .args(["bootout", &format!("{}/{}", domain, label)])
         .output();
 
     if let Ok(o) = &out {
         if !o.status.success() {
             // Fall back to legacy unload
-            let _ = Command::new("launchctl")
+            let _ = launchctl()
                 .args(["unload", &path.to_string_lossy()])
                 .output();
         }
@@ -409,6 +508,109 @@ fn detached_restart(name: &str, token: &str) -> Result<()> {
     Ok(())
 }
 
+pub const AGENT_LABEL: &str = "com.dorkyrobot.tunnels-agent";
+
+pub fn agent_plist_path() -> PathBuf {
+    plist_dir().join(format!("{AGENT_LABEL}.plist"))
+}
+
+pub fn agent_plist(exe: &str) -> String {
+    let log = log_dir().join("agent.log");
+    let log = log.to_string_lossy();
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>{AGENT_LABEL}</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>{exe}</string>
+		<string>agent</string>
+		<string>run</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>StandardOutPath</key>
+	<string>{log}</string>
+	<key>StandardErrorPath</key>
+	<string>{log}</string>
+</dict>
+</plist>"#
+    )
+}
+
+/// Install (or reinstall) the agent as a LaunchAgent and load it. Loading
+/// uses kickstart when it is already loaded, so reinstalling over ssh never
+/// leaves it booted out.
+pub fn install_agent(exe: &str) -> Result<()> {
+    let path = agent_plist_path();
+    std::fs::create_dir_all(plist_dir())?;
+    std::fs::create_dir_all(log_dir())?;
+    let changed = std::fs::read_to_string(&path).map(|old| old != agent_plist(exe)).unwrap_or(true);
+    std::fs::write(&path, agent_plist(exe))?;
+    let target = format!("{}/{AGENT_LABEL}", gui_domain());
+    if is_loaded(AGENT_LABEL) {
+        if changed {
+            // a changed plist needs a reload; hand both halves to a process
+            // that outlives this one, as restart does
+            let script = format!(
+                "launchctl bootout {target} >/dev/null 2>&1; sleep 1; launchctl bootstrap {} {} >/dev/null 2>&1",
+                gui_domain(),
+                path.display()
+            );
+            Command::new("nohup")
+                .args(["sh", "-c", &script])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+        } else {
+            launchctl().args(["kickstart", "-k", &target]).output()?;
+        }
+        return Ok(());
+    }
+    let out = launchctl().args(["bootstrap", &gui_domain(), &path.to_string_lossy()]).output()?;
+    if !out.status.success() && !is_already_bootstrapped(&diagnostic(&out)) {
+        anyhow::bail!("launchctl bootstrap failed: {}{}", diagnostic(&out).trim(), hint_for(&diagnostic(&out)));
+    }
+    Ok(())
+}
+
+pub fn uninstall_agent() -> Result<()> {
+    let _ = launchctl().args(["bootout", &format!("{}/{AGENT_LABEL}", gui_domain())]).output();
+    let _ = std::fs::remove_file(agent_plist_path());
+    Ok(())
+}
+
+pub fn agent_loaded() -> bool {
+    is_loaded(AGENT_LABEL)
+}
+
+/// Every cloudflared LaunchAgent here, by the local name in its label.
+pub fn local_labels() -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(plist_dir()) else { return Vec::new() };
+    let mut out: Vec<String> = rd
+        .flatten()
+        .filter_map(|e| {
+            let f = e.file_name().to_string_lossy().to_string();
+            let base = f.strip_suffix(".plist")?;
+            if base == LABEL_PREFIX {
+                Some("default".to_string())
+            } else {
+                base.strip_prefix(&format!("{LABEL_PREFIX}-")).map(String::from)
+            }
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 /// Read recent log lines for a tunnel
 pub fn read_logs(name: &str, lines: usize) -> Result<String> {
     let label = label_for(name);
@@ -472,14 +674,23 @@ pub fn discover_existing() -> Vec<DiscoveredTunnel> {
                         .to_string()
                 };
 
-                // Extract token via PlistBuddy
-                let output = Command::new("/usr/libexec/PlistBuddy")
-                    .args(["-c", "Print :ProgramArguments:4", &entry.path().to_string_lossy()])
-                    .output();
+                // Extract token via PlistBuddy: inline after --token, or
+                // read from the file after --token-file
+                let arg = |i: usize| {
+                    Command::new("/usr/libexec/PlistBuddy")
+                        .args(["-c", &format!("Print :ProgramArguments:{i}"), &entry.path().to_string_lossy()])
+                        .output()
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                };
+                let token = match arg(3).as_deref() {
+                    Some("--token-file") => arg(4).and_then(|p| std::fs::read_to_string(p).ok()).map(|t| t.trim().to_string()),
+                    _ => arg(4),
+                };
 
-                if let Ok(o) = output {
-                    if o.status.success() {
-                        let token = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if let Some(token) = token {
+                    {
                         if !token.is_empty() {
                             found.push(DiscoveredTunnel {
                                 name,
@@ -498,27 +709,6 @@ pub fn discover_existing() -> Vec<DiscoveredTunnel> {
 }
 
 
-/// Migrate a daemon plist: sudo unload + sudo rm, then start as LaunchAgent
-pub fn migrate_daemon(plist: &std::path::Path) -> Result<()> {
-    let path_str = plist.to_string_lossy();
-
-    // Unload from system domain
-    let _ = Command::new("sudo")
-        .args(["launchctl", "unload", &path_str])
-        .output();
-
-    // Remove the plist
-    let out = Command::new("sudo")
-        .args(["rm", "-f", &path_str])
-        .output()
-        .context("sudo rm")?;
-
-    if !out.status.success() {
-        anyhow::bail!("failed to remove {}", path_str);
-    }
-
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
@@ -526,7 +716,7 @@ mod tests {
 
     #[test]
     fn generate_plist_embeds_token() {
-        let plist = generate_plist("default", "eyJTRUNSRVQ=");
+        let plist = plist_xml("default", "--token", "eyJTRUNSRVQ=");
         assert!(plist.contains("eyJTRUNSRVQ="));
     }
 
@@ -538,14 +728,14 @@ mod tests {
         let plist_path = dir.path().join("com.cloudflare.cloudflared.plist");
 
         // Write an "old" plist
-        std::fs::write(&plist_path, generate_plist("default", "OLD_TOKEN")).unwrap();
+        std::fs::write(&plist_path, plist_xml("default", "--token", "OLD_TOKEN")).unwrap();
         assert!(std::fs::read_to_string(&plist_path).unwrap().contains("OLD_TOKEN"));
 
         // We can't call restart() directly in tests (it invokes launchctl),
         // but we can verify the contract: restart must write the plist with
         // the new token BEFORE attempting any launchctl commands.
         // Extract the plist-writing logic and verify it.
-        let new_plist = generate_plist("default", "NEW_TOKEN");
+        let new_plist = plist_xml("default", "--token", "NEW_TOKEN");
         std::fs::write(&plist_path, &new_plist).unwrap();
 
         let content = std::fs::read_to_string(&plist_path).unwrap();
@@ -583,7 +773,7 @@ mod tests {
         // /opt/homebrew/bin/cloudflared. Whatever cloudflared_path()
         // returns must be the path embedded in the generated plist.
         let expected = cloudflared_path();
-        let plist = generate_plist("default", "TOKEN");
+        let plist = plist_xml("default", "--token", "TOKEN");
         assert!(
             plist.contains(&format!("<string>{}</string>", expected)),
             "plist should embed resolved cloudflared path: {expected}\nplist: {plist}"

@@ -1,1653 +1,1862 @@
-mod app;
-mod cloudflare;
-mod config;
-mod ops;
-mod launchd;
-mod route_import;
-mod scan;
-mod ui;
+//! The command line. Every command says where it acts — this Mac, the fleet
+//! file, Cloudflare — in its help and before it acts, and carries the same
+//! in `--json`. See `scope.rs` for why.
 
-use anyhow::{Context, Result};
-use app::{AddField, App, Mode, PrefixKey, RouteField, ServiceField};
-use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-    ExecutableCommand,
-};
-use ratatui::prelude::*;
-use std::io::{Read, stdout};
+use anyhow::{Context, Result, anyhow, bail};
+use clap::{Args, Parser, Subcommand};
+use std::collections::BTreeSet;
+use std::io::IsTerminal;
 use std::time::Duration;
+use tunnels::apply::{self, Options};
+use tunnels::config::{self, Config};
+use tunnels::fleet::{self, Fleet, Route, TunnelDecl};
+use tunnels::observe::{self, Snapshot, Want};
+use tunnels::scope::{self, Scope};
+use tunnels::{cf, launchd, plan, scan, status, sync, util, web};
 
-fn main() -> Result<()> {
-    // Handle CLI args for non-interactive use
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() > 1 {
-        let json_flag = args.iter().any(|a| a == "--json" || a == "-j");
-        match args[1].as_str() {
-            "list" | "ls" => return cli_list(json_flag),
-            "import" => return cli_import(),
-            "routes" => return cli_routes(args.get(2).map(|s| s.as_str()), json_flag),
-            "route" => {
-                if args.len() < 3 {
-                    eprintln!("Usage: tunnels route <add|rm|mv|import> [args]");
-                    std::process::exit(1);
-                }
-                match args[2].as_str() {
-                    "add" => return cli_route_add(&args[3..]),
-                    "rm" | "remove" => return cli_route_rm(&args[3..]),
-                    "mv" | "rename" => return cli_route_mv(&args[3..]),
-                    "import" => return cli_route_import(&args[3..]),
-                    _ => {
-                        eprintln!("Unknown route command: {}", args[2]);
-                        std::process::exit(1);
-                    }
-                }
-            }
-            "start" => return cli_start(args.get(2).map(|s| s.as_str())),
-            "stop" => return cli_stop(args.get(2).map(|s| s.as_str())),
-            "restart" => return cli_restart(args.get(2).map(|s| s.as_str())),
-            "logs" => return cli_logs(args.get(2).map(|s| s.as_str()), &args[2..]),
-            "add" => return cli_add(&args[2..]),
-            "rm" | "remove" => return cli_rm(args.get(2).map(|s| s.as_str())),
-            "rename" => return cli_rename(&args[2..]),
-            "token" => {
-                if args.len() < 3 {
-                    eprintln!("Usage: tunnels token <add|list|rm|edit> [args]");
-                    std::process::exit(1);
-                }
-                match args[2].as_str() {
-                    "add" => return cli_token_add(args.get(3).map(|s| s.as_str())),
-                    "list" | "ls" => return cli_token_list(),
-                    "rm" | "remove" => return cli_token_rm(args.get(3).map(|s| s.as_str())),
-                    "edit" => return cli_token_edit(&args[3..]),
-                    _ => {
-                        eprintln!("Unknown token command: {}", args[2]);
-                        std::process::exit(1);
-                    }
-                }
-            }
-            "service" => {
-                if args.len() < 3 {
-                    eprintln!("Usage: tunnels service <list|add|rm|edit|scan> [args]");
-                    std::process::exit(1);
-                }
-                match args[2].as_str() {
-                    "list" | "ls" => return cli_service_list(json_flag),
-                    "add" => return cli_service_add(&args[3..]),
-                    "rm" | "remove" => return cli_service_rm(&args[3..]),
-                    "edit" => return cli_service_edit(&args[3..]),
-                    "scan" => return cli_service_scan(),
-                    _ => {
-                        eprintln!("Unknown service command: {}", args[2]);
-                        std::process::exit(1);
-                    }
-                }
-            }
-            "sync" => return cli_sync(),
-            "heal" => return cli_heal(),
-            "--version" | "-v" | "-V" => {
-                println!("tunnels {}", env!("CARGO_PKG_VERSION"));
-                return Ok(());
-            }
-            "help" | "--help" | "-h" => {
-                print_help();
-                return Ok(());
-            }
-            _ => {}
-        }
-    }
-
-    // TUI mode
-    enable_raw_mode()?;
-    stdout().execute(EnterAlternateScreen)?;
-
-    let backend = CrosstermBackend::new(stdout());
-    let mut terminal = Terminal::new(backend)?;
-
-    let mut app = App::new();
-    let result = run_loop(&mut terminal, &mut app);
-
-    disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
-
-    result
+#[derive(Parser)]
+#[command(
+    name = "tunnels",
+    version,
+    about = "Cloudflare tunnels across a fleet of Macs: a config file, a CLI, an agent on every machine.",
+    long_about = "Cloudflare tunnels across a fleet of Macs.\n\n\
+        The fleet file (~/.config/tunnels/fleet.toml) says which machine runs which tunnel and where \
+        every hostname goes. `tunnels plan` shows how Cloudflare and this Mac differ from it; \
+        `tunnels apply` closes the gap; the agent on each machine keeps closing it.\n\n\
+        Every command says where it acts: [this Mac only], [read-only], [fleet file + cloudflare], …",
+    after_help = "Start here:\n  tunnels status            everything, everywhere\n  tunnels import            write the fleet file from what exists\n  tunnels agent install     keep this Mac in line, serve the web UI\n\nConfig: ~/.config/tunnels/  ·  Logs: ~/Library/Logs/tunnels/  ·  Docs: https://github.com/Dorky-Robot/tunnels"
+)]
+struct Cli {
+    /// machine-readable output
+    #[arg(long, short = 'j', global = true)]
+    json: bool,
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
 }
 
-fn run_loop(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut App) -> Result<()> {
-    loop {
-        app.spinner_tick = app.spinner_tick.wrapping_add(1);
-        app.poll_bg();
+#[derive(Subcommand)]
+enum Cmd {
+    /// [read-only] Every tunnel, connector, route and DNS record across every account; what differs from the fleet file
+    Status {
+        /// only this Mac: its tunnels and LaunchAgents, no Cloudflare
+        #[arg(long)]
+        local: bool,
+    },
+    /// [read-only] What `apply` would change to match the fleet file (exit 2 when there is something to do)
+    Plan,
+    /// [this Mac + cloudflare] Make Cloudflare and this Mac match the fleet file
+    Apply(ApplyArgs),
+    /// [read-only] Only the problems: down tunnels, orphans, dead origins, missing DNS
+    Doctor,
+    /// [fleet file + cloudflare] Write this Mac and what it runs into the fleet file (merges; never removes)
+    Import {
+        /// this machine's name in the fleet (default: its hostname)
+        #[arg(long)]
+        machine: Option<String>,
+        /// the name other machines reach this one by on the tailnet (default: its hostname)
+        #[arg(long)]
+        host: Option<String>,
+        /// show what would be added, write nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// The fleet file itself
+    #[command(subcommand)]
+    Fleet(FleetCmd),
+    /// Hostnames: where each goes
+    #[command(subcommand)]
+    Route(RouteCmd),
+    /// [fleet file + cloudflare] Send a hostname's traffic to its standby now
+    Promote { host: String },
+    /// [fleet file + cloudflare] Send a hostname's traffic back to its primary
+    Failback { host: String },
+    /// Tunnels: create, run, forget, destroy, rotate
+    #[command(subcommand)]
+    Tunnel(TunnelCmd),
+    /// Cloudflare API tokens on this Mac
+    #[command(subcommand)]
+    Token(TokenCmd),
+    /// The agent that keeps this Mac in line and serves the web UI
+    #[command(subcommand)]
+    Agent(AgentCmd),
+    /// [read-only] Print (or open) this Mac's web UI address
+    Web {
+        #[arg(long)]
+        open: bool,
+    },
+    /// [this Mac only] Listening TCP ports here, and which project each belongs to
+    Scan,
 
-        terminal.draw(|f| ui::draw(f, app))?;
+    // --- the old commands, kept so scripts keep working
+    #[command(hide = true, alias = "ls")]
+    List,
+    #[command(hide = true)]
+    Routes { tunnel: Option<String> },
+    #[command(hide = true)]
+    Start { name: String },
+    #[command(hide = true)]
+    Stop { name: String },
+    #[command(hide = true)]
+    Restart { name: String },
+    #[command(hide = true)]
+    Logs {
+        name: String,
+        #[arg(long, default_value_t = 50)]
+        lines: usize,
+    },
+    #[command(hide = true)]
+    Add {
+        name: String,
+        #[arg(long)]
+        token: String,
+    },
+    #[command(hide = true, alias = "remove")]
+    Rm { name: Option<String> },
+    #[command(hide = true)]
+    Sync,
+    #[command(hide = true)]
+    Heal,
+}
 
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
+#[derive(Args, Clone, Default)]
+struct ApplyArgs {
+    /// also take hostnames from tunnels serving them now (live takeovers)
+    #[arg(long)]
+    yes: bool,
+    /// also remove ingress and DNS the fleet file does not mention
+    #[arg(long)]
+    prune: bool,
+    /// also destroy tunnels marked `destroy = true` — kills their connector tokens
+    #[arg(long)]
+    allow_destroy: bool,
+    /// only actions about this hostname (repeatable)
+    #[arg(long = "host")]
+    hosts: Vec<String>,
+    /// leave this Mac's LaunchAgents alone
+    #[arg(long)]
+    no_local: bool,
+}
 
-                if app.loading.is_some() {
-                    continue;
-                }
+#[derive(Subcommand)]
+enum FleetCmd {
+    /// [this Mac only] Print the fleet file
+    Show,
+    /// [this Mac only] Print where the fleet file is
+    Path,
+    /// [this Mac only] Check the fleet file
+    Validate,
+    /// [fleet file + cloudflare] Edit the fleet file in $EDITOR; checked and shared with the other machines when you save
+    Edit,
+    /// [this Mac only] Earlier versions of the fleet file kept here
+    History,
+    /// [this Mac only] Take the fleet file from another machine's agent
+    Join {
+        /// the machine to take it from (tailnet name or address)
+        host: String,
+        /// this machine's name in the fleet
+        #[arg(long)]
+        machine: Option<String>,
+        #[arg(long, default_value_t = fleet::DEFAULT_WEB_PORT)]
+        port: u16,
+    },
+    /// [this Mac only] Take the newest fleet file from the peers now, and tell them about ours
+    Sync,
+}
 
-                match &app.mode {
-                    Mode::Normal => handle_normal(app, key.code),
-                    Mode::Prefix(prefix) => {
-                        let p = *prefix;
-                        handle_prefix(app, p, key.code);
-                    }
-                    Mode::ContextMenu { .. } => handle_context_menu(app, key.code),
-                    Mode::Adding { .. } => handle_adding(app, key.code),
-                    Mode::Editing { .. } => handle_editing(app, key.code),
-                    Mode::Renaming { .. } => handle_renaming(app, key.code),
-                    Mode::Confirming { .. } => handle_confirming(app, key.code),
-                    Mode::Migrating { .. } => handle_migrating(app, key.code),
-                    Mode::AddingService { .. } => handle_adding_service(app, key.code),
-                    Mode::EditingService { .. } => handle_editing_service(app, key.code),
-                    Mode::ConfirmingServiceDelete { .. } => handle_confirming_service_delete(app, key.code),
-                    Mode::ApiTokens { .. } => handle_api_tokens(app, key.code),
-                    Mode::AddingApiToken { .. } => handle_adding_api_token(app, key.code),
-                    Mode::Routes { .. } => handle_routes(app, key.code),
-                    Mode::AddingRoute { .. } => handle_adding_route(app, key.code),
-                    Mode::RenamingRoute { .. } => handle_renaming_route(app, key.code),
-                    Mode::ConfirmingRouteDelete { .. } => handle_confirming_route_delete(app, key.code),
-                    Mode::Logs { .. } | Mode::Help => {
-                        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-                            app.mode = Mode::Normal;
-                        }
-                    }
-                }
+#[derive(Subcommand)]
+enum RouteCmd {
+    /// [read-only] Every hostname: its tunnel, service, and where DNS really sends it
+    #[command(alias = "ls")]
+    List {
+        #[arg(long)]
+        tunnel: Option<String>,
+    },
+    /// [fleet file + cloudflare] Send a hostname to a service through a tunnel (adds or updates; idempotent)
+    Add {
+        host: String,
+        /// a port on the tunnel's machine (3000) or a URL (http://localhost:3000, ssh://localhost:22)
+        service: String,
+        #[arg(long)]
+        tunnel: String,
+        /// a second tunnel that also carries it, for failover
+        #[arg(long)]
+        standby: Option<String>,
+        /// manual (default) or auto
+        #[arg(long)]
+        failover: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+        /// only write the fleet file; let the agents carry it out
+        #[arg(long)]
+        no_apply: bool,
+        /// allow taking the hostname from a tunnel serving it now
+        #[arg(long)]
+        yes: bool,
+    },
+    /// [fleet file + cloudflare] Stop routing a hostname: its ingress and DNS go
+    #[command(alias = "remove")]
+    Rm {
+        host: String,
+        #[arg(long)]
+        no_apply: bool,
+    },
+    /// [fleet file + cloudflare] Rename a hostname, keeping its tunnel and service
+    #[command(alias = "rename")]
+    Mv {
+        old: String,
+        new: String,
+        #[arg(long)]
+        no_apply: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum TunnelCmd {
+    /// [this Mac only] Tunnels this Mac has connector tokens for, and their LaunchAgents
+    #[command(alias = "ls")]
+    List,
+    /// [this Mac only] Start a tunnel here
+    Start { name: String },
+    /// [this Mac only] Stop a tunnel here (the agent starts it again if the fleet says it runs here)
+    Stop { name: String },
+    /// [this Mac only] Restart a tunnel here (safe over the ssh it carries)
+    Restart { name: String },
+    /// [this Mac only] A tunnel's cloudflared logs
+    Logs {
+        name: String,
+        #[arg(long, default_value_t = 50)]
+        lines: usize,
+    },
+    /// [this Mac only] Keep a connector token here under a name
+    Add {
+        name: String,
+        #[arg(long)]
+        token: String,
+    },
+    /// [this Mac only] Stop a tunnel here and delete its token and LaunchAgent here. Nothing in Cloudflare changes: the tunnel and its tokens keep working
+    Forget { name: String },
+    /// [this Mac + cloudflare] DELETE a tunnel in Cloudflare: its DNS, its connections, the tunnel. Every connector token for it stops working
+    Destroy {
+        tunnel: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// [this Mac + cloudflare] Give a tunnel a new secret: every old connector token stops working; agents fetch the new one
+    Rotate { tunnel: String },
+    /// [fleet file + cloudflare] Create a tunnel in Cloudflare and add it to the fleet
+    Create {
+        alias: String,
+        /// the fleet account to create it in
+        #[arg(long)]
+        account: String,
+        /// the machine that should run it
+        #[arg(long)]
+        machine: Option<String>,
+    },
+    /// [fleet file + cloudflare] Add an existing Cloudflare tunnel to the fleet
+    Adopt {
+        /// its id, or its Cloudflare name
+        tunnel: String,
+        #[arg(long = "as")]
+        alias: String,
+        #[arg(long)]
+        machine: Option<String>,
+    },
+    /// [fleet file + cloudflare] Change which machine runs a tunnel (--none: no fleet machine)
+    Assign {
+        tunnel: String,
+        #[arg(long, conflicts_with = "none")]
+        machine: Option<String>,
+        #[arg(long)]
+        none: bool,
+    },
+    /// [fleet file + cloudflare] Rename a tunnel's alias in the fleet file (Cloudflare's name is untouched)
+    Rename { old: String, new: String },
+    /// [this Mac only] Take in cloudflared LaunchAgents this Mac's config does not know
+    ImportPlists,
+}
+
+#[derive(Subcommand)]
+enum TokenCmd {
+    /// [this Mac; reads cloudflare] Keep a Cloudflare API token here, after finding out what it reaches
+    Add { token: String },
+    /// [this Mac only] The API tokens here, and the accounts and domains each reaches
+    #[command(alias = "ls")]
+    List,
+    /// [this Mac only] Forget an API token, by its number in `token list`
+    #[command(alias = "remove")]
+    Rm { index: usize },
+}
+
+#[derive(Subcommand)]
+enum AgentCmd {
+    /// [this Mac + cloudflare] Run the agent in the foreground (launchd does this)
+    Run,
+    /// [this Mac + cloudflare] One agent pass, now, in the foreground
+    Once,
+    /// [this Mac only] Install the agent as a LaunchAgent and start it
+    Install,
+    /// [this Mac only] Stop the agent and remove its LaunchAgent
+    Uninstall,
+    /// [this Mac only] Is the agent running, and what has it done lately
+    Status,
+}
+
+/// Every command's scope, in one place. The dispatcher declares it before
+/// running anything, and `a_commands_help_says_its_scope` holds the help
+/// text to it.
+const SCOPES: &[(&str, Scope)] = &[
+    ("status", Scope::ReadOnly),
+    ("plan", Scope::ReadOnly),
+    ("apply", Scope::LocalAndCloudflare),
+    ("doctor", Scope::ReadOnly),
+    ("import", Scope::Fleet),
+    ("fleet show", Scope::Local),
+    ("fleet path", Scope::Local),
+    ("fleet validate", Scope::Local),
+    ("fleet edit", Scope::Fleet),
+    ("fleet history", Scope::Local),
+    ("fleet join", Scope::Local),
+    ("fleet sync", Scope::Local),
+    ("route list", Scope::ReadOnly),
+    ("route add", Scope::Fleet),
+    ("route rm", Scope::Fleet),
+    ("route mv", Scope::Fleet),
+    ("promote", Scope::Fleet),
+    ("failback", Scope::Fleet),
+    ("tunnel list", Scope::Local),
+    ("tunnel start", Scope::Local),
+    ("tunnel stop", Scope::Local),
+    ("tunnel restart", Scope::Local),
+    ("tunnel logs", Scope::Local),
+    ("tunnel add", Scope::Local),
+    ("tunnel forget", Scope::Local),
+    ("tunnel destroy", Scope::LocalAndCloudflare),
+    ("tunnel rotate", Scope::LocalAndCloudflare),
+    ("tunnel create", Scope::Fleet),
+    ("tunnel adopt", Scope::Fleet),
+    ("tunnel assign", Scope::Fleet),
+    ("tunnel rename", Scope::Fleet),
+    ("tunnel import-plists", Scope::Local),
+    ("token add", Scope::LocalReadsCloudflare),
+    ("token list", Scope::Local),
+    ("token rm", Scope::Local),
+    ("agent run", Scope::LocalAndCloudflare),
+    ("agent once", Scope::LocalAndCloudflare),
+    ("agent install", Scope::Local),
+    ("agent uninstall", Scope::Local),
+    ("agent status", Scope::Local),
+    ("web", Scope::ReadOnly),
+    ("scan", Scope::Local),
+];
+
+fn scope_of(path: &str) -> Scope {
+    SCOPES.iter().find(|(p, _)| *p == path).map(|(_, s)| *s).unwrap_or(Scope::LocalAndCloudflare)
+}
+
+fn cmd_path(cmd: &Cmd) -> String {
+    match cmd {
+        Cmd::Status { local: true } => "tunnel list".into(),
+        Cmd::Status { .. } => "status".into(),
+        Cmd::Plan => "plan".into(),
+        Cmd::Apply(_) => "apply".into(),
+        Cmd::Doctor => "doctor".into(),
+        Cmd::Import { .. } => "import".into(),
+        Cmd::Fleet(f) => format!(
+            "fleet {}",
+            match f {
+                FleetCmd::Show => "show",
+                FleetCmd::Path => "path",
+                FleetCmd::Validate => "validate",
+                FleetCmd::Edit => "edit",
+                FleetCmd::History => "history",
+                FleetCmd::Join { .. } => "join",
+                FleetCmd::Sync => "sync",
             }
-        }
-
-        if app.should_quit {
-            return Ok(());
-        }
+        ),
+        Cmd::Route(r) => format!(
+            "route {}",
+            match r {
+                RouteCmd::List { .. } => "list",
+                RouteCmd::Add { .. } => "add",
+                RouteCmd::Rm { .. } => "rm",
+                RouteCmd::Mv { .. } => "mv",
+            }
+        ),
+        Cmd::Promote { .. } => "promote".into(),
+        Cmd::Failback { .. } => "failback".into(),
+        Cmd::Tunnel(t) => format!(
+            "tunnel {}",
+            match t {
+                TunnelCmd::List => "list",
+                TunnelCmd::Start { .. } => "start",
+                TunnelCmd::Stop { .. } => "stop",
+                TunnelCmd::Restart { .. } => "restart",
+                TunnelCmd::Logs { .. } => "logs",
+                TunnelCmd::Add { .. } => "add",
+                TunnelCmd::Forget { .. } => "forget",
+                TunnelCmd::Destroy { .. } => "destroy",
+                TunnelCmd::Rotate { .. } => "rotate",
+                TunnelCmd::Create { .. } => "create",
+                TunnelCmd::Adopt { .. } => "adopt",
+                TunnelCmd::Assign { .. } => "assign",
+                TunnelCmd::Rename { .. } => "rename",
+                TunnelCmd::ImportPlists => "import-plists",
+            }
+        ),
+        Cmd::Token(t) => format!(
+            "token {}",
+            match t {
+                TokenCmd::Add { .. } => "add",
+                TokenCmd::List => "list",
+                TokenCmd::Rm { .. } => "rm",
+            }
+        ),
+        Cmd::Agent(a) => format!(
+            "agent {}",
+            match a {
+                AgentCmd::Run => "run",
+                AgentCmd::Once => "once",
+                AgentCmd::Install => "install",
+                AgentCmd::Uninstall => "uninstall",
+                AgentCmd::Status => "status",
+            }
+        ),
+        Cmd::Web { .. } => "web".into(),
+        Cmd::Scan => "scan".into(),
+        Cmd::List => "tunnel list".into(),
+        Cmd::Routes { .. } => "route list".into(),
+        Cmd::Start { .. } => "tunnel start".into(),
+        Cmd::Stop { .. } => "tunnel stop".into(),
+        Cmd::Restart { .. } => "tunnel restart".into(),
+        Cmd::Logs { .. } => "tunnel logs".into(),
+        Cmd::Add { .. } => "tunnel add".into(),
+        Cmd::Rm { .. } => "tunnel forget".into(),
+        Cmd::Sync => "status".into(),
+        Cmd::Heal => "agent once".into(),
     }
 }
 
-fn handle_normal(app: &mut App, code: KeyCode) {
-    match code {
-        KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
-        KeyCode::Char('j') | KeyCode::Down => app.move_down(),
-        KeyCode::Char('k') | KeyCode::Up => app.move_up(),
-        KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right => app.toggle_expand(),
-        KeyCode::Enter => {
-            if let Some(menu) = app.build_context_menu() {
-                app.mode = menu;
+fn main() {
+    let cli = Cli::parse();
+    let json = cli.json;
+    let cmd = cli.cmd.unwrap_or(Cmd::Status { local: false });
+    let path = cmd_path(&cmd);
+    scope::enter(scope_of(&path));
+    let code = match run(cmd, json) {
+        Ok(code) => code,
+        Err(e) => {
+            if json {
+                println!("{}", serde_json::json!({ "error": format!("{e:#}"), "scope": scope_of(&path) }));
+            } else {
+                eprintln!("✗ {e:#}");
             }
+            1
         }
-        // Prefix keys
-        KeyCode::Char('a') => app.mode = Mode::Prefix(PrefixKey::Add),
-        KeyCode::Char('t') => app.mode = Mode::Prefix(PrefixKey::Token),
-        KeyCode::Char('g') => app.mode = Mode::Prefix(PrefixKey::Global),
-        // Context-sensitive direct keys
-        KeyCode::Char('s') if app.is_tunnel_selected() => app.start_selected(),
-        KeyCode::Char('x') if app.is_tunnel_selected() => app.stop_selected(),
-        KeyCode::Char('r') if app.is_tunnel_selected() => app.restart_selected(),
-        KeyCode::Char('e') => {
-            if app.is_tunnel_selected() {
-                app.begin_edit();
-            } else if app.is_service_selected() {
-                app.begin_edit_service();
-            }
-        }
-        KeyCode::Char('n') => {
-            if app.is_tunnel_selected() {
-                app.begin_rename();
-            } else if app.is_service_selected() {
-                app.begin_rename_service_route();
-            }
-        }
-        KeyCode::Char('d') => {
-            if app.is_tunnel_selected() {
-                app.confirm_delete();
-            } else if app.is_service_selected() {
-                app.confirm_delete_service();
-            }
-        }
-        KeyCode::Char('l') if app.is_tunnel_selected() => app.show_logs(),
-        KeyCode::Char('m') if app.is_tunnel_selected() => app.begin_routes(),
-        KeyCode::Char('?') => app.mode = Mode::Help,
-        _ => {}
-    }
-}
-
-fn handle_prefix(app: &mut App, prefix: PrefixKey, code: KeyCode) {
-    match code {
-        KeyCode::Esc => app.mode = Mode::Normal,
-        _ => match prefix {
-            PrefixKey::Add => match code {
-                KeyCode::Char('t') => { app.mode = Mode::Normal; app.begin_add(); }
-                KeyCode::Char('s') => { app.mode = Mode::Normal; app.begin_add_service(); }
-                KeyCode::Char('r') => {
-                    if app.is_tunnel_selected() {
-                        app.mode = Mode::Normal;
-                        app.begin_routes();
-                    } else {
-                        app.mode = Mode::Normal;
-                        app.status_msg = Some("Select a tunnel first to add a route".into());
-                    }
-                }
-                _ => app.mode = Mode::Normal,
-            },
-            PrefixKey::Token => match code {
-                // running one machine's connectors for several Cloudflare
-                // accounts is the point of this tool, so adding one lives
-                // here, next to the token that replaces an existing one —
-                // not only under "add", where nobody thinking about
-                // connectors goes looking
-                KeyCode::Char('n') => { app.mode = Mode::Normal; app.begin_add(); }
-                KeyCode::Char('c') => {
-                    app.mode = Mode::Normal;
-                    if app.is_tunnel_selected() {
-                        app.begin_edit();
-                    } else {
-                        app.status_msg = Some("Select a tunnel to edit its connector token".into());
-                    }
-                }
-                KeyCode::Char('a') => { app.mode = Mode::Normal; app.begin_add_api_token(); }
-                KeyCode::Char('l') => { app.show_api_tokens(); }
-                _ => app.mode = Mode::Normal,
-            },
-            PrefixKey::Global => match code {
-                KeyCode::Char('s') => { app.mode = Mode::Normal; app.refresh_cf(); }
-                KeyCode::Char('p') => { app.mode = Mode::Normal; app.scan_services(); }
-                KeyCode::Char('i') => { app.mode = Mode::Normal; app.import_existing(); }
-                _ => app.mode = Mode::Normal,
-            },
-        },
-    }
-}
-
-fn handle_api_tokens(app: &mut App, code: KeyCode) {
-    let total = app.config.api_tokens().len();
-    let Mode::ApiTokens { selected } = &mut app.mode else {
-        return;
     };
-    match code {
-        KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Normal,
-        KeyCode::Char('j') | KeyCode::Down => {
-            if total > 0 && *selected + 1 < total {
-                *selected += 1;
+    std::process::exit(code);
+}
+
+/// Say where this command acts before it acts. On stderr, so `--json` output stays clean.
+fn announce(what: &str) {
+    let path_scope = current_scope_tag();
+    eprintln!("{path_scope} {what}");
+}
+
+fn current_scope_tag() -> &'static str {
+    // the scope was declared in main; recover it from the command table via argv
+    let args: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with('-')).collect();
+    for n in [2, 1] {
+        if args.len() >= n {
+            let p = args[..n].join(" ");
+            if let Some((_, s)) = SCOPES.iter().find(|(x, _)| *x == p) {
+                return s.tag();
             }
         }
-        KeyCode::Char('k') | KeyCode::Up => {
-            *selected = selected.saturating_sub(1);
+    }
+    Scope::LocalAndCloudflare.tag()
+}
+
+fn print_json(v: &impl serde::Serialize) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(v)?);
+    Ok(())
+}
+
+fn short(id: &str) -> &str {
+    &id[..8.min(id.len())]
+}
+
+fn run(cmd: Cmd, json: bool) -> Result<i32> {
+    match cmd {
+        Cmd::Status { local: true } | Cmd::List => tunnel_list(json),
+        Cmd::Status { local: false } | Cmd::Sync => status_cmd(json, false),
+        Cmd::Doctor => status_cmd(json, true),
+        Cmd::Plan => plan_cmd(json),
+        Cmd::Apply(a) => apply_cmd(a, json),
+        Cmd::Import { machine, host, dry_run } => import_cmd(machine, host, dry_run, json),
+        Cmd::Fleet(f) => fleet_cmd(f, json),
+        Cmd::Route(r) => route_cmd(r, json),
+        Cmd::Routes { tunnel } => route_cmd(RouteCmd::List { tunnel }, json),
+        Cmd::Promote { host } => switch_cmd(&host, true, json),
+        Cmd::Failback { host } => switch_cmd(&host, false, json),
+        Cmd::Tunnel(t) => tunnel_cmd(t, json),
+        Cmd::Start { name } => tunnel_cmd(TunnelCmd::Start { name }, json),
+        Cmd::Stop { name } => tunnel_cmd(TunnelCmd::Stop { name }, json),
+        Cmd::Restart { name } => tunnel_cmd(TunnelCmd::Restart { name }, json),
+        Cmd::Logs { name, lines } => tunnel_cmd(TunnelCmd::Logs { name, lines }, json),
+        Cmd::Add { name, token } => tunnel_cmd(TunnelCmd::Add { name, token }, json),
+        Cmd::Rm { name } => {
+            // `rm` said "Delete a tunnel" and only forgot it here. It is gone
+            // rather than reworded: the two things it could mean now have
+            // names that cannot be mistaken for each other.
+            let n = name.unwrap_or_else(|| "<name>".into());
+            bail!(
+                "`tunnels rm` is gone — it never deleted anything in Cloudflare. Say which you mean:\n  \
+                 tunnels tunnel forget {n}     [this Mac only] stop it here; the tunnel and its tokens keep working\n  \
+                 tunnels tunnel destroy {n}    [this Mac + cloudflare] delete it in Cloudflare; its tokens stop working"
+            )
         }
-        KeyCode::Char('a') => {
-            app.mode = Mode::Normal;
-            app.begin_add_api_token();
-        }
-        KeyCode::Char('d') => {
-            let idx = *selected;
-            if total > 0 {
-                app.forget_api_token(idx);
-            }
-        }
+        Cmd::Token(t) => token_cmd(t, json),
+        Cmd::Agent(a) => agent_cmd(a, json),
+        Cmd::Heal => agent_cmd(AgentCmd::Once, json),
+        Cmd::Web { open } => web_cmd(open, json),
+        Cmd::Scan => scan_cmd(json),
+    }
+}
+
+// ---------------------------------------------------------------- context
+
+struct Ctx {
+    config: Config,
+    fleet: Option<Fleet>,
+    me: String,
+}
+
+fn ctx() -> Result<Ctx> {
+    let config = Config::load()?;
+    let fleet = Fleet::load()?;
+    let me = fleet::this_machine(&config, fleet.as_ref());
+    Ok(Ctx { config, fleet, me })
+}
+
+/// Before changing the fleet file, take the newest copy the peers have, so
+/// this edit builds on it rather than racing it.
+fn pull_first(me: &str) {
+    match sync::pull(me, &[], Duration::from_secs(3)) {
+        Ok(Some((host, serial))) => eprintln!("  (took fleet serial {serial} from {host} first)"),
         _ => {}
     }
 }
 
-fn handle_context_menu(app: &mut App, code: KeyCode) {
-    let Mode::ContextMenu { items, selected } = &mut app.mode else {
-        return;
-    };
-
-    match code {
-        KeyCode::Esc | KeyCode::Char('q') => {
-            app.mode = Mode::Normal;
-        }
-        KeyCode::Char('j') | KeyCode::Down => {
-            if *selected < items.len() - 1 {
-                *selected += 1;
-            }
-        }
-        KeyCode::Char('k') | KeyCode::Up => {
-            if *selected > 0 {
-                *selected -= 1;
-            }
-        }
-        KeyCode::Enter => {
-            let action = items[*selected].2.clone();
-            app.execute_context_action(action);
-        }
-        KeyCode::Char(c) => {
-            // Direct shortcut key
-            if let Some(item) = items.iter().find(|(key, _, _)| *key == c) {
-                let action = item.2.clone();
-                app.execute_context_action(action);
-            }
-        }
-        _ => {}
-    }
+fn observe_all(config: &Config) -> Snapshot {
+    observe::observe(config, &Want::default())
 }
 
-fn handle_adding_service(app: &mut App, code: KeyCode) {
-    let Mode::AddingService { field, name, port, tunnel, memo } = &mut app.mode else {
-        return;
-    };
-
-    match code {
-        KeyCode::Esc => app.mode = Mode::Normal,
-        KeyCode::Tab => {
-            *field = match field {
-                ServiceField::Name => ServiceField::Port,
-                ServiceField::Port => ServiceField::Tunnel,
-                ServiceField::Tunnel => ServiceField::Memo,
-                ServiceField::Memo => ServiceField::Name,
-            };
-        }
-        KeyCode::BackTab => {
-            *field = match field {
-                ServiceField::Name => ServiceField::Memo,
-                ServiceField::Port => ServiceField::Name,
-                ServiceField::Tunnel => ServiceField::Port,
-                ServiceField::Memo => ServiceField::Tunnel,
-            };
-        }
-        KeyCode::Enter => {
-            if !name.is_empty() && !port.is_empty() {
-                let (n, p, t, m) = (name.clone(), port.clone(), tunnel.clone(), memo.clone());
-                app.finish_add_service(n, p, t, m);
-            }
-        }
-        KeyCode::Backspace => {
-            let s = match field {
-                ServiceField::Name => name,
-                ServiceField::Port => port,
-                ServiceField::Tunnel => tunnel,
-                ServiceField::Memo => memo,
-            };
-            s.pop();
-        }
-        KeyCode::Char(c) => {
-            let s = match field {
-                ServiceField::Name => name,
-                ServiceField::Port => {
-                    if c.is_ascii_digit() { port } else { return; }
-                }
-                ServiceField::Tunnel => tunnel,
-                ServiceField::Memo => memo,
-            };
-            s.push(c);
-        }
-        _ => {}
-    }
+fn fleet_or_default(c: &Ctx) -> Fleet {
+    c.fleet.clone().unwrap_or_default()
 }
 
-fn handle_editing_service(app: &mut App, code: KeyCode) {
-    let Mode::EditingService { idx, field, name, port, tunnel, memo } = &mut app.mode else {
-        return;
-    };
+// ---------------------------------------------------------------- status / plan / apply
 
-    match code {
-        KeyCode::Esc => app.mode = Mode::Normal,
-        KeyCode::Tab => {
-            *field = match field {
-                ServiceField::Name => ServiceField::Port,
-                ServiceField::Port => ServiceField::Tunnel,
-                ServiceField::Tunnel => ServiceField::Memo,
-                ServiceField::Memo => ServiceField::Name,
-            };
-        }
-        KeyCode::BackTab => {
-            *field = match field {
-                ServiceField::Name => ServiceField::Memo,
-                ServiceField::Port => ServiceField::Name,
-                ServiceField::Tunnel => ServiceField::Port,
-                ServiceField::Memo => ServiceField::Tunnel,
-            };
-        }
-        KeyCode::Enter => {
-            if !name.is_empty() && !port.is_empty() {
-                let (i, n, p, t, m) = (*idx, name.clone(), port.clone(), tunnel.clone(), memo.clone());
-                app.finish_edit_service(i, n, p, t, m);
-            }
-        }
-        KeyCode::Backspace => {
-            let s = match field {
-                ServiceField::Name => name,
-                ServiceField::Port => port,
-                ServiceField::Tunnel => tunnel,
-                ServiceField::Memo => memo,
-            };
-            s.pop();
-        }
-        KeyCode::Char(c) => {
-            let s = match field {
-                ServiceField::Name => name,
-                ServiceField::Port => {
-                    if c.is_ascii_digit() { port } else { return; }
-                }
-                ServiceField::Tunnel => tunnel,
-                ServiceField::Memo => memo,
-            };
-            s.push(c);
-        }
-        _ => {}
-    }
-}
-
-fn handle_confirming_service_delete(app: &mut App, code: KeyCode) {
-    let Mode::ConfirmingServiceDelete { idx, .. } = &app.mode else {
-        return;
-    };
-    let idx = *idx;
-
-    match code {
-        KeyCode::Char('y') | KeyCode::Char('Y') => {
-            app.delete_service(idx);
-            app.mode = Mode::Normal;
-        }
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-            app.mode = Mode::Normal;
-        }
-        _ => {}
-    }
-}
-
-fn handle_adding_api_token(app: &mut App, code: KeyCode) {
-    let Mode::AddingApiToken { input } = &mut app.mode else {
-        return;
-    };
-
-    match code {
-        KeyCode::Esc => {
-            app.mode = Mode::Normal;
-        }
-        KeyCode::Enter => {
-            if !input.is_empty() {
-                let token = input.clone();
-                app.finish_add_api_token(token);
-            }
-        }
-        KeyCode::Backspace => {
-            input.pop();
-        }
-        KeyCode::Char(c) => {
-            input.push(c);
-        }
-        _ => {}
-    }
-}
-
-fn handle_adding(app: &mut App, code: KeyCode) {
-    let Mode::Adding { field, name, token } = &mut app.mode else {
-        return;
-    };
-
-    match code {
-        KeyCode::Esc => {
-            app.mode = Mode::Normal;
-        }
-        KeyCode::Tab => {
-            *field = match field {
-                AddField::Name => AddField::Token,
-                AddField::Token => AddField::Name,
-            };
-        }
-        KeyCode::Enter => {
-            if *field == AddField::Name && !name.is_empty() {
-                *field = AddField::Token;
-            } else if *field == AddField::Token && !name.is_empty() && !token.is_empty() {
-                let n = name.clone();
-                let t = token.clone();
-                app.finish_add(n, t);
-            }
-        }
-        KeyCode::Backspace => {
-            match field {
-                AddField::Name => { name.pop(); }
-                AddField::Token => { token.pop(); }
-            }
-        }
-        KeyCode::Char(c) => {
-            match field {
-                AddField::Name => name.push(c),
-                AddField::Token => token.push(c),
-            }
-        }
-        _ => {}
-    }
-}
-
-fn handle_editing(app: &mut App, code: KeyCode) {
-    let Mode::Editing { name, token } = &mut app.mode else {
-        return;
-    };
-
-    match code {
-        KeyCode::Esc => {
-            app.mode = Mode::Normal;
-        }
-        KeyCode::Enter => {
-            if !token.is_empty() {
-                let n = name.clone();
-                let t = token.clone();
-                app.finish_edit(n, t);
-            }
-        }
-        KeyCode::Backspace => {
-            token.pop();
-        }
-        KeyCode::Char(c) => {
-            token.push(c);
-        }
-        _ => {}
-    }
-}
-
-fn handle_renaming(app: &mut App, code: KeyCode) {
-    let Mode::Renaming { old_name, new_name } = &mut app.mode else {
-        return;
-    };
-
-    match code {
-        KeyCode::Esc => {
-            app.mode = Mode::Normal;
-        }
-        KeyCode::Enter => {
-            if !new_name.is_empty() {
-                let o = old_name.clone();
-                let n = new_name.clone();
-                app.finish_rename(o, n);
-            }
-        }
-        KeyCode::Backspace => {
-            new_name.pop();
-        }
-        KeyCode::Char(c) => {
-            new_name.push(c);
-        }
-        _ => {}
-    }
-}
-
-fn handle_migrating(app: &mut App, code: KeyCode) {
-    let Mode::Migrating { daemon_plists } = &app.mode else {
-        return;
-    };
-    let plists = daemon_plists.clone();
-
-    match code {
-        KeyCode::Char('y') | KeyCode::Char('Y') => {
-            app.do_migrate(plists);
-        }
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-            app.status_msg = Some("Imported — old daemon plists left in place".into());
-            app.mode = Mode::Normal;
-        }
-        _ => {}
-    }
-}
-
-fn handle_confirming(app: &mut App, code: KeyCode) {
-    let Mode::Confirming { target, .. } = &app.mode else {
-        return;
-    };
-    let target = target.clone();
-
-    match code {
-        KeyCode::Char('y') | KeyCode::Char('Y') => {
-            app.delete_tunnel_by_name(&target);
-            app.mode = Mode::Normal;
-        }
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-            app.mode = Mode::Normal;
-        }
-        _ => {}
-    }
-}
-
-fn handle_routes(app: &mut App, code: KeyCode) {
-    let Mode::Routes { routes, selected, .. } = &mut app.mode else {
-        return;
-    };
-
-    match code {
-        KeyCode::Esc | KeyCode::Char('q') => {
-            app.mode = Mode::Normal;
-        }
-        KeyCode::Char('j') | KeyCode::Down => {
-            if !routes.is_empty() && *selected < routes.len() - 1 {
-                *selected += 1;
-            }
-        }
-        KeyCode::Char('k') | KeyCode::Up => {
-            if *selected > 0 {
-                *selected -= 1;
-            }
-        }
-        KeyCode::Char('a') => {
-            app.begin_add_route();
-        }
-        KeyCode::Char('n') => {
-            app.begin_rename_route();
-        }
-        KeyCode::Char('d') => {
-            app.confirm_delete_route();
-        }
-        _ => {}
-    }
-}
-
-fn handle_adding_route(app: &mut App, code: KeyCode) {
-    let Mode::AddingRoute { tunnel_name, api_token, account_id, tunnel_id, field, hostname, service } = &mut app.mode else {
-        return;
-    };
-
-    match code {
-        KeyCode::Esc => app.mode = Mode::Normal,
-        KeyCode::Tab | KeyCode::BackTab => {
-            *field = match field {
-                RouteField::Hostname => RouteField::Service,
-                RouteField::Service => RouteField::Hostname,
-            };
-        }
-        KeyCode::Enter => {
-            if !hostname.is_empty() && !service.is_empty() {
-                let (tn, at, ai, ti, h, s) = (
-                    tunnel_name.clone(), api_token.clone(),
-                    account_id.clone(), tunnel_id.clone(),
-                    hostname.clone(), service.clone(),
-                );
-                app.finish_add_route(tn, at, ai, ti, h, s);
-            }
-        }
-        KeyCode::Backspace => {
-            let s = match field {
-                RouteField::Hostname => hostname,
-                RouteField::Service => service,
-            };
-            s.pop();
-        }
-        KeyCode::Char(c) => {
-            let s = match field {
-                RouteField::Hostname => hostname,
-                RouteField::Service => service,
-            };
-            s.push(c);
-        }
-        _ => {}
-    }
-}
-
-fn handle_renaming_route(app: &mut App, code: KeyCode) {
-    let Mode::RenamingRoute { tunnel_name, api_token, account_id, tunnel_id, old_hostname, service, new_subdomain, domain_suffix } = &mut app.mode else {
-        return;
-    };
-
-    match code {
-        KeyCode::Esc => app.mode = Mode::Normal,
-        KeyCode::Enter => {
-            if !new_subdomain.is_empty() {
-                let full_hostname = format!("{}{}", new_subdomain, domain_suffix);
-                let (tn, at, ai, ti, oh, svc) = (
-                    tunnel_name.clone(), api_token.clone(),
-                    account_id.clone(), tunnel_id.clone(),
-                    old_hostname.clone(), service.clone(),
-                );
-                app.finish_rename_route(tn, at, ai, ti, oh, svc, full_hostname);
-            }
-        }
-        KeyCode::Backspace => {
-            new_subdomain.pop();
-        }
-        KeyCode::Char(c) => {
-            new_subdomain.push(c);
-        }
-        _ => {}
-    }
-}
-
-fn handle_confirming_route_delete(app: &mut App, code: KeyCode) {
-    let Mode::ConfirmingRouteDelete { tunnel_name, api_token, account_id, tunnel_id, hostname } = &app.mode else {
-        return;
-    };
-    let (tn, at, ai, ti, h) = (
-        tunnel_name.clone(), api_token.clone(),
-        account_id.clone(), tunnel_id.clone(),
-        hostname.clone(),
-    );
-
-    match code {
-        KeyCode::Char('y') | KeyCode::Char('Y') => {
-            app.finish_delete_route(tn, at, ai, ti, h);
-        }
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-            app.mode = Mode::Normal;
-        }
-        _ => {}
-    }
-}
-
-fn cli_list(json: bool) -> Result<()> {
-    let config = config::Config::load()?;
-    if config.tunnels.is_empty() {
-        if json {
-            println!("[]");
-        } else {
-            println!("No tunnels configured.");
-        }
-        return Ok(());
-    }
-
+fn status_cmd(json: bool, problems_only: bool) -> Result<i32> {
+    let c = ctx()?;
+    let fleet = fleet_or_default(&c);
+    let snap = observe_all(&c.config);
+    let local = observe::observe_local(&c.config, &c.me);
+    let mut p = plan::plan(&fleet, &snap, Some(&local));
+    p.findings.extend(plan::probe_origins(&fleet, &c.me));
+    let st = status::build(&fleet, &snap, Some(&local), p, &c.me);
     if json {
-        let items: Vec<serde_json::Value> = config.tunnels.iter().map(|t| {
-            let status = launchd::status(&t.name);
-            let (status_str, pid) = match &status {
-                launchd::Status::Running { pid } => ("running", *pid),
-                launchd::Status::Stopped => ("stopped", None),
-                launchd::Status::Inactive => ("inactive", None),
-            };
-            let tunnel_id = config::decode_token(&t.token)
-                .map(|p| p.tunnel_id)
-                .unwrap_or_default();
-            serde_json::json!({
-                "name": t.name,
-                "status": status_str,
-                "pid": pid,
-                "tunnel_id": tunnel_id,
-            })
-        }).collect();
-        println!("{}", serde_json::to_string_pretty(&items)?);
+        if problems_only {
+            print_json(&serde_json::json!({ "scope": Scope::ReadOnly, "findings": st.plan.findings, "errors": st.errors }))?;
+        } else {
+            print_json(&st)?;
+        }
+        return Ok(0);
+    }
+    if c.fleet.is_none() {
+        eprintln!("(no fleet file here yet, so everything shows as not in the fleet — `tunnels import` writes one)\n");
+    }
+    if problems_only {
+        let mut p = st.plan.clone();
+        p.actions.clear();
+        let text = status::render_plan(&p);
+        print!("{}", text.replace("\nin line with the fleet file — nothing to do\n", ""));
+        if st.plan.findings.is_empty() {
+            println!("no problems found");
+        }
+        for e in &st.errors {
+            println!("  ! {e}");
+        }
     } else {
-        println!("{:<18} {:<10} {:<10} {}", "NAME", "STATUS", "PID", "TUNNEL ID");
-        println!("{:<18} {:<10} {:<10} {}", "──────────────────", "──────────", "──────────", "──────────────");
+        print!("{}", status::render(&st));
+    }
+    Ok(0)
+}
 
-        for t in &config.tunnels {
-            let status = launchd::status(&t.name);
-            let (status_str, pid_str) = match &status {
-                launchd::Status::Running { pid } => {
-                    ("running", pid.map(|p| p.to_string()).unwrap_or("-".into()))
+fn plan_cmd(json: bool) -> Result<i32> {
+    let c = ctx()?;
+    let fleet = Fleet::load_required()?;
+    let snap = observe_all(&c.config);
+    let local = observe::observe_local(&c.config, &c.me);
+    let p = plan::plan(&fleet, &snap, Some(&local));
+    if json {
+        print_json(&serde_json::json!({ "scope": Scope::ReadOnly, "serial": fleet.serial, "plan": p, "errors": snap.errors }))?;
+    } else {
+        print!("{}", status::render_plan(&p));
+        for e in &snap.errors {
+            println!("  ! {e}");
+        }
+    }
+    Ok(if p.actions.is_empty() { 0 } else { 2 })
+}
+
+fn print_report(r: &apply::Report, json: bool) -> Result<i32> {
+    if json {
+        print_json(&serde_json::json!({ "scope": Scope::LocalAndCloudflare, "report": r }))?;
+    } else {
+        for o in &r.done {
+            println!("  {} {} — {}", if o.ok { "✓" } else { "✗" }, o.summary, o.detail);
+        }
+        for (s, why) in &r.held {
+            println!("  · held: {s} ({why})");
+        }
+        if r.done.is_empty() && r.held.is_empty() {
+            println!("  nothing to do");
+        }
+    }
+    Ok(if r.failed() > 0 { 1 } else { 0 })
+}
+
+fn apply_cmd(a: ApplyArgs, json: bool) -> Result<i32> {
+    let mut c = ctx()?;
+    let fleet = Fleet::load_required()?;
+    announce(&format!("applying fleet serial {}", fleet.serial));
+    let snap = observe_all(&c.config);
+    let local = observe::observe_local(&c.config, &c.me);
+    let p = plan::plan(&fleet, &snap, Some(&local));
+    let opts = Options {
+        prune: a.prune,
+        yes: a.yes,
+        allow_destroy: a.allow_destroy,
+        only_hosts: if a.hosts.is_empty() { None } else { Some(a.hosts.clone()) },
+        no_local: a.no_local,
+        only_owner: None,
+    };
+    let r = apply::apply(&p, &snap, &mut c.config, &opts);
+    // a tunnel destroyed in Cloudflare leaves the fleet file too
+    let destroyed: Vec<String> = p
+        .actions
+        .iter()
+        .filter(|x| x.destroy)
+        .filter(|x| r.done.iter().any(|o| o.ok && o.summary == x.summary))
+        .filter_map(|x| match &x.kind {
+            plan::Kind::Destroy { tunnel, .. } => Some(tunnel.clone()),
+            _ => None,
+        })
+        .collect();
+    if !destroyed.is_empty() {
+        let f = Fleet::edit(&c.me, |f| {
+            for t in &destroyed {
+                remove_tunnel_from_fleet(f, t);
+            }
+            Ok(())
+        })?;
+        sync::notify(&f, &c.me);
+    }
+    print_report(&r, json)
+}
+
+fn remove_tunnel_from_fleet(f: &mut Fleet, alias: &str) {
+    f.tunnels.remove(alias);
+    f.routes.retain(|r| r.tunnel != alias);
+    for r in &mut f.routes {
+        if r.standby.as_deref() == Some(alias) {
+            r.standby = None;
+            r.failover = None;
+            r.active = None;
+        }
+    }
+}
+
+/// Apply only what concerns these hostnames, right after a fleet edit.
+fn apply_hosts(c: &mut Ctx, hosts: &[String], yes: bool, prune: bool, json: bool) -> Result<i32> {
+    let fleet = Fleet::load_required()?;
+    let snap = observe_all(&c.config);
+    let p = plan::plan(&fleet, &snap, None);
+    let opts = Options { yes, prune, only_hosts: Some(hosts.to_vec()), no_local: true, ..Default::default() };
+    let r = apply::apply(&p, &snap, &mut c.config, &opts);
+    let code = print_report(&r, json)?;
+    if !json && r.held.iter().any(|(_, w)| w.contains("--yes")) {
+        println!("\n  rerun with --yes to take it over — or pick another hostname");
+    }
+    if !json && r.failed() > 0 {
+        println!("\n  the fleet file has the change; the agent that owns it will keep trying");
+    }
+    Ok(code)
+}
+
+// ---------------------------------------------------------------- import
+
+/// A short name for an account: its first domain without the TLD.
+fn account_alias(zones: &[String], name: &str, taken: &BTreeSet<String>) -> String {
+    let base = zones
+        .first()
+        .map(|z| z.rsplit_once('.').map(|(a, _)| a).unwrap_or(z).replace('.', "-"))
+        .unwrap_or_else(|| name.split(['@', ' ', '\'']).next().unwrap_or("account").to_ascii_lowercase());
+    let mut alias = base.clone();
+    let mut n = 2;
+    while taken.contains(&alias) {
+        alias = format!("{base}-{n}");
+        n += 1;
+    }
+    alias
+}
+
+fn import_cmd(machine: Option<String>, host: Option<String>, dry_run: bool, json: bool) -> Result<i32> {
+    let mut c = ctx()?;
+    if let Some(m) = &machine {
+        if !dry_run {
+            c.config.set_machine(m)?;
+        }
+        c.me = m.clone();
+    }
+    if c.fleet.is_some() && !dry_run {
+        pull_first(&c.me);
+    }
+    let me = c.me.clone();
+    let snap = observe_all(&c.config);
+    for e in &snap.errors {
+        eprintln!("  ! {e}");
+    }
+    let mut notes: Vec<String> = Vec::new();
+    let mut added: Vec<String> = Vec::new();
+
+    let build = |f: &mut Fleet, notes: &mut Vec<String>, added: &mut Vec<String>| -> Result<()> {
+        let my_host = host.clone().unwrap_or_else(util::short_hostname);
+        if !f.machines.contains_key(&me) {
+            f.machines.insert(me.clone(), fleet::Machine { host: my_host.clone(), note: String::new() });
+            added.push(format!("machine {me} (reached at {my_host})"));
+        }
+        // accounts every token here reaches
+        for a in snap.accounts.iter().filter(|a| a.reachable || !a.zones.is_empty()) {
+            if f.account_alias_for_id(&a.id).is_some() {
+                // keep its zone list current
+                let alias = f.account_alias_for_id(&a.id).unwrap().clone();
+                let acct = f.accounts.get_mut(&alias).unwrap();
+                for z in &a.zones {
+                    if !acct.zones.contains(z) {
+                        acct.zones.push(z.clone());
+                        acct.zones.sort();
+                    }
                 }
-                launchd::Status::Stopped => ("stopped", "-".into()),
-                launchd::Status::Inactive => ("inactive", "-".into()),
-            };
-            let tunnel_id = config::decode_token(&t.token)
-                .map(|p| p.tunnel_id)
-                .unwrap_or("-".into());
-
-            println!("{:<18} {:<10} {:<10} {}", t.name, status_str, pid_str, tunnel_id);
-        }
-    }
-    Ok(())
-}
-
-fn cli_import() -> Result<()> {
-    let mut config = config::Config::load()?;
-    let found = launchd::discover_existing();
-    let mut count = 0;
-    for d in found {
-        if !config.tunnels.iter().any(|t| t.name == d.name) {
-            println!("  Imported '{}'", d.name);
-            config.add(d.name, d.token)?;
-            count += 1;
-        }
-    }
-    println!("{} tunnel(s) imported.", count);
-    Ok(())
-}
-
-/// Resolve a tunnel name to its (api_token, account_id, tunnel_id).
-///
-/// A tunnel this machine runs is known by its connector token. A tunnel it
-/// does not run is looked up in Cloudflare by name, through every API token
-/// here — the connector token lives where the connector runs, but routes and
-/// DNS are account-level and can be managed from anywhere that holds the
-/// account's API token.
-fn resolve_tunnel(config: &config::Config, tunnel_name: &str) -> Result<(String, String, String)> {
-    let api_tokens = config.all_cf_api_tokens();
-
-    if let Some(tunnel) = config.tunnels.iter().find(|t| t.name == tunnel_name) {
-        let payload = config::decode_token(&tunnel.token)?;
-        for api_token in &api_tokens {
-            if cloudflare::verify_token(api_token, &payload.account_id, &payload.tunnel_id) {
-                return Ok((api_token.to_string(), payload.account_id, payload.tunnel_id));
+                continue;
             }
+            let taken: BTreeSet<String> = f.accounts.keys().cloned().collect();
+            let alias = account_alias(&a.zones, &a.name, &taken);
+            f.accounts.insert(alias.clone(), fleet::Account { id: a.id.clone(), name: a.name.clone(), zones: a.zones.clone() });
+            added.push(format!("account {alias} ({})", a.zones.join(", ")));
         }
-        anyhow::bail!("No API token works for tunnel '{}'. Add one with: tunnels (TUI) → t a", tunnel_name)
-    }
-
-    if api_tokens.is_empty() {
-        anyhow::bail!(
-            "tunnel '{}' does not run on this machine, and there is no API token here to look it up with. Add one with: tunnels (TUI) → t a",
-            tunnel_name
-        )
-    }
-    // a uuid names exactly one tunnel; a name can be two machines' local
-    // names for two different tunnels in the same account
-    let looks_like_id = tunnel_name.len() == 36
-        && tunnel_name.bytes().all(|b| b == b'-' || b.is_ascii_hexdigit());
-    for (api_token, hint_accounts) in config.api_tokens_with_reach() {
-        if looks_like_id {
-            if let Some(account_id) = cloudflare::find_tunnel_by_id(api_token, &hint_accounts, tunnel_name) {
-                return Ok((api_token.to_string(), account_id, tunnel_name.to_string()));
+        // the tunnels this Mac runs
+        for t in &c.config.tunnels {
+            let Some(id) = t.tunnel_id() else { continue };
+            if let Some(alias) = f.alias_for_id(&id) {
+                let decl = &f.tunnels[alias];
+                if decl.machine.as_deref() != Some(me.as_str()) {
+                    notes.push(format!(
+                        "{} ({}) is here, but the fleet runs it as {alias} on {} — left as is",
+                        t.name,
+                        short(&id),
+                        decl.machine.as_deref().unwrap_or("no machine")
+                    ));
+                }
+                continue;
             }
-            continue;
-        }
-        if let Some((account_id, tunnel_id)) =
-            cloudflare::find_tunnel_by_name(api_token, &hint_accounts, tunnel_name)
-        {
-            return Ok((api_token.to_string(), account_id, tunnel_id));
-        }
-    }
-    anyhow::bail!(
-        "tunnel '{}' does not run on this machine, and none of the {} API token(s) here can see a tunnel by that name in Cloudflare",
-        tunnel_name, api_tokens.len()
-    )
-}
-
-fn cli_routes(tunnel_filter: Option<&str>, json: bool) -> Result<()> {
-    let config = config::Config::load()?;
-
-    // If a tunnel name is given and it looks like a flag, skip it
-    let tunnel_filter = tunnel_filter.filter(|s| !s.starts_with('-'));
-
-    let api_tokens = config.all_cf_api_tokens();
-    if api_tokens.is_empty() {
-        eprintln!("No API tokens configured. Add one in the TUI with t a.");
-        std::process::exit(1);
-    }
-
-    // (name, api_token, account_id, tunnel_id) for each tunnel to ask about.
-    // A named tunnel may be one another machine runs; resolve_tunnel finds
-    // it in Cloudflare. With no name, it is the tunnels this machine runs.
-    let mut targets: Vec<(String, String, String, String)> = Vec::new();
-    if let Some(name) = tunnel_filter {
-        let (api_token, account_id, tunnel_id) = resolve_tunnel(&config, name)?;
-        targets.push((name.to_string(), api_token, account_id, tunnel_id));
-    } else {
-        for tunnel in &config.tunnels {
-            let Ok(payload) = config::decode_token(&tunnel.token) else { continue };
-            let Some(api_token) = api_tokens
-                .iter()
-                .find(|t| cloudflare::verify_token(t, &payload.account_id, &payload.tunnel_id))
-            else {
+            let Some(obs) = snap.tunnel(&id) else {
+                notes.push(format!("{} ({}): Cloudflare does not show this tunnel (deleted, or no token here reaches its account) — skipped", t.name, short(&id)));
                 continue;
             };
-            targets.push((tunnel.name.clone(), api_token.to_string(), payload.account_id, payload.tunnel_id));
-        }
-    }
-
-    let mut all_routes: Vec<serde_json::Value> = Vec::new();
-
-    for (name, api_token, account_id, tunnel_id) in &targets {
-        let routes = cloudflare::list_routes(api_token, account_id, tunnel_id);
-        for route in &routes {
-            let hostname = route.hostname.as_deref().unwrap_or("(catch-all)");
-            all_routes.push(serde_json::json!({
-                "tunnel": name,
-                "hostname": hostname,
-                "service": route.service,
-            }));
-        }
-    }
-
-    if json {
-        println!("{}", serde_json::to_string_pretty(&all_routes)?);
-    } else {
-        if all_routes.is_empty() {
-            println!("No routes found.");
-            return Ok(());
-        }
-        println!("{:<20} {:<35} {}", "TUNNEL", "HOSTNAME", "SERVICE");
-        println!("{:<20} {:<35} {}", "────────────────────", "───────────────────────────────────", "───────────────────────");
-        for r in &all_routes {
-            println!("{:<20} {:<35} {}",
-                r["tunnel"].as_str().unwrap_or(""),
-                r["hostname"].as_str().unwrap_or(""),
-                r["service"].as_str().unwrap_or(""),
+            let Some(acct) = f.account_alias_for_id(&obs.account_id).cloned() else { continue };
+            let base = format!("{me}-{acct}").to_ascii_lowercase();
+            let mut alias = base.clone();
+            let mut n = 2;
+            while f.find_tunnel(&alias).is_some() {
+                alias = format!("{base}-{n}");
+                n += 1;
+            }
+            f.tunnels.insert(
+                alias.clone(),
+                TunnelDecl {
+                    id: id.clone(),
+                    account: acct,
+                    machine: Some(me.clone()),
+                    note: format!("Cloudflare name {:?}; local name {:?}", obs.tunnel.name, t.name),
+                    destroy: false,
+                },
             );
+            added.push(format!("tunnel {alias} = {} ({}) on {me}", obs.tunnel.name, short(&id)));
         }
-    }
-
-    Ok(())
-}
-
-/// Normalize service: "3000" → "http://localhost:3000", passthrough URLs
-fn normalize_service(input: &str) -> String {
-    if input.parse::<u16>().is_ok() {
-        format!("http://localhost:{}", input)
-    } else {
-        input.to_string()
-    }
-}
-
-fn cli_route_add(args: &[String]) -> Result<()> {
-    if args.len() < 2 {
-        eprintln!("Usage: tunnels route add <hostname> <port|service> --tunnel <name>");
-        eprintln!("  e.g. tunnels route add levee2.everyday.vet 3000 --tunnel myapp");
-        eprintln!("       tunnels route add levee2.everyday.vet http://localhost:3000 --tunnel myapp");
-        eprintln!();
-        eprintln!("Idempotent — safe to re-run to fix DNS if it failed the first time.");
-        std::process::exit(1);
-    }
-
-    let hostname = &args[0];
-    let service = normalize_service(&args[1]);
-    let tunnel_name = parse_flag(args, "--tunnel")
-        .ok_or_else(|| anyhow::anyhow!("--tunnel <name> is required"))?;
-
-    let config = config::Config::load()?;
-    let (api_token, account_id, tunnel_id) = resolve_tunnel(&config, &tunnel_name)?;
-
-    match cloudflare::add_route(&api_token, &account_id, &tunnel_id, hostname, &service) {
-        Ok(cloudflare::RouteResult::Ok) => {
-            println!("✓ {} → {} via {}", hostname, service, tunnel_name);
-            println!("  Route: created");
-            println!("  DNS:   created");
+        // routes: a hostname whose ingress and DNS agree on a fleet tunnel
+        let ids: Vec<(String, String)> = f.tunnels.iter().map(|(a, t)| (a.clone(), t.id.clone())).collect();
+        for (alias, id) in ids {
+            let Some(obs) = snap.tunnel(&id) else { continue };
+            for (host, service) in obs.routes() {
+                if f.find_route(&host).is_some() {
+                    continue;
+                }
+                let dns = snap.dns_for(&host);
+                let target = dns.first().and_then(|r| r.tunnel_target());
+                match target {
+                    Some(t) if t.eq_ignore_ascii_case(&id) => {
+                        f.routes.push(Route { host: host.clone(), tunnel: alias.clone(), service: service.clone(), ..Default::default() });
+                        added.push(format!("route {host} → {service} on {alias}"));
+                    }
+                    Some(t) => {
+                        let other = f
+                            .alias_for_id(&t)
+                            .cloned()
+                            .or_else(|| snap.tunnel(&t).map(|o| format!("{} ({})", o.tunnel.name, short(&t))))
+                            .unwrap_or_else(|| format!("{} (a tunnel that no longer exists)", short(&t)));
+                        notes.push(format!(
+                            "{host} is in {alias}'s ingress but DNS sends it to {other} — not imported here{}",
+                            if f.alias_for_id(&t).is_some() {
+                                format!("; to keep {alias} as a warm standby: tunnels route add {host} {service} --tunnel {other} --standby {alias}")
+                            } else {
+                                String::new()
+                            }
+                        ));
+                    }
+                    None if snap.dns_known_for(&host) => {
+                        notes.push(format!("{host} is in {alias}'s ingress but has no DNS — not imported (a route nothing reaches)"))
+                    }
+                    None => notes.push(format!("{host}: no token here can see its zone's DNS — not imported")),
+                }
+            }
         }
-        Ok(cloudflare::RouteResult::AlreadyExists) => {
-            println!("✓ {} → {} via {}", hostname, service, tunnel_name);
-            println!("  Route: already exists");
-            println!("  DNS:   ok");
-        }
-        Ok(cloudflare::RouteResult::DnsFailure(ref e)) => {
-            println!("⚠ {} → {} via {}", hostname, service, tunnel_name);
-            println!("  Route: ok");
-            println!("  DNS:   FAILED — {}", e);
-            println!();
-            println!("{}", cloudflare::DNS_PERMISSION_HINT);
-            println!();
-            println!("Or manually add a CNAME:");
-            println!("  {} → {}.cfargotunnel.com", hostname, tunnel_id);
-            println!();
-            println!("Then re-run this command to verify.");
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("✗ Failed: {}", e);
-            std::process::exit(1);
-        }
-    }
-
-    Ok(())
-}
-
-fn cli_route_rm(args: &[String]) -> Result<()> {
-    if args.is_empty() {
-        eprintln!("Usage: tunnels route rm <hostname> --tunnel <name>");
-        std::process::exit(1);
-    }
-
-    let hostname = &args[0];
-    let tunnel_name = parse_flag(args, "--tunnel")
-        .ok_or_else(|| anyhow::anyhow!("--tunnel <name> is required"))?;
-
-    let config = config::Config::load()?;
-    let (api_token, account_id, tunnel_id) = resolve_tunnel(&config, &tunnel_name)?;
-
-    match cloudflare::remove_route(&api_token, &account_id, &tunnel_id, hostname) {
-        Ok(cloudflare::RouteResult::Ok) => {
-            println!("✓ Removed {}", hostname);
-            println!("  Route: removed");
-            println!("  DNS:   removed");
-        }
-        Ok(cloudflare::RouteResult::DnsFailure(ref e)) => {
-            println!("⚠ Removed {} (route only)", hostname);
-            println!("  Route: removed");
-            println!("  DNS:   FAILED — {}", e);
-            println!();
-            println!("Manually delete the CNAME record for: {}", hostname);
-            println!("Or update your API token permissions:");
-            println!("{}", cloudflare::DNS_PERMISSION_HINT);
-        }
-        Ok(cloudflare::RouteResult::AlreadyExists) => unreachable!(),
-        Err(e) => {
-            eprintln!("✗ Failed: {}", e);
-            std::process::exit(1);
-        }
-    }
-
-    Ok(())
-}
-
-fn cli_route_mv(args: &[String]) -> Result<()> {
-    if args.len() < 2 {
-        eprintln!("Usage: tunnels route mv <old-hostname> <new-hostname> --tunnel <name>");
-        std::process::exit(1);
-    }
-
-    let old_hostname = &args[0];
-    let new_hostname = &args[1];
-    let tunnel_name = parse_flag(args, "--tunnel")
-        .ok_or_else(|| anyhow::anyhow!("--tunnel <name> is required"))?;
-
-    let config = config::Config::load()?;
-    let (api_token, account_id, tunnel_id) = resolve_tunnel(&config, &tunnel_name)?;
-
-    // Find the existing route's service
-    let routes = cloudflare::list_routes(&api_token, &account_id, &tunnel_id);
-    let old_route = routes.iter()
-        .find(|r| r.hostname.as_deref() == Some(old_hostname.as_str()))
-        .ok_or_else(|| anyhow::anyhow!("route '{}' not found on tunnel '{}'", old_hostname, tunnel_name))?;
-    let service = old_route.service.clone();
-
-    println!("Renaming {} → {}", old_hostname, new_hostname);
-    println!("  Service: {}", service);
-    println!();
-
-    // Add new route first (idempotent)
-    match cloudflare::add_route(&api_token, &account_id, &tunnel_id, new_hostname, &service) {
-        Ok(cloudflare::RouteResult::Ok) => {
-            println!("✓ {} created (route + DNS)", new_hostname);
-        }
-        Ok(cloudflare::RouteResult::AlreadyExists) => {
-            println!("✓ {} already exists", new_hostname);
-        }
-        Ok(cloudflare::RouteResult::DnsFailure(ref e)) => {
-            println!("⚠ {} route ok, DNS failed: {}", new_hostname, e);
-            println!("  Re-run to retry DNS.");
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("✗ Failed to create {}: {}", new_hostname, e);
-            std::process::exit(1);
-        }
-    }
-
-    // Remove old route
-    match cloudflare::remove_route(&api_token, &account_id, &tunnel_id, old_hostname) {
-        Ok(cloudflare::RouteResult::Ok) => {
-            println!("✓ {} removed (route + DNS)", old_hostname);
-        }
-        Ok(cloudflare::RouteResult::DnsFailure(ref e)) => {
-            println!("⚠ {} route removed, DNS cleanup failed: {}", old_hostname, e);
-        }
-        Ok(cloudflare::RouteResult::AlreadyExists) => unreachable!(),
-        Err(e) => {
-            eprintln!("⚠ New route ok but failed to remove old: {}", e);
-            std::process::exit(1);
-        }
-    }
-
-    println!();
-    println!("✓ Renamed {} → {}", old_hostname, new_hostname);
-
-    Ok(())
-}
-
-/// `tunnels route import [--tunnel <name>] [--dry-run]`
-///
-/// Reads route entries from stdin (the JSON shape that `tunnels routes --json`
-/// emits) and creates them via `cloudflare::add_route`, which is idempotent.
-///
-/// With `--tunnel <name>`, all imported routes are retargeted to that tunnel —
-/// this is the cross-machine move case (pipe from one tunnel into another).
-/// With `--dry-run`, prints the plan without calling the Cloudflare API.
-fn cli_route_import(args: &[String]) -> Result<()> {
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("Usage: tunnels route import [--tunnel <name>] [--dry-run]");
-        println!();
-        println!("Reads route JSON from stdin in the format emitted by `tunnels routes --json`.");
-        println!("Uses cloudflare::add_route (idempotent — safe to re-run).");
-        println!();
-        println!("Examples:");
-        println!("  # Back up and restore routes on the same tunnel");
-        println!("  tunnels routes my-tunnel --json > routes.json");
-        println!("  tunnels route import < routes.json");
-        println!();
-        println!("  # Move all routes from one tunnel to another");
-        println!("  tunnels routes mac-mini --json | tunnels route import --tunnel home-mesh");
-        return Ok(());
-    }
-
-    let target = parse_flag(args, "--tunnel");
-    let dry_run = args.iter().any(|a| a == "--dry-run");
-
-    let mut buf = String::new();
-    std::io::stdin()
-        .read_to_string(&mut buf)
-        .map_err(|e| anyhow::anyhow!("failed to read stdin: {}", e))?;
-
-    let entries = route_import::parse_entries(&buf)?;
-    if entries.is_empty() {
-        println!("No routes to import.");
-        return Ok(());
-    }
-
-    let entries = route_import::retarget(entries, target.as_deref());
-    let groups = route_import::group_by_tunnel(entries);
-
-    let total: usize = groups.iter().map(|(_, v)| v.len()).sum();
-    println!(
-        "Importing {} route(s) across {} tunnel(s){}",
-        total,
-        groups.len(),
-        if dry_run { " (dry run)" } else { "" }
-    );
+        f.routes.sort_by(|a, b| a.host.cmp(&b.host));
+        Ok(())
+    };
 
     if dry_run {
-        for (tunnel, routes) in &groups {
-            println!();
-            println!("Tunnel: {}", tunnel);
-            for r in routes {
-                println!("  + {} → {}", r.hostname, r.service);
-            }
-        }
-        return Ok(());
-    }
-
-    let config = config::Config::load()?;
-    let mut created = 0usize;
-    let mut existed = 0usize;
-    let mut failed = 0usize;
-
-    for (tunnel_name, routes) in groups {
-        println!();
-        println!("Tunnel: {}", tunnel_name);
-        let (api_token, account_id, tunnel_id) = match resolve_tunnel(&config, &tunnel_name) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("  ✗ cannot resolve tunnel '{}': {}", tunnel_name, e);
-                failed += routes.len();
-                continue;
-            }
-        };
-        for r in routes {
-            match cloudflare::add_route(&api_token, &account_id, &tunnel_id, &r.hostname, &r.service) {
-                Ok(cloudflare::RouteResult::Ok) => {
-                    println!("  ✓ {} → {}", r.hostname, r.service);
-                    created += 1;
-                }
-                Ok(cloudflare::RouteResult::AlreadyExists) => {
-                    println!("  = {} → {} (already exists)", r.hostname, r.service);
-                    existed += 1;
-                }
-                Ok(cloudflare::RouteResult::DnsFailure(ref e)) => {
-                    println!(
-                        "  ⚠ {} → {} (route ok, DNS failed: {})",
-                        r.hostname, r.service, e
-                    );
-                    failed += 1;
-                }
-                Err(e) => {
-                    eprintln!("  ✗ {} → {}: {}", r.hostname, r.service, e);
-                    failed += 1;
-                }
-            }
-        }
-    }
-
-    println!();
-    println!(
-        "Done: {} created, {} already existed, {} failed",
-        created, existed, failed
-    );
-
-    if failed > 0 {
-        std::process::exit(1);
-    }
-    Ok(())
-}
-
-fn parse_flag(args: &[String], flag: &str) -> Option<String> {
-    args.iter()
-        .position(|a| a == flag)
-        .and_then(|i| args.get(i + 1))
-        .cloned()
-}
-
-fn print_help() {
-    println!("tunnels — manage cloudflared tunnels, routes, and local services");
-    println!();
-    println!("No sudo needed. Tunnels run as LaunchAgents in your user session.");
-    println!();
-    println!("USAGE:");
-    println!("  tunnels                              Launch interactive TUI");
-    println!("  tunnels <command> [args]              Run a CLI command");
-    println!();
-    println!("QUICK START:");
-    println!("  tunnels list                          See what tunnels exist");
-    println!("  tunnels restart <name>                Restart a tunnel that's down");
-    println!("  tunnels routes <name>                 See hostname → port mappings");
-    println!("  tunnels route add app.example.com 3000 --tunnel my-tunnel");
-    println!("                                        Expose localhost:3000 as app.example.com");
-    println!();
-    println!("TUNNEL LIFECYCLE:");
-    println!("  list [--json]                         List tunnels with status and PID");
-    println!("  start <name>                          Start a tunnel (bootstraps LaunchAgent)");
-    println!("  stop <name>                           Stop a tunnel (removes LaunchAgent)");
-    println!("  restart <name>                        Restart a tunnel (kickstart or stop+start)");
-    println!("  logs <name> [--lines N]               View tunnel logs (default 50 lines)");
-    println!("  add <name> --token <token>            Register a new tunnel");
-    println!("  rm <name>                             Forget a tunnel here and remove its LaunchAgent");
-    println!("                                        (the tunnel itself stays in Cloudflare)");
-    println!("  rename <old> <new>                    Rename a tunnel");
-    println!("  import                                Import existing cloudflared plists");
-    println!();
-    println!("ROUTE COMMANDS:");
-    println!("  routes [tunnel] [--json]              List ingress routes (hostname → service)");
-    println!("  route add <host> <port> --tunnel <n>  Add a route (idempotent, creates DNS)");
-    println!("  route rm <host> --tunnel <name>       Remove a route");
-    println!("  route mv <old> <new> --tunnel <name>  Rename a route's hostname");
-    println!();
-    println!("SERVICE TRACKING:");
-    println!("  service list [--json]                 List tracked local services");
-    println!("  service add <name> --port <p> [--tunnel <t>] [--memo <m>]");
-    println!("  service rm <name>                     Untrack a service");
-    println!("  service edit <name> [--port <p>] [--tunnel <t>] [--memo <m>]");
-    println!("  service scan                          Scan for listening ports (lsof)");
-    println!();
-    println!("TOKENS:");
-    println!("  token add <token>                     Add a Cloudflare API token (one per CF account)");
-    println!("  token list                            Show what each token reaches");
-    println!("  token rm <#>                          Forget a token, by its number in the list");
-    println!("  token edit <tunnel> --token <token>   Replace a tunnel's CONNECTOR token (restarts it)");
-    println!("  sync                                  Sync routes from Cloudflare API");
-    println!("  heal                                  Restart tunnels with no edge connections");
-    println!();
-    println!("CONFIG: ~/.config/tunnels/config.json");
-    println!("PLISTS: ~/Library/LaunchAgents/com.cloudflare.cloudflared-<name>.plist");
-    println!("LOGS:   ~/Library/Logs/tunnels/");
-}
-
-fn cli_start(name: Option<&str>) -> Result<()> {
-    let name = name.ok_or_else(|| anyhow::anyhow!("Usage: tunnels start <name>"))?;
-    let config = config::Config::load()?;
-    let tunnel = config.tunnels.iter()
-        .find(|t| t.name == name)
-        .ok_or_else(|| anyhow::anyhow!("tunnel '{}' not found", name))?;
-
-    launchd::start(name, &tunnel.token)?;
-    println!("✓ Started {}", name);
-    Ok(())
-}
-
-fn cli_stop(name: Option<&str>) -> Result<()> {
-    let name = name.ok_or_else(|| anyhow::anyhow!("Usage: tunnels stop <name>"))?;
-    let config = config::Config::load()?;
-    if !config.tunnels.iter().any(|t| t.name == name) {
-        anyhow::bail!("tunnel '{}' not found", name);
-    }
-
-    launchd::stop(name)?;
-    println!("✓ Stopped {}", name);
-    Ok(())
-}
-
-fn cli_restart(name: Option<&str>) -> Result<()> {
-    let name = name.ok_or_else(|| anyhow::anyhow!("Usage: tunnels restart <name>"))?;
-    let config = config::Config::load()?;
-    let tunnel = config.tunnels.iter()
-        .find(|t| t.name == name)
-        .ok_or_else(|| anyhow::anyhow!("tunnel '{}' not found", name))?;
-
-    launchd::restart(name, &tunnel.token)?;
-    println!("✓ Restarted {}", name);
-    Ok(())
-}
-
-fn cli_logs(name: Option<&str>, args: &[String]) -> Result<()> {
-    let name = name.ok_or_else(|| anyhow::anyhow!("Usage: tunnels logs <name> [--lines N]"))?;
-    let config = config::Config::load()?;
-    if !config.tunnels.iter().any(|t| t.name == name) {
-        anyhow::bail!("tunnel '{}' not found", name);
-    }
-
-    let lines: usize = parse_flag(args, "--lines")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50);
-
-    let output = launchd::read_logs(name, lines)?;
-    if output.is_empty() {
-        println!("No logs found for '{}'.", name);
-    } else {
-        print!("{}", output);
-    }
-    Ok(())
-}
-
-fn cli_add(args: &[String]) -> Result<()> {
-    if args.is_empty() {
-        eprintln!("Usage: tunnels add <name> --token <token>");
-        std::process::exit(1);
-    }
-
-    let name = &args[0];
-    let token = parse_flag(args, "--token")
-        .ok_or_else(|| anyhow::anyhow!("--token <token> is required"))?;
-
-    let mut config = config::Config::load()?;
-    config.add(name.clone(), token)?;
-    println!("✓ Added tunnel '{}'", name);
-    Ok(())
-}
-
-fn cli_rm(name: Option<&str>) -> Result<()> {
-    let name = name.ok_or_else(|| anyhow::anyhow!("Usage: tunnels rm <name>"))?;
-    let mut config = config::Config::load()?;
-
-    // Stop if running
-    launchd::stop(name)?;
-
-    config.remove(name)?;
-    println!("✓ Removed tunnel '{}'", name);
-    Ok(())
-}
-
-fn cli_rename(args: &[String]) -> Result<()> {
-    if args.len() < 2 {
-        eprintln!("Usage: tunnels rename <old-name> <new-name>");
-        std::process::exit(1);
-    }
-
-    let old_name = &args[0];
-    let new_name = &args[1];
-
-    let mut config = config::Config::load()?;
-
-    // If running, restart with new name
-    let was_running = matches!(launchd::status(old_name), launchd::Status::Running { .. });
-    if was_running {
-        launchd::stop(old_name)?;
-    }
-
-    let token = config.tunnels.iter()
-        .find(|t| t.name == *old_name)
-        .map(|t| t.token.clone())
-        .ok_or_else(|| anyhow::anyhow!("tunnel '{}' not found", old_name))?;
-
-    config.rename(old_name, new_name.clone())?;
-
-    if was_running {
-        launchd::start(new_name, &token)?;
-    }
-
-    println!("✓ Renamed '{}' → '{}'", old_name, new_name);
-    Ok(())
-}
-
-fn cli_token_add(token: Option<&str>) -> Result<()> {
-    let token = token.ok_or_else(|| anyhow::anyhow!("Usage: tunnels token add <token>"))?;
-    let mut config = config::Config::load()?;
-    // the same operation the TUI runs, so neither front door can decide
-    // this differently from the other
-    let unreached = cloudflare::sync(&config.owned_api_tokens().iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-        &config.tunnels.iter().map(|t| (t.name.clone(), t.token.clone())).collect::<Vec<_>>()).unreached;
-    let added = ops::add_api_token(&mut config, token, &unreached)?;
-    println!("✓ API token added — {}", added.covers);
-    if let Some(account) = added.still_waiting {
-        println!("  ⚠ account {account} still has no token — that one is from a different account");
-    }
-    println!("  See them all with: tunnels token list");
-    Ok(())
-}
-
-fn cli_token_list() -> Result<()> {
-    let config = config::Config::load()?;
-    let tokens = config.api_tokens();
-    if tokens.is_empty() {
-        println!("No Cloudflare API tokens configured. Add one with: tunnels token add <token>");
-        return Ok(());
-    }
-    for (i, t) in tokens.iter().enumerate() {
-        if t.reach.is_empty() {
-            let covers = if t.covers.is_empty() { "no domains" } else { t.covers.as_str() };
-            println!("{i}. {covers}");
-        } else {
-            for r in &t.reach {
-                println!("{}{}", if i == 0 { format!("{i}. ") } else { format!("{i}. ") }, r.account_name);
-                println!("     {}", r.zones.join(" · "));
-            }
-        }
-        println!("     via {}", t.hint());
-    }
-    Ok(())
-}
-
-fn cli_token_rm(which: Option<&str>) -> Result<()> {
-    let which = which.ok_or_else(|| anyhow::anyhow!("Usage: tunnels token rm <#>"))?;
-    let idx: usize = which.parse().context("expected a number from `tunnels token list`")?;
-    let mut config = config::Config::load()?;
-    let covers = ops::remove_api_token(&mut config, idx)?;
-    println!("✓ Removed token{}", if covers.is_empty() { String::new() } else { format!(" — {covers}") });
-    Ok(())
-}
-
-fn cli_token_edit(args: &[String]) -> Result<()> {
-    if args.is_empty() {
-        eprintln!("Usage: tunnels token edit <tunnel-name> --token <token>");
-        std::process::exit(1);
-    }
-
-    let tunnel_name = &args[0];
-    let token = parse_flag(args, "--token")
-        .ok_or_else(|| anyhow::anyhow!("--token <token> is required"))?;
-
-    let mut config = config::Config::load()?;
-    config.update_token(tunnel_name, token)?;
-    println!("✓ Token updated for '{}'", tunnel_name);
-    Ok(())
-}
-
-fn cli_service_list(json: bool) -> Result<()> {
-    let config = config::Config::load()?;
-    if config.services.is_empty() {
+        let mut f = c.fleet.clone().unwrap_or_default();
+        build(&mut f, &mut notes, &mut added)?;
+        let problems = f.validate();
         if json {
-            println!("[]");
+            print_json(&serde_json::json!({ "scope": Scope::Fleet, "dry_run": true, "added": added, "notes": notes, "problems": problems }))?;
         } else {
-            println!("No services tracked.");
+            for a in &added {
+                println!("  + {a}");
+            }
+            for n in &notes {
+                println!("  · {n}");
+            }
+            for p in &problems {
+                println!("  ✗ {p}");
+            }
+            println!("\n(dry run — nothing written)");
         }
-        return Ok(());
+        return Ok(0);
     }
-
+    announce(&format!("importing {me} into {}", Fleet::path().display()));
+    let f = Fleet::edit(&me, |f| build(f, &mut notes, &mut added))?;
+    sync::notify(&f, &me);
     if json {
-        let items: Vec<serde_json::Value> = config.services.iter().map(|s| {
-            serde_json::json!({
-                "name": s.name,
-                "port": s.port,
-                "tunnel": s.tunnel,
-                "memo": s.memo,
-            })
-        }).collect();
-        println!("{}", serde_json::to_string_pretty(&items)?);
+        print_json(&serde_json::json!({ "scope": Scope::Fleet, "serial": f.serial, "added": added, "notes": notes }))?;
     } else {
-        println!("{:<20} {:<8} {:<18} {}", "NAME", "PORT", "TUNNEL", "MEMO");
-        println!("{:<20} {:<8} {:<18} {}", "────────────────────", "────────", "──────────────────", "────────────────");
-        for s in &config.services {
-            println!("{:<20} {:<8} {:<18} {}",
-                s.name,
-                s.port,
-                s.tunnel.as_deref().unwrap_or("—"),
-                s.memo.as_deref().unwrap_or(""),
+        for a in &added {
+            println!("  + {a}");
+        }
+        for n in &notes {
+            println!("  · {n}");
+        }
+        if added.is_empty() {
+            println!("  nothing new — the fleet already had everything here");
+        }
+        println!("\nfleet serial {} written to {}", f.serial, Fleet::path().display());
+        println!("next: `tunnels plan` to see what differs, `tunnels agent install` to keep this Mac in line");
+    }
+    Ok(0)
+}
+
+// ---------------------------------------------------------------- fleet
+
+fn fleet_cmd(cmd: FleetCmd, json: bool) -> Result<i32> {
+    match cmd {
+        FleetCmd::Show => {
+            let f = Fleet::load_required()?;
+            if json {
+                print_json(&f)?;
+            } else {
+                print!("{}", std::fs::read_to_string(Fleet::path())?);
+            }
+        }
+        FleetCmd::Path => println!("{}", Fleet::path().display()),
+        FleetCmd::Validate => {
+            let f = Fleet::load_required()?;
+            let problems = f.validate();
+            if json {
+                print_json(&serde_json::json!({ "serial": f.serial, "valid": problems.is_empty(), "problems": problems }))?;
+            } else if problems.is_empty() {
+                println!("✓ fleet serial {} is valid", f.serial);
+            } else {
+                for p in &problems {
+                    println!("✗ {p}");
+                }
+            }
+            return Ok(if problems.is_empty() { 0 } else { 1 });
+        }
+        FleetCmd::Edit => {
+            let c = ctx()?;
+            pull_first(&c.me);
+            let before = Fleet::load_required()?;
+            let tmp = std::env::temp_dir().join(format!("fleet-{}.toml", std::process::id()));
+            std::fs::write(&tmp, before.to_toml())?;
+            let editor = std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")).unwrap_or_else(|_| "vi".into());
+            loop {
+                let st = std::process::Command::new("sh").args(["-c", &format!("{editor} \"$1\""), "sh"]).arg(&tmp).status()?;
+                if !st.success() {
+                    bail!("the editor exited with {st}; nothing saved");
+                }
+                let text = std::fs::read_to_string(&tmp)?;
+                match Fleet::parse(&text).map(|f| (f.validate(), f)) {
+                    Ok((p, edited)) if p.is_empty() => {
+                        if edited == before {
+                            println!("no changes");
+                            return Ok(0);
+                        }
+                        let f = Fleet::edit(&c.me, |f| {
+                            let serial = f.serial;
+                            *f = edited;
+                            f.serial = serial;
+                            Ok(())
+                        })?;
+                        sync::notify(&f, &c.me);
+                        println!("✓ fleet serial {} saved and shared — `tunnels plan` to see what it changes", f.serial);
+                        return Ok(0);
+                    }
+                    Ok((p, _)) => eprintln!("✗ not valid:\n  {}", p.join("\n  ")),
+                    Err(e) => eprintln!("✗ {e:#}"),
+                }
+                if !std::io::stdin().is_terminal() || !ask("edit again? [Y/n] ", true) {
+                    bail!("nothing saved (your edit is in {})", tmp.display());
+                }
+            }
+        }
+        FleetCmd::History => {
+            let dir = Fleet::path().with_file_name("fleet.history");
+            let mut files: Vec<_> = std::fs::read_dir(&dir).map(|r| r.flatten().map(|e| e.path()).collect()).unwrap_or_default();
+            files.sort();
+            for p in files.iter().rev() {
+                if let Ok(f) = std::fs::read_to_string(p).map_err(anyhow::Error::from).and_then(|t| Fleet::parse(&t)) {
+                    println!("serial {:>4}  {}  by {}   {}", f.serial, f.updated_at, f.updated_by, p.display());
+                }
+            }
+        }
+        FleetCmd::Join { host, machine, port } => {
+            let f = sync::fetch(&host, port, Duration::from_secs(8))?;
+            if let Some(existing) = Fleet::load()? {
+                if !f.newer_than(&existing) {
+                    println!("this machine already has fleet serial {} (theirs: {}) — kept", existing.serial, f.serial);
+                    return Ok(0);
+                }
+            }
+            if let Some(m) = &machine {
+                let mut c = Config::load()?;
+                c.set_machine(m)?;
+            }
+            f.save()?;
+            println!("✓ took fleet serial {} from {host}", f.serial);
+            println!("next: `tunnels import{}` to add this Mac's tunnels, then `tunnels agent install`", machine.map(|m| format!(" --machine {m}")).unwrap_or_default());
+        }
+        FleetCmd::Sync => {
+            let c = ctx()?;
+            match sync::pull(&c.me, &[], Duration::from_secs(5))? {
+                Some((h, s)) => println!("✓ took fleet serial {s} from {h}"),
+                None => println!("this machine's copy is the newest it can find"),
+            }
+            if let Some(f) = Fleet::load()? {
+                sync::notify(&f, &c.me);
+            }
+        }
+    }
+    Ok(0)
+}
+
+fn ask(prompt: &str, default_yes: bool) -> bool {
+    use std::io::Write;
+    eprint!("{prompt}");
+    let _ = std::io::stderr().flush();
+    let mut s = String::new();
+    if std::io::stdin().read_line(&mut s).is_err() {
+        return false;
+    }
+    let s = s.trim().to_ascii_lowercase();
+    if s.is_empty() { default_yes } else { s == "y" || s == "yes" }
+}
+
+// ---------------------------------------------------------------- routes
+
+fn route_cmd(cmd: RouteCmd, json: bool) -> Result<i32> {
+    match cmd {
+        RouteCmd::List { tunnel } => {
+            let c = ctx()?;
+            let fleet = fleet_or_default(&c);
+            let snap = observe_all(&c.config);
+            let st = status::build(&fleet, &snap, None, plan::Plan::default(), &c.me);
+            let rows: Vec<serde_json::Value> = st
+                .tunnels
+                .iter()
+                .filter(|t| match &tunnel {
+                    None => true,
+                    Some(k) => {
+                        t.alias.as_deref().map(|a| a.eq_ignore_ascii_case(k)).unwrap_or(false)
+                            || t.id.starts_with(&k.to_ascii_lowercase())
+                            || t.cf_name.eq_ignore_ascii_case(k)
+                    }
+                })
+                .flat_map(|t| {
+                    t.routes.iter().map(move |r| {
+                        serde_json::json!({
+                            "host": r.host, "service": r.service,
+                            "tunnel": t.alias.clone().unwrap_or_else(|| t.cf_name.clone()),
+                            "tunnel_id": t.id, "machine": t.machine, "role": r.role, "active": r.active,
+                            "dns": r.dns, "dns_target": r.dns_target, "tunnel_state": t.state,
+                        })
+                    })
+                })
+                .collect();
+            if json {
+                print_json(&rows)?;
+            } else {
+                println!("{:<40} {:<30} {:<22} {:<8} {}", "HOSTNAME", "SERVICE", "TUNNEL", "ROLE", "DNS");
+                for r in &rows {
+                    let dns = match (r["dns"].as_str().unwrap_or(""), r["dns_target"].as_str()) {
+                        ("elsewhere", Some(t)) => format!("→ {t}"),
+                        (d, _) => d.to_string(),
+                    };
+                    println!(
+                        "{:<40} {:<30} {:<22} {:<8} {}",
+                        r["host"].as_str().unwrap_or(""),
+                        r["service"].as_str().unwrap_or(""),
+                        r["tunnel"].as_str().unwrap_or(""),
+                        r["role"].as_str().unwrap_or(""),
+                        dns
+                    );
+                }
+            }
+            Ok(0)
+        }
+        RouteCmd::Add { host, service, tunnel, standby, failover, note, no_apply, yes } => {
+            let mut c = ctx()?;
+            if c.fleet.is_none() {
+                bail!("no fleet file here — `tunnels import` first (it takes a minute and writes down what exists)");
+            }
+            pull_first(&c.me);
+            let host = host.to_ascii_lowercase();
+            let service = fleet::normalize_service(&service);
+            let failover = match failover.as_deref() {
+                None => None,
+                Some("manual") => Some(fleet::Failover::Manual),
+                Some("auto") => Some(fleet::Failover::Auto),
+                Some(x) => bail!("--failover is manual or auto, not {x}"),
+            };
+            let mut what = String::new();
+            let f = Fleet::edit(&c.me, |f| {
+                let alias = f
+                    .find_tunnel(&tunnel)
+                    .map(|(a, _)| a.clone())
+                    .ok_or_else(|| anyhow!("no tunnel `{tunnel}` in the fleet — `tunnels status` lists them; `tunnels tunnel adopt` adds one"))?;
+                let sb = match &standby {
+                    Some(s) => Some(f.find_tunnel(s).map(|(a, _)| a.clone()).ok_or_else(|| anyhow!("no tunnel `{s}` in the fleet"))?),
+                    None => None,
+                };
+                match f.find_route_mut(&host) {
+                    Some(r) => {
+                        if r.tunnel != alias {
+                            what = format!("moving {host} from {} to {alias}", r.tunnel);
+                            r.active = None;
+                        } else {
+                            what = format!("updating {host}");
+                        }
+                        r.tunnel = alias;
+                        r.service = service.clone();
+                        if sb.is_some() {
+                            r.standby = sb;
+                        }
+                        if failover.is_some() {
+                            r.failover = failover;
+                        }
+                        if let Some(n) = &note {
+                            r.note = n.clone();
+                        }
+                    }
+                    None => {
+                        what = format!("{host} → {service} on {alias}");
+                        f.routes.push(Route {
+                            host: host.clone(),
+                            tunnel: alias,
+                            service: service.clone(),
+                            standby: sb,
+                            failover,
+                            active: None,
+                            note: note.clone().unwrap_or_default(),
+                        });
+                        f.routes.sort_by(|a, b| a.host.cmp(&b.host));
+                    }
+                }
+                Ok(())
+            })?;
+            announce(&what);
+            eprintln!("  fleet serial {}", f.serial);
+            sync::notify(&f, &c.me);
+            if no_apply {
+                println!("✓ in the fleet file; the agent on {} will carry it out", f.find_route(&host).and_then(|r| f.machine_of(&r.tunnel)).unwrap_or("its machine"));
+                return Ok(0);
+            }
+            apply_hosts(&mut c, &[host], yes, false, json)
+        }
+        RouteCmd::Rm { host, no_apply } => {
+            let mut c = ctx()?;
+            pull_first(&c.me);
+            let f = Fleet::edit(&c.me, |f| {
+                let before = f.routes.len();
+                f.routes.retain(|r| !r.host.eq_ignore_ascii_case(&host));
+                if f.routes.len() == before {
+                    bail!("{host} is not in the fleet file");
+                }
+                Ok(())
+            })?;
+            announce(&format!("removing {host}"));
+            sync::notify(&f, &c.me);
+            if no_apply {
+                println!("✓ out of the fleet file; `tunnels apply --prune --host {host}` removes its ingress and DNS");
+                return Ok(0);
+            }
+            // removing it is exactly what was asked, so prune it
+            apply_hosts(&mut c, &[host], false, true, json)
+        }
+        RouteCmd::Mv { old, new, no_apply } => {
+            let mut c = ctx()?;
+            pull_first(&c.me);
+            let new = new.to_ascii_lowercase();
+            let f = Fleet::edit(&c.me, |f| {
+                if f.find_route(&new).is_some() {
+                    bail!("{new} is already routed");
+                }
+                let r = f.find_route_mut(&old).ok_or_else(|| anyhow!("{old} is not in the fleet file"))?;
+                r.host = new.clone();
+                f.routes.sort_by(|a, b| a.host.cmp(&b.host));
+                Ok(())
+            })?;
+            announce(&format!("renaming {old} → {new}"));
+            sync::notify(&f, &c.me);
+            if no_apply {
+                return Ok(0);
+            }
+            // the new name first; only once it is in place does the old one go
+            let code = apply_hosts(&mut c, &[new.clone()], false, false, json)?;
+            if code != 0 {
+                println!("  {old} left in place, since {new} did not come up");
+                return Ok(code);
+            }
+            apply_hosts(&mut c, &[old], false, true, json)
+        }
+    }
+}
+
+fn switch_cmd(host: &str, promote: bool, json: bool) -> Result<i32> {
+    let c = ctx()?;
+    pull_first(&c.me);
+    announce(&format!("{} {host}", if promote { "promoting to standby:" } else { "failing back to primary:" }));
+    let r = web::switch(host, promote)?;
+    print_report(&r, json)
+}
+
+// ---------------------------------------------------------------- tunnels
+
+/// A tunnel named any way a person might name it: fleet alias, id or id
+/// prefix, this Mac's local name, or its Cloudflare name (when that is
+/// unambiguous — two tunnels called DorkyRobot2 in two accounts is real).
+struct Resolved {
+    alias: Option<String>,
+    id: String,
+    account_id: String,
+    cf_name: String,
+    local: Option<String>,
+}
+
+fn resolve(key: &str, c: &Ctx, snap: &Snapshot) -> Result<Resolved> {
+    let fleet = fleet_or_default(c);
+    let local_of = |id: &str| c.config.tunnel_by_id(id).map(|t| t.name.clone());
+    if let Some((alias, t)) = fleet.find_tunnel(key) {
+        let obs = snap.tunnel(&t.id);
+        return Ok(Resolved {
+            alias: Some(alias.clone()),
+            id: t.id.clone(),
+            account_id: obs.map(|o| o.account_id.clone()).or_else(|| fleet.accounts.get(&t.account).map(|a| a.id.clone())).unwrap_or_default(),
+            cf_name: obs.map(|o| o.tunnel.name.clone()).unwrap_or_default(),
+            local: local_of(&t.id),
+        });
+    }
+    if let Some(t) = c.config.tunnel_by_name(key) {
+        let id = t.tunnel_id().ok_or_else(|| anyhow!("{key}'s connector token does not decode"))?;
+        return Ok(Resolved {
+            alias: fleet.alias_for_id(&id).cloned(),
+            account_id: t.account_id().unwrap_or_default(),
+            cf_name: snap.tunnel(&id).map(|o| o.tunnel.name.clone()).unwrap_or_default(),
+            local: Some(t.name.clone()),
+            id,
+        });
+    }
+    let hits: Vec<_> = snap
+        .tunnels
+        .iter()
+        .filter(|o| o.tunnel.id.eq_ignore_ascii_case(key) || (key.len() >= 8 && o.tunnel.id.starts_with(&key.to_ascii_lowercase())) || o.tunnel.name.eq_ignore_ascii_case(key))
+        .collect();
+    match hits.len() {
+        1 => Ok(Resolved {
+            alias: fleet.alias_for_id(&hits[0].tunnel.id).cloned(),
+            id: hits[0].tunnel.id.clone(),
+            account_id: hits[0].account_id.clone(),
+            cf_name: hits[0].tunnel.name.clone(),
+            local: local_of(&hits[0].tunnel.id),
+        }),
+        0 => bail!("no tunnel `{key}` — not a fleet alias, not a local name, and no Cloudflare tunnel by that name or id is visible from here"),
+        _ => bail!(
+            "`{key}` names {} tunnels; use an id:\n  {}",
+            hits.len(),
+            hits.iter().map(|o| format!("{} ({}) in account {}", o.tunnel.name, o.tunnel.id, short(&o.account_id))).collect::<Vec<_>>().join("\n  ")
+        ),
+    }
+}
+
+/// A tunnel on this Mac, by local name or by fleet alias/id (no Cloudflare).
+fn local_name(key: &str, c: &Ctx) -> Result<String> {
+    if let Some(t) = c.config.tunnel_by_name(key) {
+        return Ok(t.name.clone());
+    }
+    if let Some((_, t)) = c.fleet.as_ref().and_then(|f| f.find_tunnel(key)) {
+        if let Some(l) = c.config.tunnel_by_id(&t.id) {
+            return Ok(l.name.clone());
+        }
+    }
+    if let Some(l) = c.config.tunnels.iter().find(|t| t.tunnel_id().map(|i| i.starts_with(&key.to_ascii_lowercase())).unwrap_or(false) && key.len() >= 8) {
+        return Ok(l.name.clone());
+    }
+    bail!("this Mac has no tunnel `{key}` — `tunnels tunnel list` shows the ones it has")
+}
+
+fn tunnel_list(json: bool) -> Result<i32> {
+    let c = ctx()?;
+    let local = observe::observe_local(&c.config, &c.me);
+    let fleet = c.fleet.clone();
+    let alias_of = |id: &Option<String>| id.as_ref().and_then(|i| fleet.as_ref().and_then(|f| f.alias_for_id(i).cloned()));
+    if json {
+        let rows: Vec<serde_json::Value> = local
+            .tunnels
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "name": t.name, "status": if t.state == "loaded" { if t.pid.is_some() { "running" } else { "loaded" } } else if t.state == "not loaded" { "stopped" } else { "inactive" },
+                    "pid": t.pid, "tunnel_id": t.tunnel_id, "account_id": t.account_id, "fleet_alias": alias_of(&t.tunnel_id),
+                    "label": t.label, "token_in_plist": t.inline_token,
+                })
+            })
+            .collect();
+        print_json(&serde_json::json!({ "scope": Scope::Local, "machine": c.me, "agent_loaded": local.agent_loaded, "tunnels": rows, "stray_plists": local.stray_plists }))?;
+        return Ok(0);
+    }
+    println!("{:<18} {:<11} {:<7} {:<10} {:<22} {}", "NAME", "STATE", "PID", "TUNNEL", "FLEET ALIAS", "TOKEN");
+    for t in &local.tunnels {
+        println!(
+            "{:<18} {:<11} {:<7} {:<10} {:<22} {}",
+            t.name,
+            t.state,
+            t.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+            t.tunnel_id.as_deref().map(short).unwrap_or("?"),
+            alias_of(&t.tunnel_id).unwrap_or_else(|| "(not in fleet)".into()),
+            if t.inline_token { "in plist" } else if t.state == "no plist" { "-" } else { "file" }
+        );
+    }
+    if local.tunnels.is_empty() {
+        println!("(none)");
+    }
+    for s in &local.stray_plists {
+        println!("  · {} has a LaunchAgent here but is not in this Mac's config (`tunnels tunnel import-plists`)", s);
+    }
+    println!("\nmachine {} · agent {}", c.me, if local.agent_loaded { "running" } else { "not installed (`tunnels agent install`)" });
+    Ok(0)
+}
+
+fn tunnel_cmd(cmd: TunnelCmd, json: bool) -> Result<i32> {
+    let done = |msg: String| -> Result<i32> {
+        if json {
+            print_json(&serde_json::json!({ "scope": scope_of(&current_path()), "ok": true, "message": msg }))?;
+        } else {
+            println!("✓ {msg}");
+        }
+        Ok(0)
+    };
+    match cmd {
+        TunnelCmd::List => tunnel_list(json),
+        TunnelCmd::Start { name } => {
+            let c = ctx()?;
+            let n = local_name(&name, &c)?;
+            announce(&format!("start {n}"));
+            let t = c.config.tunnel_by_name(&n).unwrap();
+            launchd::start(&n, &t.token)?;
+            done(format!("started {n}"))
+        }
+        TunnelCmd::Stop { name } => {
+            let c = ctx()?;
+            let n = local_name(&name, &c)?;
+            announce(&format!("stop {n}"));
+            launchd::stop(&n)?;
+            let runs_here = c
+                .config
+                .tunnel_by_name(&n)
+                .and_then(|t| t.tunnel_id())
+                .and_then(|id| c.fleet.as_ref().and_then(|f| f.alias_for_id(&id).map(|a| f.tunnels[a].machine.clone())))
+                .flatten()
+                .map(|m| m == c.me)
+                .unwrap_or(false);
+            done(format!(
+                "stopped {n}{}",
+                if runs_here { " — the fleet says it runs here, so the agent will start it again; `tunnels tunnel assign` changes that" } else { "" }
+            ))
+        }
+        TunnelCmd::Restart { name } => {
+            let c = ctx()?;
+            let n = local_name(&name, &c)?;
+            announce(&format!("restart {n}"));
+            let t = c.config.tunnel_by_name(&n).unwrap();
+            if launchd::is_loaded_name(&n) && launchd::plist_runs_token(&n, &t.token) && !launchd::plist_has_inline_token(&n) {
+                launchd::kickstart(&n)?;
+            } else {
+                // writes the plist fresh (token in a file) — detached when over ssh
+                launchd::restart(&n, &t.token)?;
+            }
+            done(format!("restarted {n}"))
+        }
+        TunnelCmd::Logs { name, lines } => {
+            let c = ctx()?;
+            let n = local_name(&name, &c)?;
+            print!("{}", launchd::read_logs(&n, lines)?);
+            Ok(0)
+        }
+        TunnelCmd::Add { name, token } => {
+            let mut c = ctx()?;
+            announce(&format!("keep a connector token here as {name}"));
+            c.config.add(name.clone(), token)?;
+            done(format!("added {name} — `tunnels tunnel start {name}` runs it"))
+        }
+        TunnelCmd::Forget { name } => {
+            let mut c = ctx()?;
+            let n = local_name(&name, &c)?;
+            let id = c.config.tunnel_by_name(&n).and_then(|t| t.tunnel_id()).unwrap_or_default();
+            announce(&format!("forget {n} on this Mac"));
+            apply::forget_local(&mut c.config, &n)?;
+            let assigned_here = c
+                .fleet
+                .as_ref()
+                .and_then(|f| f.alias_for_id(&id).map(|a| (a.clone(), f.tunnels[a].machine.clone())))
+                .filter(|(_, m)| m.as_deref() == Some(c.me.as_str()));
+            let msg = format!(
+                "forgot {n} on this Mac: stopped, LaunchAgent and token removed here.\n  \
+                 Tunnel {id} STILL EXISTS in Cloudflare and every connector token for it STILL WORKS.\n  \
+                 To delete it there: tunnels tunnel destroy {id}{}",
+                match assigned_here {
+                    Some((a, _)) => format!(
+                        "\n  ⚠ the fleet says this Mac runs {a}, so the agent will fetch its token and start it again. \
+                         `tunnels tunnel assign {a} --none` (or --machine <other>) first."
+                    ),
+                    None => String::new(),
+                }
+            );
+            if json {
+                print_json(&serde_json::json!({ "scope": Scope::Local, "forgot": n, "tunnel_id": id, "still_exists_in_cloudflare": true, "tokens_still_work": true }))?;
+                Ok(0)
+            } else {
+                println!("✓ {msg}");
+                Ok(0)
+            }
+        }
+        TunnelCmd::Destroy { tunnel, yes } => destroy_cmd(&tunnel, yes, json),
+        TunnelCmd::Rotate { tunnel } => rotate_cmd(&tunnel, json),
+        TunnelCmd::Create { alias, account, machine } => {
+            let mut c = ctx()?;
+            let fleet = Fleet::load_required()?;
+            pull_first(&c.me);
+            let acct = fleet.accounts.get(&account).ok_or_else(|| anyhow!("no account `{account}` in the fleet ({})", fleet.accounts.keys().cloned().collect::<Vec<_>>().join(", ")))?;
+            if fleet.find_tunnel(&alias).is_some() {
+                bail!("there is already a tunnel `{alias}`");
+            }
+            if let Some(m) = &machine {
+                if !fleet.machines.contains_key(m) {
+                    bail!("no machine `{m}` in the fleet");
+                }
+            }
+            let snap = observe::observe(&c.config, &Want { ingress_for: Some(BTreeSet::new()), dns_zones: Some(BTreeSet::new()), accounts: Some([acct.id.clone()].into()) });
+            let client = snap.client_for_account(&acct.id).ok_or_else(|| anyhow!("no API token here reaches account {account}"))?;
+            announce(&format!("create tunnel {alias} in {account}"));
+            let t = client.create_tunnel(&acct.id, &alias)?;
+            let f = Fleet::edit(&c.me, |f| {
+                f.tunnels.insert(alias.clone(), TunnelDecl { id: t.id.clone(), account: account.clone(), machine: machine.clone(), note: String::new(), destroy: false });
+                Ok(())
+            })?;
+            sync::notify(&f, &c.me);
+            if machine.as_deref() == Some(c.me.as_str()) {
+                let token = client.connector_token(&acct.id, &t.id)?;
+                c.config.upsert_tunnel(&alias, &token)?;
+                launchd::start(&alias, &token)?;
+            }
+            done(format!(
+                "created {alias} ({}) in {account}{}",
+                t.id,
+                match &machine {
+                    Some(m) if *m == c.me => " and started it here".to_string(),
+                    Some(m) => format!(" — the agent on {m} will fetch its token and start it"),
+                    None => " — no machine runs it yet (`tunnels tunnel assign`)".into(),
+                }
+            ))
+        }
+        TunnelCmd::Adopt { tunnel, alias, machine } => {
+            let c = ctx()?;
+            Fleet::load_required()?;
+            pull_first(&c.me);
+            let snap = observe_all(&c.config);
+            let r = resolve(&tunnel, &c, &snap)?;
+            if let Some(a) = &r.alias {
+                bail!("already in the fleet as {a}");
+            }
+            let f = Fleet::edit(&c.me, |f| {
+                let acct = f.account_alias_for_id(&r.account_id).cloned().ok_or_else(|| anyhow!("its account is not in the fleet — `tunnels import` adds the accounts a token here reaches"))?;
+                if let Some(m) = &machine {
+                    if !f.machines.contains_key(m) {
+                        bail!("no machine `{m}` in the fleet");
+                    }
+                }
+                f.tunnels.insert(alias.clone(), TunnelDecl { id: r.id.clone(), account: acct, machine: machine.clone(), note: format!("Cloudflare name {:?}", r.cf_name), destroy: false });
+                Ok(())
+            })?;
+            announce(&format!("adopt {} as {alias}", r.cf_name));
+            sync::notify(&f, &c.me);
+            done(format!("{alias} = {} ({}) is in the fleet — its current routes show as undeclared until you add them (`tunnels import` does that for the machine that runs it)", r.cf_name, short(&r.id)))
+        }
+        TunnelCmd::Assign { tunnel, machine, none } => {
+            let c = ctx()?;
+            pull_first(&c.me);
+            if machine.is_none() && !none {
+                bail!("--machine <name> or --none");
+            }
+            let mut alias = String::new();
+            let f = Fleet::edit(&c.me, |f| {
+                if let Some(m) = &machine {
+                    if !f.machines.contains_key(m) {
+                        bail!("no machine `{m}` in the fleet");
+                    }
+                }
+                alias = f.find_tunnel(&tunnel).map(|(a, _)| a.clone()).ok_or_else(|| anyhow!("no tunnel `{tunnel}` in the fleet"))?;
+                f.tunnels.get_mut(&alias).unwrap().machine = machine.clone();
+                Ok(())
+            })?;
+            announce(&format!("assign {alias}"));
+            sync::notify(&f, &c.me);
+            done(format!(
+                "{alias} now runs on {} (the machine that ran it keeps running it until you `tunnels tunnel forget` it there)",
+                machine.as_deref().unwrap_or("no fleet machine")
+            ))
+        }
+        TunnelCmd::Rename { old, new } => {
+            let c = ctx()?;
+            pull_first(&c.me);
+            let f = Fleet::edit(&c.me, |f| {
+                let a = f.find_tunnel(&old).map(|(a, _)| a.clone()).ok_or_else(|| anyhow!("no tunnel `{old}` in the fleet"))?;
+                f.rename_tunnel(&a, &new)
+            })?;
+            announce(&format!("rename {old} → {new}"));
+            sync::notify(&f, &c.me);
+            done(format!("renamed {old} → {new} in the fleet file (its Cloudflare name and this Mac's LaunchAgent label are unchanged)"))
+        }
+        TunnelCmd::ImportPlists => {
+            let mut c = ctx()?;
+            let mut n = 0;
+            for d in launchd::discover_existing() {
+                if c.config.tunnel_by_name(&d.name).is_none() && !d.is_daemon {
+                    c.config.add(d.name.clone(), d.token)?;
+                    println!("  + {}", d.name);
+                    n += 1;
+                }
+            }
+            done(format!("{n} LaunchAgent(s) taken in"))
+        }
+    }
+}
+
+fn current_path() -> String {
+    let args: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with('-')).collect();
+    for n in [2, 1] {
+        if args.len() >= n {
+            let p = args[..n].join(" ");
+            if SCOPES.iter().any(|(x, _)| *x == p) {
+                return p;
+            }
+        }
+    }
+    String::new()
+}
+
+fn destroy_cmd(key: &str, yes: bool, json: bool) -> Result<i32> {
+    let mut c = ctx()?;
+    let snap = observe_all(&c.config);
+    let r = resolve(key, &c, &snap)?;
+    let obs = snap.tunnel(&r.id).ok_or_else(|| anyhow!("Cloudflare does not show tunnel {} from here — already deleted, or no token reaches its account", r.id))?;
+    let fleet = c.fleet.clone();
+    if let (Some(f), Some(alias)) = (&fleet, &r.alias) {
+        let primaries: Vec<&str> = f.routes.iter().filter(|x| &x.tunnel == alias).map(|x| x.host.as_str()).collect();
+        if !primaries.is_empty() {
+            bail!(
+                "{alias} is the primary for {} — move or remove those routes first (`tunnels route add <host> <svc> --tunnel <other>` or `tunnels route rm <host>`)",
+                primaries.join(", ")
             );
         }
     }
-    Ok(())
-}
-
-fn cli_service_add(args: &[String]) -> Result<()> {
-    if args.is_empty() {
-        eprintln!("Usage: tunnels service add <name> --port <port> [--tunnel <tunnel>] [--memo <memo>]");
-        std::process::exit(1);
-    }
-
-    let name = &args[0];
-    let port: u16 = parse_flag(args, "--port")
-        .ok_or_else(|| anyhow::anyhow!("--port <port> is required"))?
-        .parse()
-        .map_err(|_| anyhow::anyhow!("invalid port number"))?;
-    let tunnel = parse_flag(args, "--tunnel");
-    let memo = parse_flag(args, "--memo");
-
-    let mut config = config::Config::load()?;
-    config.add_service(name.clone(), port, tunnel, memo)?;
-    println!("✓ Added service '{}' on port {}", name, port);
-    Ok(())
-}
-
-fn cli_service_rm(args: &[String]) -> Result<()> {
-    if args.is_empty() {
-        eprintln!("Usage: tunnels service rm <name>");
-        std::process::exit(1);
-    }
-
-    let name = &args[0];
-    let mut config = config::Config::load()?;
-    let idx = config.services.iter().position(|s| s.name == *name)
-        .ok_or_else(|| anyhow::anyhow!("service '{}' not found", name))?;
-    config.remove_service_by_idx(idx)?;
-    println!("✓ Removed service '{}'", name);
-    Ok(())
-}
-
-fn cli_service_edit(args: &[String]) -> Result<()> {
-    if args.is_empty() {
-        eprintln!("Usage: tunnels service edit <name> [--port <port>] [--tunnel <tunnel>] [--memo <memo>]");
-        std::process::exit(1);
-    }
-
-    let name = &args[0];
-    let mut config = config::Config::load()?;
-    let idx = config.services.iter().position(|s| s.name == *name)
-        .ok_or_else(|| anyhow::anyhow!("service '{}' not found", name))?;
-
-    let existing = &config.services[idx];
-    let port: u16 = parse_flag(args, "--port")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(existing.port);
-    let tunnel = parse_flag(args, "--tunnel").or_else(|| existing.tunnel.clone());
-    let memo = parse_flag(args, "--memo").or_else(|| existing.memo.clone());
-
-    config.update_service(idx, name.clone(), port, tunnel, memo)?;
-    println!("✓ Updated service '{}'", name);
-    Ok(())
-}
-
-fn cli_service_scan() -> Result<()> {
-    let discovered = scan::scan_services();
-    if discovered.is_empty() {
-        println!("No listening services found.");
-        return Ok(());
-    }
-
-    println!("{:<20} {}", "NAME", "PORT");
-    println!("{:<20} {}", "────────────────────", "────────");
-    for s in &discovered {
-        println!("{:<20} {}", s.name, s.port);
-    }
-    println!();
-    println!("{} service(s) found. Use 'tunnels service add' to track them.", discovered.len());
-    Ok(())
-}
-
-fn load_sync_result() -> Result<(config::Config, cloudflare::SyncResult)> {
-    let config = config::Config::load()?;
-    let api_tokens = config.all_cf_api_tokens();
-
-    if api_tokens.is_empty() {
-        eprintln!("No API tokens configured. Add one with: tunnels token add <token>");
-        std::process::exit(1);
-    }
-
-    let tunnel_tokens: Vec<(String, String)> = config.tunnels.iter()
-        .map(|t| (t.name.clone(), t.token.clone()))
+    let dns: Vec<String> = snap
+        .dns
+        .iter()
+        .filter(|d| d.tunnel_target().as_deref() == Some(r.id.to_ascii_lowercase().as_str()))
+        .map(|d| d.name.clone())
         .collect();
-
-    let result = cloudflare::sync(&api_tokens, &tunnel_tokens);
-    Ok((config, result))
-}
-
-fn cli_sync() -> Result<()> {
-    println!("Syncing from Cloudflare...");
-    let (_config, result) = load_sync_result()?;
-
-    println!("{}", result.status);
-
-    if !result.unreached.is_empty() {
-        println!();
-        for u in &result.unreached {
-            println!("  ⚠ Account {} — tunnels: {}", &u.account_id[..8.min(u.account_id.len())], u.tunnel_names.join(", "));
+    let name = r.alias.clone().unwrap_or_else(|| r.cf_name.clone());
+    eprintln!("{} destroy {name}", Scope::LocalAndCloudflare.tag());
+    eprintln!("  in Cloudflare:");
+    eprintln!("    delete tunnel {} ({}) — every connector token for it stops working", r.cf_name, r.id);
+    if obs.up() {
+        eprintln!("    it has {} live connector(s) right now; they will be cut off", obs.tunnel.connections.len());
+    }
+    for d in &dns {
+        eprintln!("    delete DNS {d} (points at it)");
+    }
+    if let Some(l) = &r.local {
+        eprintln!("  on this Mac: stop and forget {l}");
+    }
+    if let Some(a) = &r.alias {
+        eprintln!("  in the fleet file: remove {a}");
+    }
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            bail!("destroying needs --yes when not run from a terminal");
+        }
+        eprint!("type the name `{name}` to destroy it: ");
+        let mut s = String::new();
+        std::io::stdin().read_line(&mut s)?;
+        if s.trim() != name {
+            bail!("not destroyed");
         }
     }
-
-    if !result.ingress_routes.is_empty() {
-        println!();
-        println!("{:<8} {:<35} {}", "PORT", "HOSTNAME", "TUNNEL");
-        println!("{:<8} {:<35} {}", "────────", "───────────────────────────────────", "────────────────");
-        let mut routes: Vec<_> = result.ingress_routes.iter().collect();
-        routes.sort_by_key(|(port, _)| *port);
-        for (port, entries) in routes {
-            for entry in entries {
-                println!("{:<8} {:<35} {}", port, entry.hostname, entry.tunnel_name);
-            }
-        }
+    let notes = apply::destroy(&snap, &mut c.config, &obs.account_id, &r.id)?;
+    if let (Some(_), Some(alias)) = (&fleet, &r.alias) {
+        let f = Fleet::edit(&c.me, |f| {
+            remove_tunnel_from_fleet(f, alias);
+            Ok(())
+        })?;
+        sync::notify(&f, &c.me);
     }
-
-    Ok(())
-}
-
-fn cli_heal() -> Result<()> {
-    let (config, result) = load_sync_result()?;
-
-    // If we got no tunnel data at all, the API is likely unreachable — don't restart anything
-    if result.tunnel_info.is_empty() {
-        eprintln!("Could not fetch tunnel status from Cloudflare API — aborting heal.");
-        std::process::exit(1);
-    }
-
-    // Build set of unreached tunnel IDs so we skip them rather than false-positive restart
-    let unreached_ids: std::collections::HashSet<String> = result.unreached.iter()
-        .map(|u| u.tunnel_id.clone())
-        .collect();
-
-    let mut healed: usize = 0;
-    let mut attempted: usize = 0;
-
-    for tunnel in &config.tunnels {
-        let status = launchd::status(&tunnel.name);
-        let (_is_loaded, has_pid) = match &status {
-            launchd::Status::Running { pid } => (true, pid.is_some()),
-            _ => continue, // Stopped or Inactive — not managed, skip
-        };
-
-        let tunnel_id = match config::decode_token(&tunnel.token) {
-            Ok(p) => p.tunnel_id,
-            Err(e) => {
-                eprintln!("Skipping {}: could not decode token ({})", tunnel.name, e);
-                continue;
-            }
-        };
-
-        // Skip tunnels whose accounts we couldn't reach — no data, not confirmed unhealthy
-        if unreached_ids.contains(&tunnel_id) {
-            continue;
-        }
-
-        // Needs healing if: loaded but no process, or running but no edge connections
-        let needs_heal = if !has_pid {
-            true // loaded in launchd but process not running
-        } else {
-            let has_edge = result.tunnel_info.get(&tunnel_id)
-                .map(|info| info.connection_count > 0)
-                .unwrap_or(true); // assume healthy when data is missing
-            !has_edge
-        };
-
-        if needs_heal {
-            attempted += 1;
-            match launchd::restart(&tunnel.name, &tunnel.token) {
-                Ok(()) => {
-                    println!("↻ Restarted {} (no edge connections)", tunnel.name);
-                    healed += 1;
-                }
-                Err(e) => {
-                    eprintln!("✗ Failed to restart {}: {}", tunnel.name, e);
-                }
-            }
-        }
-    }
-
-    if attempted == 0 {
-        println!("All running tunnels have edge connections.");
-    } else if healed == attempted {
-        println!("Healed {} tunnel(s).", healed);
+    if json {
+        print_json(&serde_json::json!({ "scope": Scope::LocalAndCloudflare, "destroyed": r.id, "notes": notes }))?;
     } else {
-        println!("Healed {} of {} tunnel(s).", healed, attempted);
+        println!("✓ destroyed {name}: {notes}");
+    }
+    Ok(0)
+}
+
+fn rotate_cmd(key: &str, json: bool) -> Result<i32> {
+    let mut c = ctx()?;
+    let snap = observe_all(&c.config);
+    let r = resolve(key, &c, &snap)?;
+    let client = snap.client_for_account(&r.account_id).ok_or_else(|| anyhow!("no API token here reaches that tunnel's account"))?;
+    let name = r.alias.clone().unwrap_or_else(|| r.cf_name.clone());
+    announce(&format!("rotate {name}"));
+    client.rotate_secret(&r.account_id, &r.id).context("giving the tunnel a new secret")?;
+    let token = client.connector_token(&r.account_id, &r.id).context("fetching the new connector token")?;
+    let mut msg = format!("{name} has a new secret — every connector token issued before now no longer works");
+    if let Some(l) = &r.local {
+        c.config.upsert_tunnel(l, &token)?;
+        launchd::write_token_file(&token)?;
+        if launchd::plist_has_inline_token(l) || !launchd::plist_runs_token(l, &token) || !launchd::is_loaded_name(l) {
+            // writes the plist fresh, token in a file; detached when over ssh
+            launchd::restart(l, &token)?;
+        } else {
+            launchd::kickstart(l)?;
+        }
+        msg.push_str(&format!("; this Mac took the new one and restarted {l}"));
+    }
+    let owner = c.fleet.as_ref().and_then(|f| r.alias.as_ref().and_then(|a| f.machine_of(a).map(String::from)));
+    if let Some(m) = owner.filter(|m| *m != c.me) {
+        msg.push_str(&format!("; the agent on {m} fetches the new token on its next pass"));
+        if let Some(f) = &c.fleet {
+            sync::notify(f, &c.me);
+        }
+    }
+    let others: Vec<String> = c.config.tunnels.iter().filter(|t| t.tunnel_id().as_deref() == Some(r.id.as_str()) && Some(&t.name) != r.local.as_ref()).map(|t| t.name.clone()).collect();
+    if !others.is_empty() {
+        msg.push_str(&format!("; also here under {}: updated", others.join(", ")));
+    }
+    if json {
+        print_json(&serde_json::json!({ "scope": Scope::LocalAndCloudflare, "rotated": r.id, "old_tokens_work": false, "message": msg }))?;
+    } else {
+        println!("✓ {msg}");
+    }
+    Ok(0)
+}
+
+// ---------------------------------------------------------------- tokens
+
+fn token_cmd(cmd: TokenCmd, json: bool) -> Result<i32> {
+    match cmd {
+        TokenCmd::Add { token } => {
+            let mut c = ctx()?;
+            let client = cf::Client::new(&token);
+            client.verify().context("Cloudflare does not accept this token")?;
+            let zones = client.zones().unwrap_or_default();
+            let mut reach: Vec<config::Reach> = Vec::new();
+            for z in &zones {
+                match reach.iter_mut().find(|r| r.account_id == z.account_id) {
+                    Some(r) => r.zones.push(z.name.clone()),
+                    None => reach.push(config::Reach { account_id: z.account_id.clone(), account_name: z.account_name.clone(), zones: vec![z.name.clone()] }),
+                }
+            }
+            for a in client.accounts().unwrap_or_default() {
+                if !reach.iter().any(|r| r.account_id == a.id) {
+                    reach.push(config::Reach { account_id: a.id, account_name: a.name, zones: vec![] });
+                }
+            }
+            if reach.is_empty() {
+                bail!("this token reaches no account and no zone — wrong Cloudflare account, or missing permissions");
+            }
+            let covers = reach.iter().map(|r| format!("{} ({})", r.account_name, r.zones.join(", "))).collect::<Vec<_>>().join(" · ");
+            announce("keep an API token here");
+            c.config.add_api_token(token, covers.clone(), reach)?;
+            if json {
+                print_json(&serde_json::json!({ "scope": Scope::LocalReadsCloudflare, "covers": covers }))?;
+            } else {
+                println!("✓ API token kept — {covers}");
+                println!("  it needs Account › Cloudflare Tunnel › Edit and Zone › DNS › Edit to manage routes");
+            }
+            Ok(0)
+        }
+        TokenCmd::List => {
+            let c = ctx()?;
+            let tokens = c.config.api_tokens();
+            if json {
+                let rows: Vec<_> = tokens.iter().enumerate().map(|(i, t)| serde_json::json!({ "index": i, "hint": t.hint(), "reach": t.reach })).collect();
+                print_json(&rows)?;
+                return Ok(0);
+            }
+            if tokens.is_empty() {
+                println!("no Cloudflare API tokens here — `tunnels token add <token>`");
+            }
+            for (i, t) in tokens.iter().enumerate() {
+                if t.reach.is_empty() {
+                    println!("{i}. {}", if t.covers.is_empty() { "(nothing recorded)" } else { &t.covers });
+                }
+                for r in &t.reach {
+                    println!("{i}. {}  ({})", r.account_name, short(&r.account_id));
+                    println!("     {}", r.zones.join(" · "));
+                }
+                println!("     via {}", t.hint());
+            }
+            Ok(0)
+        }
+        TokenCmd::Rm { index } => {
+            let mut c = ctx()?;
+            announce("forget an API token here");
+            let covers = c.config.remove_api_token(index)?;
+            println!("✓ forgot token {index}{} (it still works in Cloudflare — revoke it at dash.cloudflare.com/profile/api-tokens)", if covers.is_empty() { String::new() } else { format!(" — {covers}") });
+            Ok(0)
+        }
+    }
+}
+
+// ---------------------------------------------------------------- agent / web / scan
+
+fn exe_for_launchd() -> String {
+    // the stable path (Homebrew's symlink) rather than this version's
+    // Cellar path, so `brew upgrade` is picked up by the running agent
+    for p in ["/opt/homebrew/bin/tunnels", "/usr/local/bin/tunnels"] {
+        if let (Ok(a), Ok(b)) = (std::fs::canonicalize(p), std::env::current_exe().and_then(std::fs::canonicalize)) {
+            if a == b {
+                return p.to_string();
+            }
+        }
+    }
+    std::env::current_exe().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| "tunnels".into())
+}
+
+fn agent_cmd(cmd: AgentCmd, json: bool) -> Result<i32> {
+    match cmd {
+        AgentCmd::Run => {
+            tunnels::agent::run()?;
+            Ok(0)
+        }
+        AgentCmd::Once => {
+            // one pass in the foreground, using the running agent if there is one
+            let c = ctx()?;
+            let port = c.fleet.as_ref().map(|f| f.policy.web_port).unwrap_or(fleet::DEFAULT_WEB_PORT);
+            if launchd::agent_loaded() {
+                let a: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(3))).build().into();
+                if a.post(&format!("http://127.0.0.1:{port}/api/notify")).header("X-Tunnels", "1").send_json(serde_json::json!({})).is_ok() {
+                    println!("✓ asked the running agent for a pass now — `tunnels agent status` shows what it did");
+                    return Ok(0);
+                }
+            }
+            let fleet = Fleet::load_required()?;
+            let mut config = c.config.clone();
+            let mine: BTreeSet<String> = fleet.tunnels.iter().filter(|(_, t)| t.machine.as_deref() == Some(c.me.as_str())).map(|(a, _)| a.clone()).collect();
+            let snap = observe::observe(&config, &tunnels::agent::want_for(&fleet, &mine));
+            let local = observe::observe_local(&config, &c.me);
+            let p = plan::plan(&fleet, &snap, Some(&local));
+            let opts = Options { only_owner: Some(c.me.clone()), prune: fleet.policy.prune, ..Default::default() };
+            let r = apply::apply(&p, &snap, &mut config, &opts);
+            print_report(&r, json)
+        }
+        AgentCmd::Install => {
+            let exe = exe_for_launchd();
+            announce(&format!("install the agent ({exe})"));
+            launchd::install_agent(&exe)?;
+            // the agent does what the watchdog did; two of them is one too many
+            let wd = launchd::plist_dir().join("com.dorkyrobot.tunnel-watchdog.plist");
+            if wd.exists() {
+                let uid = unsafe { libc::getuid() };
+                let _ = std::process::Command::new("launchctl").args(["bootout", &format!("gui/{uid}/com.dorkyrobot.tunnel-watchdog")]).output();
+                let _ = std::fs::remove_file(&wd);
+                println!("  removed the old tunnel-watchdog LaunchAgent (the agent does its job now)");
+            }
+            let port = Fleet::load().ok().flatten().map(|f| f.policy.web_port).unwrap_or(fleet::DEFAULT_WEB_PORT);
+            println!("✓ agent installed and started");
+            match util::tailnet_ipv4() {
+                Some(ip) => println!("  web UI: http://{ip}:{port}  (tailnet only)"),
+                None => println!("  web UI: http://127.0.0.1:{port} — and on the tailnet once Tailscale is up"),
+            }
+            Ok(0)
+        }
+        AgentCmd::Uninstall => {
+            announce("uninstall the agent");
+            launchd::uninstall_agent()?;
+            println!("✓ agent stopped and removed (tunnels keep running; nothing heals them now)");
+            Ok(0)
+        }
+        AgentCmd::Status => {
+            let c = ctx()?;
+            let port = c.fleet.as_ref().map(|f| f.policy.web_port).unwrap_or(fleet::DEFAULT_WEB_PORT);
+            let a: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(3))).build().into();
+            let v: Option<serde_json::Value> = a.get(&format!("http://127.0.0.1:{port}/api/agent")).call().ok().and_then(|mut r| r.body_mut().read_json().ok());
+            if json {
+                print_json(&serde_json::json!({ "loaded": launchd::agent_loaded(), "agent": v }))?;
+                return Ok(0);
+            }
+            println!("agent: {}", if launchd::agent_loaded() { "loaded" } else { "not installed" });
+            let Some(v) = v else {
+                println!("  not answering on 127.0.0.1:{port}");
+                return Ok(if launchd::agent_loaded() { 1 } else { 0 });
+            };
+            println!("  {} v{} · running since {}", v["machine"].as_str().unwrap_or("?"), v["version"].as_str().unwrap_or("?"), v["started_at"].as_str().unwrap_or("?"));
+            if let Some(t) = v.get("last_tick").filter(|t| !t.is_null()) {
+                println!("  last pass {} · fleet serial {} · {} ms", t["at"].as_str().unwrap_or("?"), t["serial"], t["took_ms"]);
+                if let Some(e) = t["error"].as_str() {
+                    println!("  ✗ {e}");
+                }
+                for w in t["waiting"].as_array().into_iter().flatten() {
+                    println!("  · waiting for a person: {} ({})", w[0].as_str().unwrap_or(""), w[1].as_str().unwrap_or(""));
+                }
+            }
+            println!("  recent:");
+            for e in v["events"].as_array().into_iter().flatten().take(15) {
+                println!("    {} {:<8} {}", e["at"].as_str().unwrap_or(""), e["kind"].as_str().unwrap_or(""), e["message"].as_str().unwrap_or(""));
+            }
+            Ok(0)
+        }
+    }
+}
+
+fn web_cmd(open: bool, json: bool) -> Result<i32> {
+    let port = Fleet::load().ok().flatten().map(|f| f.policy.web_port).unwrap_or(fleet::DEFAULT_WEB_PORT);
+    let url = match util::tailnet_ipv4() {
+        Some(ip) => format!("http://{ip}:{port}"),
+        None => format!("http://127.0.0.1:{port}"),
+    };
+    if json {
+        print_json(&serde_json::json!({ "url": url, "agent_loaded": launchd::agent_loaded() }))?;
+    } else {
+        println!("{url}{}", if launchd::agent_loaded() { "" } else { "   (the agent is not running here — `tunnels agent install`)" });
+    }
+    if open {
+        let _ = std::process::Command::new("open").arg(&url).status();
+    }
+    Ok(0)
+}
+
+fn scan_cmd(json: bool) -> Result<i32> {
+    let found = scan::scan_services();
+    if json {
+        let rows: Vec<_> = found.iter().map(|s| serde_json::json!({ "name": s.name, "port": s.port })).collect();
+        print_json(&rows)?;
+        return Ok(0);
+    }
+    println!("{:<24} {}", "NAME", "PORT");
+    for s in &found {
+        println!("{:<24} {}", s.name, s.port);
+    }
+    Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Every command's help must carry the tag of the scope it declares —
+    /// the gap between "Delete a tunnel" and what `rm` did is this test.
+    #[test]
+    fn a_commands_help_says_its_scope() {
+        let root = Cli::command();
+        for (path, scope) in SCOPES {
+            let mut cmd = &root;
+            for part in path.split(' ') {
+                cmd = cmd.find_subcommand(part).unwrap_or_else(|| panic!("no command `{path}`"));
+            }
+            let about = cmd.get_about().map(|a| a.to_string()).unwrap_or_default();
+            assert!(about.starts_with(scope.tag()), "`tunnels {path}` says {about:?} but declares {}", scope.tag());
+        }
     }
 
-    Ok(())
+    #[test]
+    fn every_visible_command_declares_a_scope() {
+        let root = Cli::command();
+        for sub in root.get_subcommands().filter(|s| !s.is_hide_set()) {
+            let name = sub.get_name();
+            if sub.has_subcommands() {
+                for leaf in sub.get_subcommands() {
+                    let p = format!("{name} {}", leaf.get_name());
+                    assert!(SCOPES.iter().any(|(x, _)| *x == p), "`tunnels {p}` has no scope in SCOPES");
+                }
+            } else if name != "help" {
+                assert!(SCOPES.iter().any(|(x, _)| *x == name), "`tunnels {name}` has no scope in SCOPES");
+            }
+        }
+    }
+
+    #[test]
+    fn forget_is_local_and_destroy_is_not() {
+        assert_eq!(scope_of("tunnel forget"), Scope::Local);
+        assert_eq!(scope_of("tunnel destroy"), Scope::LocalAndCloudflare);
+    }
+
+    #[test]
+    fn account_aliases_come_from_their_first_domain() {
+        let taken = BTreeSet::new();
+        assert_eq!(account_alias(&["felixflor.es".into(), "sarameig.gs".into()], "x", &taken), "felixflor");
+        let taken: BTreeSet<String> = ["felixflor".to_string()].into();
+        assert_eq!(account_alias(&["felixflor.es".into()], "x", &taken), "felixflor-2");
+    }
 }

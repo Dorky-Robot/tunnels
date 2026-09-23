@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tunnels</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --card: #fff; --ink: #1d1d1b; --mute: #6b6b66; --line: #e4e3de;
+    --up: #1f8f4e; --down: #c2412d; --warn: #b7791f; --info: #52627a; --accent: #2f5bd3;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #151514; --card: #1e1e1c; --ink: #ecebe6; --mute: #9a9993; --line: #33332f;
+            --up: #3fbf74; --down: #ec6a55; --warn: #e0a642; --info: #8fa3c2; --accent: #7d9cf0; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--ink); }
+  header { display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: baseline; padding: 16px 24px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); z-index: 2; }
+  header h1 { font-size: 17px; margin: 0; }
+  header .meta { color: var(--mute); font-size: 13px; }
+  header .spacer { flex: 1; }
+  main { padding: 16px 24px 48px; max-width: 1200px; margin: 0 auto; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--mute); margin: 28px 0 10px; font-weight: 600; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; }
+  .row { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex: none; transform: translateY(-1px); }
+  .up { background: var(--up); } .down { background: var(--down); } .unknown, .missing { background: var(--mute); }
+  .alias { font-weight: 600; font-size: 15px; }
+  .mono { font-family: var(--mono); font-size: 12.5px; }
+  .mute { color: var(--mute); }
+  .tag { font-size: 11.5px; padding: 1px 7px; border-radius: 10px; border: 1px solid var(--line); color: var(--mute); white-space: nowrap; }
+  .tag.bad { color: var(--down); border-color: var(--down); }
+  .tag.warn { color: var(--warn); border-color: var(--warn); }
+  .tag.good { color: var(--up); border-color: var(--up); }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  td { padding: 5px 8px 5px 0; border-top: 1px solid var(--line); vertical-align: baseline; }
+  td:first-child { width: 38%; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  button { font: inherit; font-size: 13px; padding: 4px 11px; border-radius: 6px; border: 1px solid var(--line); background: var(--card); color: var(--ink); cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  button.danger { color: var(--down); border-color: var(--down); }
+  button:disabled { opacity: .5; cursor: default; }
+  .finding { display: grid; grid-template-columns: 18px 1fr; gap: 2px 8px; padding: 8px 0; border-top: 1px solid var(--line); }
+  .finding:first-child { border-top: 0; }
+  .finding .fix { grid-column: 2; font-family: var(--mono); font-size: 12px; color: var(--mute); }
+  .lvl-error { color: var(--down); } .lvl-warn { color: var(--warn); } .lvl-info { color: var(--info); }
+  .action { display: grid; grid-template-columns: 18px 1fr auto; gap: 8px; padding: 6px 0; border-top: 1px solid var(--line); align-items: baseline; }
+  .action:first-child { border-top: 0; }
+  .events { font-family: var(--mono); font-size: 12px; max-height: 260px; overflow: auto; }
+  .events div { padding: 2px 0; white-space: pre-wrap; }
+  pre { font-family: var(--mono); font-size: 12px; background: var(--bg); padding: 10px; border-radius: 6px; overflow: auto; max-height: 420px; margin: 8px 0 0; }
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .peers { display: flex; gap: 12px; flex-wrap: wrap; font-size: 13px; }
+  .peers span { display: inline-flex; gap: 5px; align-items: center; }
+  #toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--ink); color: var(--bg); padding: 8px 14px; border-radius: 8px; font-size: 13px; display: none; max-width: 90vw; white-space: pre-wrap; z-index: 5; }
+  .loading { color: var(--mute); padding: 40px 0; text-align: center; }
+  details summary { cursor: pointer; color: var(--mute); }
+</style>
+</head>
+<body>
+<header>
+  <h1>tunnels</h1>
+  <span class="meta" id="meta">loading…</span>
+  <span class="spacer"></span>
+  <div class="peers" id="peers"></div>
+  <button id="refresh">Refresh</button>
+</header>
+<main>
+  <div id="app"><div class="loading">Looking at Cloudflare and this Mac…</div></div>
+</main>
+<div id="toast"></div>
+<script>
+const $ = (s, el = document) => el.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+let state = null;
+
+function toast(msg, ms = 4000) {
+  const t = $("#toast"); t.textContent = msg; t.style.display = "block";
+  clearTimeout(toast.h); toast.h = setTimeout(() => t.style.display = "none", ms);
+}
+
+async function post(path, body) {
+  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Tunnels": "1" }, body: JSON.stringify(body || {}) });
+  const v = await r.json();
+  if (!r.ok) throw new Error(v.error || r.statusText);
+  return v;
+}
+
+function reportText(r) {
+  const lines = (r.done || []).map(o => `${o.ok ? "✓" : "✗"} ${o.summary} — ${o.detail}`);
+  (r.held || []).forEach(([s, why]) => lines.push(`· held: ${s} (${why})`));
+  return lines.join("\n") || "nothing to do";
+}
+
+async function load(fresh) {
+  $("#refresh").disabled = true;
+  try {
+    const r = await fetch("/api/status" + (fresh ? "?fresh=1" : ""));
+    const v = await r.json();
+    if (!r.ok) throw new Error(v.error || r.statusText);
+    state = v; render();
+  } catch (e) {
+    $("#app").innerHTML = `<div class="card lvl-error">${esc(e.message)}</div>`;
+  } finally { $("#refresh").disabled = false; }
+  loadAgent(); loadPeers();
+}
+
+async function loadAgent() {
+  try {
+    const v = await (await fetch("/api/agent")).json();
+    const el = $("#events"); if (!el) return;
+    const tick = v.last_tick;
+    $("#agent-meta").textContent = `agent v${v.version} on ${v.machine} · up since ${v.started_at}` +
+      (tick ? ` · last pass ${tick.at} (${tick.took_ms} ms)` : "") + (tick && tick.error ? ` · ✗ ${tick.error}` : "");
+    el.innerHTML = (v.events || []).map(e => `<div><span class="mute">${esc(e.at)}</span> ${esc(e.kind.padEnd(8))} ${esc(e.message)}</div>`).join("")
+      || `<div class="mute">nothing yet — the agent has had nothing to fix</div>`;
+  } catch { }
+}
+
+async function loadPeers() {
+  try {
+    const v = await (await fetch("/api/peers")).json();
+    $("#peers").innerHTML = v.map(p => {
+      const h = p.health; const ok = !!h;
+      const title = ok ? `v${h.version} · fleet serial ${h.serial ?? "—"}` : "not answering";
+      return `<span title="${esc(title)}"><i class="dot ${ok ? "up" : "down"}"></i>${esc(p.machine)}${ok && state && h.serial !== state.serial ? ` <span class="tag warn">serial ${esc(h.serial)}</span>` : ""}</span>`;
+    }).join("");
+  } catch { }
+}
+
+function dnsTag(r) {
+  switch (r.dns) {
+    case "ok": return `<span class="tag good">dns ok</span>`;
+    case "missing": return `<span class="tag bad">no dns</span>`;
+    case "elsewhere": return `<span class="tag warn">dns → ${esc(r.dns_target)}</span>`;
+    case "—": return "";
+    default: return `<span class="tag">dns ${esc(r.dns)}</span>`;
+  }
+}
+
+function roleTag(r) {
+  if (r.role === "primary") return r.active ? "" : `<span class="tag">primary (not active)</span>`;
+  if (r.role === "standby") return r.active ? `<span class="tag warn">standby · ACTIVE</span>` : `<span class="tag">standby</span>`;
+  return `<span class="tag warn">not in fleet</span>`;
+}
+
+function render() {
+  const s = state;
+  $("#meta").textContent = `seen from ${s.machine} · fleet serial ${s.serial}` +
+    (s.updated_by ? ` · last changed by ${s.updated_by} at ${s.updated_at}` : "") + ` · v${s.version}`;
+
+  const standbyRoutes = new Map();
+  s.tunnels.forEach(t => t.routes.forEach(r => { if (r.role === "standby") standbyRoutes.set(r.host, r); }));
+
+  const findings = s.plan.findings;
+  const actions = s.plan.actions;
+  let html = "";
+
+  html += `<h2>Needs attention</h2><div class="card">`;
+  html += findings.length ? findings.map(f => `
+    <div class="finding">
+      <span class="lvl-${f.level}">${f.level === "error" ? "✗" : f.level === "warn" ? "⚠" : "·"}</span>
+      <div><b>${esc(f.subject)}</b> — ${esc(f.message)}</div>
+      ${f.fix ? `<div class="fix">${esc(f.fix)}</div>` : ""}
+    </div>`).join("") : `<div class="mute">Nothing. Every tunnel is up and matches the fleet file.</div>`;
+  if (s.errors.length) html += s.errors.map(e => `<div class="finding"><span class="lvl-error">!</span><div class="mute">${esc(e)}</div></div>`).join("");
+  html += `</div>`;
+
+  html += `<h2>Differences from the fleet file</h2><div class="card">`;
+  if (!actions.length) html += `<div class="mute">None — Cloudflare and this Mac match the fleet file.</div>`;
+  else {
+    html += actions.map(a => {
+      const tags = [a.scope === "local" ? "this Mac" : "cloudflare"];
+      if (a.owner) tags.push("owner " + a.owner);
+      if (a.prune) tags.push("prune");
+      if (a.guarded && !a.destroy) tags.push("takeover");
+      if (a.destroy) tags.push("destroy");
+      return `<div class="action"><span class="mono">${esc(symbol(a))}</span><div>${esc(a.summary)}</div>
+        <div>${tags.map(t => `<span class="tag ${t === "takeover" || t === "destroy" ? "bad" : t === "prune" ? "warn" : ""}">${esc(t)}</span>`).join(" ")}</div></div>`;
+    }).join("");
+    const nPrune = actions.filter(a => a.prune).length, nGuard = actions.filter(a => a.guarded && !a.destroy).length;
+    html += `<div class="toolbar">
+      <button class="primary" data-apply='{}'>Apply safe changes</button>
+      ${nPrune ? `<button data-apply='{"prune":true}' data-confirm="Also remove ${nPrune} thing(s) the fleet file does not mention?">…and prune (${nPrune})</button>` : ""}
+      ${nGuard ? `<button class="danger" data-apply='{"prune":false,"yes":true}' data-confirm="Take ${nGuard} hostname(s) from tunnels that are serving them right now?">…and take over (${nGuard})</button>` : ""}
+    </div>`;
+  }
+  html += `</div>`;
+
+  const accounts = [...new Set(s.tunnels.map(t => t.account))].sort();
+  for (const acct of accounts) {
+    html += `<h2>${esc(acct)}</h2>`;
+    for (const t of s.tunnels.filter(t => t.account === acct)) {
+      const name = t.alias || t.cf_name;
+      html += `<div class="card">
+        <div class="row">
+          <i class="dot ${esc(t.state)}"></i>
+          <span class="alias">${esc(name)}</span>
+          ${t.in_fleet ? "" : `<span class="tag bad">not in fleet · tokens still work</span>`}
+          <span class="mute">${t.machine ? "on " + esc(t.machine) : "no fleet machine"}</span>
+          <span class="mono mute">${esc(t.id)}</span>
+          ${t.alias && t.cf_name && t.cf_name !== t.alias ? `<span class="mute">Cloudflare: ${esc(t.cf_name)}</span>` : ""}
+          <span class="spacer" style="flex:1"></span>
+          <span class="mute">${t.state === "up" ? `${t.connectors}× ${esc(t.colos.join(", "))}` : esc(t.state)}${t.versions.length ? ` · cloudflared ${esc(t.versions.join(", "))}` : ""}</span>
+          ${t.here ? `<button data-logs="${esc(t.here.name)}">logs</button>` : ""}
+        </div>
+        ${t.note ? `<div class="mute" style="margin-top:4px">${esc(t.note)}</div>` : ""}
+        ${t.routes.length ? `<table>${t.routes.map(r => {
+          const sb = r.role === "primary" ? standbyRoutes.get(r.host) : null;
+          const btn = r.role === "primary" && sb && r.active ? `<button data-promote="${esc(r.host)}">promote standby</button>`
+                    : r.role === "standby" && r.active ? `<button data-failback="${esc(r.host)}">fail back</button>` : "";
+          return `<tr>
+            <td><a href="https://${esc(r.host)}" target="_blank" rel="noopener">${esc(r.host)}</a></td>
+            <td class="mono">${esc(r.service)}</td>
+            <td>${roleTag(r)} ${dnsTag(r)} ${r.failover ? `<span class="tag">failover ${esc(r.failover)}</span>` : ""}</td>
+            <td style="text-align:right">${btn}</td></tr>`;
+        }).join("")}</table>` : `<div class="mute" style="margin-top:6px">no routes</div>`}
+      </div>`;
+    }
+  }
+
+  html += `<h2>Agent</h2><div class="card"><div class="mute" id="agent-meta"></div><div class="events" id="events" style="margin-top:8px"></div>
+    <div class="toolbar"><button data-logs="agent">agent log</button></div></div>`;
+  html += `<div class="card" id="logbox" style="display:none"><div class="row"><b id="logtitle"></b><span style="flex:1"></span><button id="logclose">close</button></div><pre id="logtext"></pre></div>`;
+  html += `<h2>Fleet file</h2><div class="card"><details><summary>serial ${s.serial} — edit with <span class="mono">tunnels fleet edit</span></summary><pre id="fleettext">…</pre></details></div>`;
+  $("#app").innerHTML = html;
+  fetch("/api/fleet").then(r => r.text()).then(t => { const el = $("#fleettext"); if (el) el.textContent = t; });
+}
+
+function symbol(a) {
+  if (a.destroy) return "!";
+  if (["add-ingress", "create-dns", "start-local", "load-local"].includes(a.op)) return "+";
+  if (["update-ingress", "repoint-dns", "restart-local"].includes(a.op)) return "~";
+  return "−";
+}
+
+document.addEventListener("click", async e => {
+  const b = e.target.closest("button"); if (!b) return;
+  if (b.id === "refresh") return load(true);
+  if (b.id === "logclose") { $("#logbox").style.display = "none"; return; }
+  if (b.dataset.logs) {
+    const name = b.dataset.logs;
+    const t = await (await fetch("/api/logs?tunnel=" + encodeURIComponent(name))).text();
+    $("#logtitle").textContent = name === "agent" ? "agent log" : `logs: ${name}`;
+    $("#logtext").textContent = t || "(empty)";
+    $("#logbox").style.display = "block"; $("#logbox").scrollIntoView({ behavior: "smooth" });
+    return;
+  }
+  try {
+    if (b.dataset.apply) {
+      if (b.dataset.confirm && !confirm(b.dataset.confirm)) return;
+      b.disabled = true; toast("applying…", 60000);
+      const r = await post("/api/apply", JSON.parse(b.dataset.apply));
+      toast(reportText(r), 9000); load(true);
+    } else if (b.dataset.promote) {
+      if (!confirm(`Send ${b.dataset.promote} to its standby now?`)) return;
+      b.disabled = true; const r = await post("/api/promote", { host: b.dataset.promote });
+      toast(reportText(r), 9000); load(true);
+    } else if (b.dataset.failback) {
+      if (!confirm(`Send ${b.dataset.failback} back to its primary now?`)) return;
+      b.disabled = true; const r = await post("/api/failback", { host: b.dataset.failback });
+      toast(reportText(r), 9000); load(true);
+    }
+  } catch (err) { toast("✗ " + err.message, 8000); b.disabled = false; }
+});
+
+load(false);
+setInterval(() => { loadAgent(); loadPeers(); }, 15000);
+setInterval(() => load(false), 60000);
+</script>
+</body>
+</html>

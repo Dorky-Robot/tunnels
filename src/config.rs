@@ -11,6 +11,19 @@ pub struct Tunnel {
     pub api_token: Option<String>,
 }
 
+impl Tunnel {
+    /// The Cloudflare tunnel this connector token runs, if it decodes.
+    pub fn tunnel_id(&self) -> Option<String> {
+        decode_token(&self.token).ok().map(|p| p.tunnel_id)
+    }
+
+    pub fn account_id(&self) -> Option<String> {
+        decode_token(&self.token).ok().map(|p| p.account_id)
+    }
+}
+
+/// Kept so an old config still opens and nothing in it is lost on write.
+/// Service tracking was a TUI feature; routes in the fleet file carry notes now.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Service {
     pub name: String,
@@ -40,14 +53,13 @@ pub struct ApiToken {
     /// domains in each. A summary string cannot be grouped or sorted, and
     /// grouping is the whole point when there is more than one account.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub reach: Vec<crate::cloudflare::Reach>,
+    pub reach: Vec<Reach>,
 }
 
 impl ApiToken {
     /// The first few characters, for showing without revealing.
     pub fn hint(&self) -> String {
-        let head: String = self.token.chars().take(10).collect();
-        format!("{head}… ({} chars)", self.token.len())
+        hint(&self.token)
     }
 }
 
@@ -65,7 +77,7 @@ impl<'de> Deserialize<'de> for ApiTokenCompat {
                 #[serde(default)]
                 covers: String,
                 #[serde(default)]
-                reach: Vec<crate::cloudflare::Reach>,
+                reach: Vec<Reach>,
             },
         }
         Ok(ApiTokenCompat(match Either::deserialize(d)? {
@@ -91,10 +103,31 @@ impl From<&str> for ApiTokenCompat {
     }
 }
 
+/// What a token can actually reach: the Cloudflare accounts it can see,
+/// each with the domains in it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Reach {
+    pub account_id: String,
+    pub account_name: String,
+    pub zones: Vec<String>,
+}
+
+/// The first few characters of a secret, for showing without revealing.
+pub fn hint(token: &str) -> String {
+    let head: String = token.chars().take(6).collect();
+    format!("{head}… ({} chars)", token.len())
+}
+
+/// This machine's secrets and identity: connector tokens for the tunnels it
+/// runs, and Cloudflare API tokens. Never replicated, never in the fleet file.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
-    pub tunnels: Vec<Tunnel>,
+    /// this machine's name in the fleet, if it differs from `hostname -s`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
     #[serde(default)]
+    pub tunnels: Vec<Tunnel>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub services: Vec<Service>,
     /// Cloudflare API tokens — one per CF account.
     /// Create at https://dash.cloudflare.com/profile/api-tokens with
@@ -151,8 +184,43 @@ impl Config {
         })
     }
 
-    pub fn owned_api_tokens(&self) -> Vec<String> {
-        self.all_cf_api_tokens().into_iter().map(|s| s.to_string()).collect()
+    /// The tunnel entry here running this Cloudflare tunnel, if any.
+    pub fn tunnel_by_id(&self, tunnel_id: &str) -> Option<&Tunnel> {
+        self.find_tunnel_by_tunnel_id(tunnel_id)
+    }
+
+    pub fn tunnel_by_name(&self, name: &str) -> Option<&Tunnel> {
+        self.tunnels.iter().find(|t| t.name == name)
+            .or_else(|| self.tunnels.iter().find(|t| t.name.eq_ignore_ascii_case(name)))
+    }
+
+    /// Directory the config lives in; the fleet file and token files sit beside it.
+    pub fn dir() -> PathBuf {
+        Self::path().parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    pub fn set_machine(&mut self, machine: &str) -> Result<()> {
+        let m = machine.to_string();
+        self.edit(|c| {
+            c.machine = Some(m);
+            Ok(())
+        })
+    }
+
+    /// Add a tunnel, or replace the token of the entry already running it.
+    pub fn upsert_tunnel(&mut self, name: &str, token: &str) -> Result<()> {
+        let (name, token) = (name.to_string(), token.to_string());
+        let id = decode_token(&token)?.tunnel_id;
+        self.edit(|c| {
+            if let Some(t) = c.tunnels.iter_mut().find(|t| t.tunnel_id().as_deref() == Some(id.as_str())) {
+                t.token = token;
+            } else if let Some(t) = c.tunnels.iter_mut().find(|t| t.name == name) {
+                t.token = token;
+            } else {
+                c.tunnels.push(Tunnel { name, token, api_token: None });
+            }
+            Ok(())
+        })
     }
 
     /// Where the config lives. `TUNNELS_CONFIG` overrides it — needed to
@@ -227,7 +295,7 @@ impl Config {
         &mut self,
         token: String,
         covers: String,
-        reach: Vec<crate::cloudflare::Reach>,
+        reach: Vec<Reach>,
     ) -> Result<()> {
         self.edit(|c| {
             // adding a token a second time relabels it rather than
@@ -265,6 +333,7 @@ impl Config {
             if c.tunnels.iter().any(|t| t.name == name) {
                 anyhow::bail!("tunnel '{}' already exists", name);
             }
+            decode_token(&token).with_context(|| "that is not a connector token (they start with eyJ)")?;
             c.tunnels.push(Tunnel { name, token, api_token: None });
             Ok(())
         })
@@ -317,40 +386,6 @@ impl Config {
         })
     }
 
-    pub fn add_service(&mut self, name: String, port: u16, tunnel: Option<String>, memo: Option<String>) -> Result<()> {
-        self.edit(|c| {
-            if c.services.iter().any(|s| s.port == port) {
-                anyhow::bail!("port {} already tracked", port);
-            }
-            c.services.push(Service { name, port, machine: String::new(), tunnel, memo });
-            Ok(())
-        })
-    }
-
-    pub fn remove_service_by_idx(&mut self, idx: usize) -> Result<()> {
-        self.edit(|c| {
-            if idx < c.services.len() {
-                c.services.remove(idx);
-                Ok(())
-            } else {
-                anyhow::bail!("service not found")
-            }
-        })
-    }
-
-    pub fn update_service(&mut self, idx: usize, name: String, port: u16, tunnel: Option<String>, memo: Option<String>) -> Result<()> {
-        self.edit(|c| {
-            if let Some(s) = c.services.get_mut(idx) {
-                s.name = name;
-                s.port = port;
-                s.tunnel = tunnel;
-                s.memo = memo;
-                Ok(())
-            } else {
-                anyhow::bail!("service index out of range")
-            }
-        })
-    }
 }
 
 /// Decode the JWT-like token to extract account_id and tunnel_id
@@ -361,6 +396,9 @@ pub struct TokenPayload {
     pub account_id: String,
     #[serde(rename = "t")]
     pub tunnel_id: String,
+    /// the tunnel secret; changes when the tunnel is rotated
+    #[serde(rename = "s", default)]
+    pub secret: String,
 }
 
 pub fn decode_token(token: &str) -> Result<TokenPayload> {
@@ -383,6 +421,7 @@ mod tests {
         let valid_token = STANDARD.encode(serde_json::to_vec(&payload).unwrap());
 
         let config = Config {
+            machine: None,
             tunnels: vec![Tunnel {
                 name: "my-tunnel".into(),
                 token: valid_token.clone(),
@@ -586,6 +625,7 @@ mod tests {
     #[test]
     fn all_cf_api_tokens_merges_sources() {
         let config = Config {
+            machine: None,
             tunnels: vec![Tunnel {
                 name: "t1".into(),
                 token: "connector".into(),
@@ -606,6 +646,7 @@ mod tests {
     #[test]
     fn all_cf_api_tokens_deduplicates() {
         let config = Config {
+            machine: None,
             tunnels: vec![],
             services: vec![],
             cf_api_tokens: vec!["same_tok".into()],

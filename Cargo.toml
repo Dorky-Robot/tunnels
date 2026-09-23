@@ -7,12 +7,17 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.102"
 base64 = "0.22.1"
-crossterm = "0.29.0"
 dirs = "6.0.0"
-ratatui = "0.30.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 libc = "0.2"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+ureq = { version = "3.4.2", features = ["json"] }
+toml = "1.1.6"
+tiny_http = "0.12.0"
 
 [dev-dependencies]
+base64 = "0.22.1"
+serde_json = "1.0.149"
 tempfile = "3"
+tiny_http = "0.12.0"
