@@ -816,7 +816,17 @@ fn resolve_tunnel(config: &config::Config, tunnel_name: &str) -> Result<(String,
             tunnel_name
         )
     }
+    // a uuid names exactly one tunnel; a name can be two machines' local
+    // names for two different tunnels in the same account
+    let looks_like_id = tunnel_name.len() == 36
+        && tunnel_name.bytes().all(|b| b == b'-' || b.is_ascii_hexdigit());
     for (api_token, hint_accounts) in config.api_tokens_with_reach() {
+        if looks_like_id {
+            if let Some(account_id) = cloudflare::find_tunnel_by_id(api_token, &hint_accounts, tunnel_name) {
+                return Ok((api_token.to_string(), account_id, tunnel_name.to_string()));
+            }
+            continue;
+        }
         if let Some((account_id, tunnel_id)) =
             cloudflare::find_tunnel_by_name(api_token, &hint_accounts, tunnel_name)
         {

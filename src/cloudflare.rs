@@ -152,6 +152,25 @@ pub(crate) fn find_tunnel_by_name(
     None
 }
 
+/// Find a tunnel by id, across every account this token can see. Names are
+/// per-machine and can collide — two boxes each running a tunnel called
+/// DorkyRobot, in the same account, is a real case — but an id is one tunnel.
+pub(crate) fn find_tunnel_by_id(
+    api_token: &str,
+    hint_accounts: &[String],
+    tunnel_id: &str,
+) -> Option<String> {
+    let mut accounts: Vec<String> = hint_accounts.to_vec();
+    for id in list_account_ids(api_token) {
+        if !accounts.contains(&id) {
+            accounts.push(id);
+        }
+    }
+    accounts
+        .into_iter()
+        .find(|account_id| fetch_tunnel_detail(api_token, account_id, tunnel_id).is_some())
+}
+
 fn list_account_ids(api_token: &str) -> Vec<String> {
     let output = Command::new("curl")
         .args([
