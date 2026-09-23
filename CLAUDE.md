@@ -1,152 +1,95 @@
 # tunnels
 
-A k9s-style TUI for managing cloudflared tunnels and local services on macOS.
+Cloudflare tunnels across a fleet of Macs, driven by a config file and a CLI and kept in line by
+an agent on every machine. There is no TUI. The web UI, served by the agent and tailnet-only, is
+the visual interface.
 
 ## Architecture
 
-- **config.rs** — JSON config at `~/.config/tunnels/config.json` (override with `TUNNELS_CONFIG`), tunnel + service CRUD, token decode. Services have optional `memo` field. **Every mutation goes through `Config::edit`, which re-reads the file first**; `save` is private. A long-running TUI holds its config for a whole session, so writing that copy blindly discards anything the CLI wrote meanwhile — that is how an API token once vanished with no code ever removing one.
-- **ops.rs** — operations, once, returning values rather than printed text or UI state. Both front doors call these, so a decision cannot differ between them. If a behaviour would be surprising when the CLI and TUI disagree about it, it belongs here.
-- **launchd.rs** — LaunchAgent plist generation, start/stop/status via `launchctl`, plist discovery/migration
-- **cloudflare.rs** — CF API integration via API tokens (multi-account + per-tunnel), tunnel details + ingress route fetch, route add/remove with DNS management, auto-match tokens to accounts
-- **scan.rs** — Service discovery via `lsof`: find listening TCP ports, resolve project names from process cwd
-- **app.rs** — App state, unified tree view model (UnifiedRow), mode machine with prefix keys + context menu, CF + scan integration
-- **ui.rs** — ratatui rendering: tree table (tunnels with nested services), context menu overlay, prefix-aware keybinding bar, dialogs
-- **main.rs** — crossterm event loop, unified key handler with context-sensitive dispatch, prefix key handler, context menu handler, full CLI subcommands
-
-## Build & Install
-
 ```
-cargo build --release
-cp target/release/tunnels ~/.local/bin/
+  fleet.toml ──┐                        ┌── cf.rs (Cloudflare API)
+               ├─ plan.rs ── apply.rs ──┤
+  observe.rs ──┘                        └── launchd.rs (this Mac)
 ```
 
-Or via Homebrew: `brew install dorky-robot/tap/tunnels`
+- **fleet.rs**: the fleet file (`~/.config/tunnels/fleet.toml`, overridden by `TUNNELS_FLEET`).
+  It holds machines, accounts, tunnels (an alias pointing at a Cloudflare id), routes, and policy.
+  No secrets.
+  - `validate()` catches the mistakes that have hurt before, such as a hostname aimed at a tunnel
+    in a different account from its zone.
+  - `Fleet::edit` re-reads the file, applies the change, bumps `serial`, validates and saves.
+- **config.rs**: this Mac's secrets (`config.json`): connector tokens and API tokens. **Every
+  mutation goes through `Config::edit`, which re-reads the file first**, and `save` is private.
+  A long-running process that blindly wrote its stale copy once lost a token.
+- **cf.rs**: a typed Cloudflare client (ureq). Never shell out to curl, which puts the token in
+  argv. Ingress rules keep their raw JSON so `originRequest` and similar fields survive a rewrite.
+  `TUNNELS_CF_API` overrides the base URL; the tests point it at a fake Cloudflare.
+- **observe.rs**: a snapshot of every account, tunnel, connector, ingress rule and tunnel CNAME,
+  plus this Mac's launchd state.
+  - A `Want` narrows what gets fetched; the agent asks only for what it owns.
+  - `ingress: None` means *unknown*, not *empty*. The plan must never remove what it has not seen.
+- **plan.rs**: pure; takes a fleet and a snapshot and returns actions and findings. Each action
+  carries its `scope`, its `owner` machine, and flags:
+  - `prune`: removes something the file doesn't mention; needs `--prune`.
+  - `guarded`: a live takeover; needs `--yes`.
+  - `destroy`: deletes a tunnel; needs `--allow-destroy`.
 
-## Tree View
+  Agents run only actions with none of these flags, and only the ones they own.
+- **apply.rs**: runs actions in a fixed order (local, ingress, DNS, removals, destroys). When a
+  DNS step fails, it rolls back that route's ingress change.
+- **agent.rs**: the per-machine loop.
+  - It pulls the newest fleet from peers, reloads booted-out jobs, and restarts dead connectors,
+    but only after two bad passes and at most once every 5 minutes.
+  - It refetches a rotated connector token, repairs drift it owns, and performs automatic
+    failover.
+  - It exits when the binary changes so that launchd starts the new one.
+- **web.rs** + **web/index.html**: the agent's HTTP API and the UI.
+  - Binds to the tailnet IP and loopback only, and rejects non-tailnet addresses and requests
+    carrying proxy headers (`Cf-Ray` and similar).
+  - POSTs need an `X-Tunnels: 1` header.
+- **sync.rs**: fleet replication. The file is served at `/api/fleet` and the newest `serial`
+  wins. `notify` wakes the peers.
+- **status.rs**: the shared view model used by `tunnels status` and the web UI.
+- **scope.rs**: `Scope` for every command. `cf::Client::new` panics if the current command
+  declared `Local`.
+- **main.rs**: the clap CLI. The `SCOPES` table is the single source of truth for scopes, and
+  tests hold every command's help text to it.
 
-**Cloudflare is the source of truth.** The rows under a tunnel are the
-ingress rules the account holds, fetched at sync — not a locally
-maintained list. Several machines share these accounts, so anything
-mapped by hand here is a second opinion that goes stale the moment
-another machine changes something, and a route nobody tracked locally
-used to be invisible entirely.
+## Rules
 
-Local knowledge annotates those rows and never structures them: whether
-a port is answering on this machine (`live` / `nothing there`), and the
-name and memo from `service` entries matched by port. Services with no
-route appear under "running here, not routed".
-
-Single unified view: tunnels as parent rows (▼/▶) with services nested underneath. Unlinked services appear under a separator.
-
-## Key Bindings
-
-### Normal mode (context-sensitive)
-| Key | On Tunnel | On Service |
-|-----|-----------|------------|
-| j/k | Navigate | Navigate |
-| Enter | Context menu | Context menu |
-| Space/←/→ | Toggle expand/collapse | (no-op) |
-| s | Start tunnel | — |
-| x | Stop tunnel | — |
-| r | Restart tunnel | — |
-| e | Edit connector token | Edit service |
-| n | Rename tunnel | Rename URL |
-| d | Delete tunnel | Untrack service |
-| l | View logs | — |
-| m | Manage routes | — |
-| a | Prefix: add... | Prefix: add... |
-| t | Prefix: token... | Prefix: token... |
-| g | Prefix: global... | Prefix: global... |
-| ? | Help | Help |
-| q/Esc | Quit | Quit |
-
-### Prefix keys
-**a → add...**
-| Key | Action |
-|-----|--------|
-| t | Add tunnel |
-| s | Add service |
-| r | Add route (tunnel selected) |
-| Esc | Cancel |
-
-**t → token...**
-| Key | Action |
-|-----|--------|
-| l | Domains you can reach — grouped by Cloudflare account |
-| a | Add CF API token (one per CF account) |
-| n | New connector — a second tunnel, for another account |
-| c | Replace this tunnel'"'"'s CONNECTOR token (restarts it) |
-| Esc | Cancel |
-
-**One machine, several Cloudflare accounts.** This is what the tool is
-for: a box can run a connector per account side by side, each with its
-own tunnel, and hold an API token per account for routes and DNS. A
-hostname must be claimed by exactly one tunnel — and the tunnel holding
-its ingress must be the one its DNS CNAMEs to. On 2026-09-01 two tunnels
-were both named `mac-2024`, one per account; the felixflor.es DNS pointed
-at the account whose connector had stopped running, so those hostnames
-returned 530 while the ingress sat on the other tunnel.
-
-**g → global...**
-| Key | Action |
-|-----|--------|
-| s | Sync from Cloudflare |
-| p | Scan listening ports |
-| i | Import existing plists |
-| Esc | Cancel |
-
-### Context menu (Enter)
-Opens a floating menu with actions for the selected row. Navigate with j/k + Enter, or press the shortcut letter.
-
-## CLI Subcommands
-
-```
-# TUI
-tunnels                              # Launch TUI
-
-# Tunnel lifecycle
-tunnels list [--json]                # List tunnels
-tunnels start <name>                 # Start a tunnel
-tunnels stop <name>                  # Stop a tunnel
-tunnels restart <name>               # Restart a tunnel
-tunnels logs <name> [--lines N]      # View tunnel logs
-tunnels add <name> --token <token>   # Add a new tunnel
-tunnels rm <name>                    # Delete a tunnel
-tunnels rename <old> <new>           # Rename a tunnel
-tunnels import                       # Import existing plists
-
-# Routes
-tunnels routes [TUNNEL] [--json]     # List ingress routes
-tunnels route add <host> <port> --tunnel <name>  # Idempotent
-#   --tunnel may name a tunnel another machine runs: it is found in
-#   Cloudflare by name through the API tokens held here
-tunnels route rm <host> --tunnel <name>
-tunnels route mv <old> <new> --tunnel <name>
-
-# Services
-tunnels service list [--json]        # List tracked services
-tunnels service add <name> --port <p> [--tunnel <t>] [--memo <m>]
-tunnels service rm <name>            # Remove a service
-tunnels service edit <name> [--port <p>] [--tunnel <t>] [--memo <m>]
-tunnels service scan                 # Scan for listening ports
-
-# Tokens & sync
-tunnels token add <token>            # Add CF API token (one per CF account)
-tunnels token list                   # Domains reachable, grouped by account
-tunnels token rm <#>                 # Forget a token
-tunnels token edit <tunnel> --token <token>  # Set per-tunnel token
-tunnels sync                         # Sync from Cloudflare API
-```
+- **Say where a command acts.** New commands get an entry in `SCOPES`, and their doc comment
+  starts with that scope's tag. `tunnels rm` once said "Delete a tunnel" but only forgot it
+  locally, so its token kept working in Cloudflare. It is gone; `tunnel forget` (local) and
+  `tunnel destroy` (Cloudflare) replace it.
+- **Unknown is not missing.** Never plan a removal from data that wasn't fetched.
+- **One owner per thing.** Ingress belongs to the machine running the tunnel; DNS belongs to the
+  machine running the route's *active* tunnel.
+- **No silent takeovers.** A hostname served by a live tunnel moves only with `--yes`.
 
 ## Don't strand the machine you're on
 
-This tool restarts the tunnels that carry our ssh. A bootout-then-bootstrap
-over a tunneled ssh took Doug's mini offline on 2026-09-20: the bootout
-killed the session before the bootstrap could run. So `launchd::restart`
-detaches both halves whenever `SSH_CONNECTION`/`SSH_TTY` is set — keep that
-guard, and prefer `launchctl kickstart -k` for jobs that are already loaded.
+This tool restarts the tunnels that carry our ssh. On 2026-09-21, a bootout-then-bootstrap over a
+tunneled ssh session took Doug's mini offline: the bootout killed the session before the
+bootstrap could run.
 
-`mesh/` is the one source for the mesh ssh config (three paths per machine:
-tailnet, `-lan`, `cloudflare-`). Edit it here and push to every machine with
-`sh mesh/install.sh`. Why this shape, and how to add a machine:
-`docs/remote-access.md`.
+- Restart loaded jobs with `launchctl kickstart -k` (`launchd::kickstart`).
+- When a plist has to change, `launchd::restart` detaches both halves whenever
+  `SSH_CONNECTION`/`SSH_TTY` is set.
+- The agent reloads booted-out jobs; this replaces `scripts/tunnel-watchdog.sh`.
+- Connector tokens live in `~/.config/tunnels/tokens/<id>` (0600) and plists use `--token-file`,
+  so a token change needs only a kickstart.
+
+## Build, test, release
+
+```
+cargo test            # unit tests + tests/cli.rs (the real binary against a fake Cloudflare)
+cargo build --release
+```
+
+Release: bump `Cargo.toml`, tag `vX.Y.Z`, and push the tag. `.github/workflows/release.yml`
+builds both architectures and updates `dorky-robot/homebrew-tap`.
+
+`mesh/` is the one source for the mesh ssh config (three paths per machine: tailnet, `-lan`,
+`cloudflare-`). Push it to every machine with `sh mesh/install.sh`, which also runs
+`tunnels agent install`. `docs/remote-access.md` explains why it is shaped this way and how to add
+a machine.

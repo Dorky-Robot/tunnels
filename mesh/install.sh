@@ -16,9 +16,12 @@
 #   ~/.ssh/config.d/machines, accounts  the inventory, for desktop and github-key-setup
 #   ~/.ssh/authorized_keys              the mesh block: every machine's mesh key
 #   ~/.local/bin/github-key-setup       this machine's own GitHub key, and git set up for it
-#   ~/.local/bin/tunnel-watchdog.sh     brings back a tunnel that was booted out
 #   ~/.local/bin/desktop + symlinks     desktop-<machine>, a screen in one word
-#   com.dorkyrobot.tunnel-watchdog      runs it every five minutes, finds its own tunnels
+#   the tunnels agent                   `tunnels agent install`: keeps this machine's
+#                                       tunnels running and in line with the fleet file,
+#                                       and brings back one that was booted out. With a
+#                                       tunnels too old to have an agent, the old
+#                                       tunnel-watchdog.sh does that last part instead.
 #
 # What it does NOT do, because it cannot be done from one machine:
 #   - make this machine's mesh key or GitHub key (docs/remote-access.md,
@@ -139,22 +142,29 @@ cp "$here/github-key-setup" "$HOME/.local/bin/github-key-setup"
 chmod +x "$HOME/.local/bin/github-key-setup"
 "$HOME/.local/bin/github-key-setup" --git || echo "install: github-key-setup --git failed; git is as it was" >&2
 
-cp "$repo/scripts/tunnel-watchdog.sh" "$HOME/.local/bin/tunnel-watchdog.sh"
-chmod +x "$HOME/.local/bin/tunnel-watchdog.sh"
-
 # desktop-<machine>. --install makes its own symlinks beside itself, from the
 # machines file this installed above.
 cp "$here/desktop" "$HOME/.local/bin/desktop"
 chmod +x "$HOME/.local/bin/desktop"
 "$HOME/.local/bin/desktop" --install >/dev/null
 mkdir -p "$HOME/Library/LaunchAgents"
-P="$HOME/Library/LaunchAgents/com.dorkyrobot.tunnel-watchdog.plist"
-if ! cmp -s "$here/com.dorkyrobot.tunnel-watchdog.plist" "$P" || ! launchctl print "gui/$(id -u)/com.dorkyrobot.tunnel-watchdog" >/dev/null 2>&1; then
-  launchctl bootout "gui/$(id -u)/com.dorkyrobot.tunnel-watchdog" 2>/dev/null || true
-  cp "$here/com.dorkyrobot.tunnel-watchdog.plist" "$P"
-  launchctl bootstrap "gui/$(id -u)" "$P"
+TUNNELS=$(command -v tunnels || ls /opt/homebrew/bin/tunnels /usr/local/bin/tunnels 2>/dev/null | head -1 || true)
+if [ -n "$TUNNELS" ] && "$TUNNELS" agent --help >/dev/null 2>&1; then
+  # the agent does what the watchdog did, and more; it removes the watchdog itself
+  "$TUNNELS" agent install >/dev/null
+  keeper="agent $("$TUNNELS" --version | cut -d' ' -f2)"
+else
+  cp "$repo/scripts/tunnel-watchdog.sh" "$HOME/.local/bin/tunnel-watchdog.sh"
+  chmod +x "$HOME/.local/bin/tunnel-watchdog.sh"
+  P="$HOME/Library/LaunchAgents/com.dorkyrobot.tunnel-watchdog.plist"
+  if ! cmp -s "$here/com.dorkyrobot.tunnel-watchdog.plist" "$P" || ! launchctl print "gui/$(id -u)/com.dorkyrobot.tunnel-watchdog" >/dev/null 2>&1; then
+    launchctl bootout "gui/$(id -u)/com.dorkyrobot.tunnel-watchdog" 2>/dev/null || true
+    cp "$here/com.dorkyrobot.tunnel-watchdog.plist" "$P"
+    launchctl bootstrap "gui/$(id -u)" "$P"
+  fi
+  keeper="watchdog $(shasum -a 256 "$HOME/.local/bin/tunnel-watchdog.sh" | cut -c1-12)"
 fi
 
 h() { shasum -a 256 "$1" | cut -c1-12; }
-printf '%s  mesh.conf %s  known_hosts %s  github.conf %s  watchdog %s\n' "$H" \
-  "$(h "$D/mesh.conf")" "$(h "$D/mesh_known_hosts")" "$(h "$D/github.conf")" "$(h "$HOME/.local/bin/tunnel-watchdog.sh")"
+printf '%s  mesh.conf %s  known_hosts %s  github.conf %s  %s\n' "$H" \
+  "$(h "$D/mesh.conf")" "$(h "$D/mesh_known_hosts")" "$(h "$D/github.conf")" "$keeper"

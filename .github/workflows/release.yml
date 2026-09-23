@@ -76,10 +76,10 @@ jobs:
           mkdir -p homebrew-tap/Formula
           cat > homebrew-tap/Formula/tunnels.rb << FORMULA
           class Tunnels < Formula
-            desc "k9s-style TUI for managing cloudflared tunnels and local services"
+            desc "Cloudflare tunnels across a fleet of Macs: a config file, a CLI and an agent"
             homepage "https://github.com/Dorky-Robot/tunnels"
             version "${VERSION}"
-            license "MIT"
+            license any_of: ["MIT", "Apache-2.0"]
 
             on_macos do
               on_arm do

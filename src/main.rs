@@ -1554,7 +1554,9 @@ fn destroy_cmd(key: &str, yes: bool, json: bool) -> Result<i32> {
             bail!("not destroyed");
         }
     }
-    let notes = apply::destroy(&snap, &mut c.config, &obs.account_id, &r.id)?;
+    // out of the fleet first, so no agent starts it again while it is being
+    // deleted; if the deletion then fails it shows up as an orphan, with this
+    // same command as the fix
     if let (Some(_), Some(alias)) = (&fleet, &r.alias) {
         let f = Fleet::edit(&c.me, |f| {
             remove_tunnel_from_fleet(f, alias);
@@ -1562,6 +1564,7 @@ fn destroy_cmd(key: &str, yes: bool, json: bool) -> Result<i32> {
         })?;
         sync::notify(&f, &c.me);
     }
+    let notes = apply::destroy(&snap, &mut c.config, &obs.account_id, &r.id)?;
     if json {
         print_json(&serde_json::json!({ "scope": Scope::LocalAndCloudflare, "destroyed": r.id, "notes": notes }))?;
     } else {
@@ -1724,13 +1727,16 @@ fn agent_cmd(cmd: AgentCmd, json: bool) -> Result<i32> {
             let exe = exe_for_launchd();
             announce(&format!("install the agent ({exe})"));
             launchd::install_agent(&exe)?;
-            // the agent does what the watchdog did; two of them is one too many
-            let wd = launchd::plist_dir().join("com.dorkyrobot.tunnel-watchdog.plist");
-            if wd.exists() {
-                let uid = unsafe { libc::getuid() };
-                let _ = std::process::Command::new("launchctl").args(["bootout", &format!("gui/{uid}/com.dorkyrobot.tunnel-watchdog")]).output();
-                let _ = std::fs::remove_file(&wd);
-                println!("  removed the old tunnel-watchdog LaunchAgent (the agent does its job now)");
+            // the agent does what the watchdog and the periodic `tunnels heal`
+            // did; two of them doing it is one too many
+            for label in ["com.dorkyrobot.tunnel-watchdog", "com.tunnels.heal"] {
+                let p = launchd::plist_dir().join(format!("{label}.plist"));
+                if p.exists() {
+                    let uid = unsafe { libc::getuid() };
+                    let _ = std::process::Command::new("launchctl").args(["bootout", &format!("gui/{uid}/{label}")]).output();
+                    let _ = std::fs::remove_file(&p);
+                    println!("  removed the old {label} LaunchAgent (the agent does its job now)");
+                }
             }
             let port = Fleet::load().ok().flatten().map(|f| f.policy.web_port).unwrap_or(fleet::DEFAULT_WEB_PORT);
             println!("✓ agent installed and started");

@@ -70,7 +70,14 @@ fn reply_err(req: Request, code: u16, msg: &str) {
 
 fn handle(shared: Shared, mut req: Request) {
     let allowed = req.remote_addr().map(|a| util::is_tailnet_or_loopback(&a.ip())).unwrap_or(false);
-    if !allowed {
+    // cloudflared connects from localhost, so a route pointed at this port
+    // would pass the address check and publish the UI to the internet.
+    // Anything that came through a proxy carries these; nothing on the
+    // tailnet does.
+    let proxied = req.headers().iter().any(|h| {
+        ["Cf-Ray", "Cf-Connecting-Ip", "X-Forwarded-For", "Forwarded", "Cf-Warp-Tag-Id"].iter().any(|n| h.field.equiv(*n))
+    });
+    if !allowed || proxied {
         let _ = req.respond(Response::from_string("tailnet only").with_status_code(403));
         return;
     }

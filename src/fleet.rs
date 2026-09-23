@@ -366,6 +366,9 @@ impl Fleet {
             if !r.service.contains("://") && !r.service.starts_with("http_status:") {
                 out.push(format!("`{}`: service `{}` should be a URL like http://localhost:3000", r.host, r.service));
             }
+            if local_port(&r.service) == Some(self.policy.web_port) {
+                out.push(format!("`{}` would publish the tunnels web UI (port {}) to the internet", r.host, self.policy.web_port));
+            }
             if self.account_for_host(&r.host).is_none() && !self.accounts.is_empty() {
                 out.push(format!("`{}` is in no zone of any account in this file", r.host));
             }
@@ -556,6 +559,18 @@ service = "http://localhost:2283"
         });
         let problems = f.validate();
         assert!(problems.iter().any(|p| p.contains("its own zone's account")), "{problems:?}");
+    }
+
+    #[test]
+    fn the_web_ui_is_never_a_route() {
+        let mut f = sample();
+        f.routes.push(Route {
+            host: "ui.felixflor.es".into(),
+            tunnel: "dr2-home".into(),
+            service: format!("http://localhost:{DEFAULT_WEB_PORT}"),
+            ..Default::default()
+        });
+        assert!(f.validate().iter().any(|p| p.contains("publish the tunnels web UI")));
     }
 
     #[test]

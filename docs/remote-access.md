@@ -129,6 +129,14 @@ Host mini-lan
 
 ## The watchdog
 
+*Since tunnels 0.16 the agent (`tunnels agent install`) does this job: every
+pass it loads any cloudflared job whose plist is on disk but which launchd
+has forgotten, and `mesh/install.sh` installs the agent instead of this
+script. The agent is a user LaunchAgent, so what follows about login screens
+still applies to it — a machine that reboots to a login screen needs
+auto-login, or the system-daemon form of the watchdog below. The rest of
+this section is kept for that case, and for machines on an older tunnels.*
+
 `~/.local/bin/tunnel-watchdog.sh` bootstraps any launchd job in its list
 that is not loaded. It exists for the one case `KeepAlive` cannot cover: a
 job that was booted out rather than a process that died.
@@ -201,7 +209,7 @@ if it is not.
 | `~/.ssh/authorized_keys`, between markers | keys/ | every machine's mesh key; take one out of `keys/` and the next install everywhere stops letting it in |
 | `~/.local/bin/github-key-setup` | | this machine's own GitHub key, and git set up to push and sign with it |
 | `~/.local/bin/desktop` + `desktop-<name>` | machines | a screen in one word; reads the installed `machines` |
-| `~/.local/bin/tunnel-watchdog.sh` + its agent | | finds this user's cloudflared agents and brings back any that were booted out |
+| the tunnels agent (`tunnels agent install`) | | keeps this machine's tunnels in line with the fleet file and brings back any that were booted out; `tunnel-watchdog.sh` instead, on a tunnels older than 0.16 |
 
 Each machine's own `~/.ssh/config` keeps whatever it had and gains one line,
 `Include ~/.ssh/config.d/*.conf`, placed after any Includes already at the
