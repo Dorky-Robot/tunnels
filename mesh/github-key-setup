@@ -53,7 +53,7 @@ PRIMARY=; field "$ACCT" 4 | grep -qE '(^| )github\.com( |$)' && PRIMARY=1
 BK=$S/backups; stamp=$(date +%Y%m%d-%H%M%S)
 
 fp() { ssh-keygen -lf "$1" 2>/dev/null | cut -d' ' -f2; }
-blob() { awk '{print $2}' "$1"; }
+blob() { awk '{print $2}' "$1.pub"; }   # blob <key>: its public half, as GitHub lists it
 # does GitHub take this key, on its own (no agent, no ssh config), as $ACCT?
 works() {
   SSH_AUTH_SOCK= ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=10 -o IdentitiesOnly=yes \
