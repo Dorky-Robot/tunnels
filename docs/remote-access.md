@@ -129,39 +129,36 @@ Host mini-lan
 
 ## The watchdog
 
-`~/.local/bin/tunnel-watchdog.sh` bootstraps any launchd job in its list
-that is not loaded. It exists for the one case `KeepAlive` cannot cover: a
-job that was booted out rather than a process that died.
+`~/.local/bin/tunnel-watchdog.sh` covers the two ways a tunnel can be
+loaded-looking but dead, neither of which `KeepAlive` sees:
 
-It has to run as a **LaunchDaemon**, not a user agent, or it inherits the
-weakness it is meant to cover — a user agent only loads at login, and the
-machine that needs saving may be sitting at a login screen. Installing it
-needs a password:
+- **booted out** (2026-09-21): the job is gone from its domain, so launchd
+  no longer manages it. The watchdog bootstraps any cloudflared agent that is
+  not loaded.
+- **loaded, never started** (2026-09-23): after the macOS 27 upgrade every
+  agent that starts at load sat at `runs = 0`, `needs LWCR update`, for
+  fourteen hours, the tunnel included. The watchdog kickstarts any loaded
+  agent, tunnel or not, whose plist says it should be running (`KeepAlive`
+  true, or `RunAtLoad` with no runs) and is not.
+
+install.sh puts it in every machine as a user agent that fires by the clock
+(`StartCalendarInterval`): on 2026-09-23 those were the only agents that ran.
+That still needs a login, and the machine that needs saving may be sitting
+at a login screen, so where it matters also install it as a **LaunchDaemon**.
+Run as root, the script looks after whoever is at the console. Needs a password:
 
 ```sh
-sudo cp ~/.local/bin/tunnel-watchdog.sh /usr/local/bin/tunnel-watchdog.sh
-sudo tee /Library/LaunchDaemons/com.dorkyrobot.tunnel-watchdog.plist >/dev/null <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>com.dorkyrobot.tunnel-watchdog</string>
-  <key>ProgramArguments</key><array>
-    <string>/bin/sh</string>
-    <string>/usr/local/bin/tunnel-watchdog.sh</string>
-    <string>com.cloudflare.cloudflared-doug-mini</string>
-  </array>
-  <key>StartInterval</key><integer>300</integer>
-  <key>RunAtLoad</key><true/>
-  <key>StandardOutPath</key><string>/var/log/tunnel-watchdog.log</string>
-  <key>StandardErrorPath</key><string>/var/log/tunnel-watchdog.log</string>
-</dict></plist>
-PLIST
+sudo install -m 755 scripts/tunnel-watchdog.sh /usr/local/bin/tunnel-watchdog.sh
+sudo install -m 644 mesh/com.dorkyrobot.tunnel-watchdog.daemon.plist \
+  /Library/LaunchDaemons/com.dorkyrobot.tunnel-watchdog.plist
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.dorkyrobot.tunnel-watchdog.plist
 ```
 
-Give it the labels that matter on that machine. Proven against the real
-failure before it was written down: a job killed comes back by `KeepAlive`;
-a job booted out does not, and the watchdog returns it within one interval.
+Re-run the first line after changing the script; the daemon copy is not
+touched by install.sh. Proven against the real failures before it was
+written down: a job killed comes back by `KeepAlive`; a job booted out does
+not, and the watchdog returns it within one interval; on 2026-09-23 one run
+of it brought seven stranded agents up. The root path is not yet proven.
 
 ## Checking it actually works
 
