@@ -8,6 +8,11 @@
 #   github-key-setup --clean [acct]  delete the key it replaced, once this one works
 #   github-key-setup --git           set git's identity, signing and remotes from
 #                                    the account; install.sh runs this
+#   github-key-setup --prepare       for mesh/rollout: make the key if there is
+#                                    none, and say what GitHub still needs —
+#                                    "ready", "auth <pubkey>" or "signing <pubkey>"
+#   github-key-setup --pubkey        the key this machine uses for the account,
+#                                    as it appears on GitHub (for rollout --prune)
 #
 # One key per machine per account, made here and never copied: retiring a
 # machine is deleting its key on GitHub, and nothing else notices. SSH rather
@@ -35,7 +40,7 @@ field() {  # field <account> <n>: that column of its line in accounts, trimmed
 }
 
 mode=
-case "${1:-}" in --check|--clean|--git) mode=$1; shift ;; -h|--help) sed -n '2,24p' "$0"; exit 0 ;; esac
+case "${1:-}" in --check|--clean|--git|--prepare|--pubkey) mode=$1; shift ;; -h|--help) sed -n '2,29p' "$0"; exit 0 ;; esac
 ACCT=${1:-$(my_account)}
 [ -n "$ACCT" ] || die "$H is not in mesh/machines; add it, or name an account"
 if [ "$ACCT" = - ]; then [ "$mode" = --git ] && exit 0; die "$H pushes as no account (mesh/machines); name one to use anyway"; fi
@@ -127,6 +132,7 @@ wait_for() {  # wait_for <test> <what to ask for>
 
 case "$mode" in
   --git)   git_setup; exit 0 ;;
+  --pubkey) [ -f "$KEY.pub" ] && awk '{print $1, $2}' "$KEY.pub"; exit 0 ;;
   --check) check; exit ;;
   --clean)
     works "$KEY" || die "$KEY does not work yet; keeping what it replaced"
@@ -137,7 +143,20 @@ esac
 # ---- the key ----------------------------------------------------------------
 mkdir -p "$S"; chmod 700 "$S"
 comment=$(cut -d' ' -f3- "$KEY.pub" 2>/dev/null || true)
-if [ -f "$KEY" ] && { [ "$comment" = "$H github" ] || [ "$comment" = "$H github:$ACCT" ]; } && works "$KEY"; then
+own() { [ -f "$KEY" ] && { [ "$comment" = "$H github" ] || [ "$comment" = "$H github:$ACCT" ]; }; }
+
+if [ "$mode" = --prepare ]; then
+  # the key GitHub should end up with: this machine's own if it has one that
+  # signs in, otherwise the one waiting at .new (made now if need be)
+  if own && works "$KEY"; then k=$KEY
+  else [ -f "$NEW" ] || ssh-keygen -q -t ed25519 -N "" -C "$H github:$ACCT" -f "$NEW"; k=$NEW; fi
+  if ! works "$k"; then echo "auth $(cat "$k.pub")"
+  elif [ -n "$PRIMARY" ] && ! signs "$k"; then echo "signing $(cat "$k.pub")"
+  else echo ready; fi
+  exit 0
+fi
+
+if own && works "$KEY"; then
   echo "· $KEY is this machine's own, and GitHub takes it"
 else
   [ -f "$NEW" ] || ssh-keygen -q -t ed25519 -N "" -C "$H github:$ACCT" -f "$NEW"

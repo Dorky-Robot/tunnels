@@ -1,0 +1,125 @@
+#!/bin/sh
+# Bring every mesh machine up to date from this checkout, from this machine.
+#
+#   sh mesh/rollout                  every machine in mesh/machines, this one first
+#   sh mesh/rollout mac2024 mini     just these (names, hosts or aliases)
+#   sh mesh/rollout --tidy …         install.sh --tidy on each (see install.sh)
+#   sh mesh/rollout --prune …        also delete keys on GitHub titled for a machine
+#                                    that are not the key it has now
+#
+# For each machine, over the mesh's own ssh:
+#   1. copies mesh/ and scripts/ to ~/.local/share/mesh and runs install.sh
+#      there — the machine needs no clone of this repo and no GitHub access
+#   2. if it pushes to GitHub (mesh/machines, `github`): has it make its own key,
+#      adds that key here with `gh ssh-key add` as Authentication and Signing,
+#      titled for the machine, then lets github-key-setup swap it in, set git
+#      up and prove pull, push and signing
+# and ends with one line per machine.
+#
+# `gh` is needed on this machine only, and only to add keys: it asks for the
+# two scopes that allows once, in the browser. Every machine pushes with its
+# own SSH key, never with that token.
+#
+# What it cannot do: first contact with a new machine (its mesh key and host
+# keys) — docs/remote-access.md, "Adding a machine".
+set -eu
+here=$(cd "$(dirname "$0")" && pwd)
+repo=$(cd "$here/.." && pwd)
+ME=$(hostname -s)
+TIDY= PRUNE=
+while [ $# -gt 0 ]; do
+  case "$1" in --tidy) TIDY=--tidy ;; --prune) PRUNE=1 ;; -h|--help) sed -n '2,25p' "$0"; exit 0 ;; -*) echo "rollout: unknown option $1" >&2; exit 2 ;; *) break ;; esac
+  shift
+done
+die() { echo "rollout: $*" >&2; exit 1; }
+rows() { grep -v '^[[:space:]]*#' "$here/machines" | awk 'NF'; }
+row_for() { rows | awk -v m="$1" '{ if ($1 == m || $2 == m) { print; exit } for (i = 8; i <= NF; i++) if ($i == m) { print; exit } }'; }
+
+sh "$here/build" --check >/dev/null || die "mesh/ is out of date with its inventory; run: sh mesh/build, and commit"
+[ -z "$(git -C "$repo" status --porcelain -- mesh scripts 2>/dev/null)" ] \
+  || echo "rollout: mesh/ has uncommitted changes — rolling them out anyway, but commit them" >&2
+
+# which machines, this one first: the ssh names it uses for the others come
+# from its own install
+if [ $# -eq 0 ]; then set -- $(rows | awk '{print $1}'); fi
+todo=; for m in "$@"; do r=$(row_for "$m"); [ -n "$r" ] || die "not in mesh/machines: $m"; todo="$todo $(echo "$r" | awk '{print $1}')"; done
+first=$(rows | awk -v h="$ME" '$2 == h {print $1}')
+case " $todo " in *" $first "*) todo="$first $(printf '%s\n' $todo | grep -vx "$first" | tr '\n' ' ')" ;; esac
+
+# ---- gh, only if some machine here pushes to GitHub -------------------------
+need_gh=
+for m in $todo; do [ "$(row_for "$m" | awk '{print $7}')" = - ] || need_gh=1; done
+if [ -n "$need_gh" ]; then
+  export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+  command -v gh >/dev/null || die "gh is not installed here (brew install gh)"
+  scopes=$(gh auth status -h github.com 2>&1 | sed -n "s/.*Token scopes: //p" || true)
+  if ! gh api user >/dev/null 2>&1 || ! echo "$scopes" | grep -q admin:public_key || ! echo "$scopes" | grep -q admin:ssh_signing_key; then
+    echo "rollout: gh here needs to add SSH keys to GitHub (scopes admin:public_key, admin:ssh_signing_key)."
+    [ -t 0 ] || die "run it in a terminal, or first: gh auth login -h github.com --insecure-storage --git-protocol ssh --skip-ssh-key -s admin:public_key,admin:ssh_signing_key"
+    gh auth login -h github.com --insecure-storage --git-protocol ssh --skip-ssh-key -s admin:public_key,admin:ssh_signing_key
+  fi
+  GH_USER=$(gh api user --jq .login) || die "gh is not signed in"
+fi
+
+# ---- one machine ------------------------------------------------------------
+# run <machine> <command>: here, or over the mesh
+run() {
+  if [ "$1" = "$first" ]; then sh -c "$2"; else ssh -o BatchMode=yes -o ConnectTimeout=15 "$1" "$2"; fi
+}
+KGS='"$HOME/.local/bin/github-key-setup"'
+summary=; keys=
+one() {
+  m=$1; set -- $(row_for "$m"); host=$2 acct=$7
+  printf '\n━━ %s (%s) ━━\n' "$m" "$host"
+  if [ "$m" = "$first" ]; then
+    sh "$here/install.sh" $TIDY || { summary="$summary\n$m|install failed|"; return; }
+  else
+    run "$m" true 2>/dev/null || { echo "unreachable over the mesh"; summary="$summary\n$m|unreachable|"; return; }
+    run "$m" 'mkdir -p ~/.local/share/mesh' && \
+    rsync -a --delete -e "ssh -o BatchMode=yes" "$repo/mesh" "$repo/scripts" "$m:.local/share/mesh/" && \
+    run "$m" "sh ~/.local/share/mesh/mesh/install.sh $TIDY" || { summary="$summary\n$m|install failed|"; return; }
+  fi
+  if [ "$acct" = - ]; then summary="$summary\n$m|installed|no GitHub account"; return; fi
+  [ "$acct" = "$GH_USER" ] || { summary="$summary\n$m|installed|$acct: gh here is $GH_USER, add its key by hand"; return; }
+
+  # the key: made there, added here, swapped in there
+  for try in 1 2 3 4 5 6; do
+    st=$(run "$m" "$KGS --prepare $acct" | tail -1)
+    case "$st" in
+      ready) break ;;
+      auth\ *|signing\ *)
+        kind=${st%% *} pub=${st#* }
+        f=$(mktemp); echo "$pub" > "$f"
+        if [ "$kind" = auth ]; then
+          gh ssh-key add "$f" --title "$host" --type authentication >/dev/null 2>&1 && echo "· added to GitHub as $host: authentication key" || true
+        fi
+        # the same key as a signing key, whichever step it was at
+        gh ssh-key add "$f" --title "$host" --type signing >/dev/null 2>&1 && echo "· added to GitHub as $host: signing key" || true
+        rm -f "$f"; sleep 3 ;;  # GitHub takes a moment to honour a new key
+      *) echo "github-key-setup --prepare said: $st"; break ;;
+    esac
+  done
+  if run "$m" "$KGS $acct"; then summary="$summary\n$m|installed|GitHub ✓ pull, push, signing"
+  else summary="$summary\n$m|installed|GitHub ✗ (see above)"; fi
+  keys="$keys\n$host $(run "$m" "$KGS --pubkey $acct" 2>/dev/null)"
+}
+
+for m in $todo; do one "$m"; done
+
+# ---- --prune: GitHub keys titled for a machine that are not its key now ----
+if [ -n "$PRUNE" ] && [ -n "$need_gh" ]; then
+  printf '\n━━ GitHub keys ━━\n'
+  tab=$(printf '\t')
+  printf '%b\n' "$keys" | while read -r host current; do
+    [ -n "$current" ] || continue
+    for api in user/keys user/ssh_signing_keys; do
+      gh api "$api" --paginate --jq '.[] | "\(.id)\t\(.title)\t\(.key)"' | while IFS=$tab read -r id title key; do
+        [ "$title" = "$host" ] && [ "${key% *}" != "$current" ] && [ "$key" != "$current" ] || continue
+        gh api -X DELETE "$api/$id" >/dev/null && echo "· deleted an older $host key from GitHub ($api)"
+      done
+    done
+  done
+fi
+
+printf '\n━━ summary ━━\n'
+printf '%b\n' "$summary" | awk -F'|' 'NF { printf "  %-12s %-12s %s\n", $1, $2, $3 }'

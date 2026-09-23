@@ -213,7 +213,9 @@ block that matches). Anything it edits is copied to `~/.ssh/backups/` first.
 `sh mesh/install.sh` does all of it and is safe to re-run.
 
 **Change it here, then push it everywhere.** Edit the inventory, `sh mesh/build`,
-commit, and run `mesh/install.sh` on each machine. A copy edited in place on
+commit, and `sh mesh/rollout` from any machine in the mesh: it copies `mesh/`
+to every other box over the mesh, runs install.sh there, and makes and adds
+each one's GitHub key (below). `sh mesh/rollout mac2024` does just one. A copy edited in place on
 one box is how one machine quietly stops reaching another while the rest look
 fine.
 
@@ -228,6 +230,11 @@ Two things mesh.conf does on purpose, both learned the first time it went out:
   Intel and keeps Homebrew in `/usr/local`, not `/opt/homebrew`.
 
 ### GitHub
+
+`sh mesh/rollout` does all of this for every machine at once, adding the keys
+to GitHub itself with `gh ssh-key add` (on the machine it runs from only, which
+asks once for the two scopes that allows); `--prune` also deletes older keys on
+GitHub titled for a machine. By hand, on one machine, it is:
 
 One key per machine per account, made on that machine by `github-key-setup`
 and never copied: retiring a machine is deleting one key on GitHub. It is an
@@ -265,8 +272,8 @@ account by the alias in its remote: `git@github.com-nerdnest:org/repo.git`.
 3. Add its line to `mesh/machines`: a free vnc port, and its GitHub account
    (or `-`). A note about the box goes on comment lines directly above it.
 4. `sh mesh/build`, commit, push.
-5. `sh mesh/install.sh` on every machine — the others learn the new box, and
-   the new box learns them. On the new one, then `github-key-setup`.
+5. `sh mesh/rollout` — every machine learns the new box, the new box learns
+   them, and it gets its GitHub key.
 6. Run the matrix in the next section from each one.
 
 Taking one out is the reverse: delete its line, its `keys/` and `hostkeys/`
