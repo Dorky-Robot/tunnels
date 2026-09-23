@@ -11,8 +11,9 @@
 #   github-key-setup --prepare       for mesh/rollout: make the key if there is
 #                                    none, and say what GitHub still needs —
 #                                    "ready", "auth <pubkey>" or "signing <pubkey>"
-#   github-key-setup --pubkey        the key this machine uses for the account,
-#                                    as it appears on GitHub (for rollout --prune)
+#   github-key-setup --pubkey        every key of this machine's for the account —
+#                                    the one in use and one waiting at .new — so
+#                                    rollout --prune never deletes either
 #
 # One key per machine per account, made here and never copied: retiring a
 # machine is deleting its key on GitHub, and nothing else notices. SSH rather
@@ -61,7 +62,9 @@ works() {
 }
 # the account's signing keys, from GitHub's public API: "type key" per line
 signing_keys() {
-  j=$(curl -fsS "https://api.github.com/users/$ACCT/ssh_signing_keys" 2>/dev/null) || return 1
+  # The public API is served from a cache for about a minute, so a key added
+  # a moment ago reads as missing; a query it has never seen goes past it.
+  j=$(curl -fsS "https://api.github.com/users/$ACCT/ssh_signing_keys?per_page=100&fresh=$(date +%s)$$" 2>/dev/null) || return 1
   f=$(mktemp); printf '%s' "$j" > "$f"; i=0
   while k=$(plutil -extract "$i.key" raw -o - "$f" 2>/dev/null); do echo "$k"; i=$((i+1)); done
   rm -f "$f"
@@ -126,13 +129,14 @@ wait_for() {  # wait_for <test> <what to ask for>
   if [ -t 0 ]; then
     until "$1" "$NEW"; do printf '%s — press Enter once it is added (Ctrl-C to stop, and come back later) ' "$2"; read -r _; done
   else
-    echo "$2. Then run github-key-setup again."; exit 0
+    # not finished, and saying so: a caller must not read this as done
+    echo "$2. Then run github-key-setup again."; exit 3
   fi
 }
 
 case "$mode" in
   --git)   git_setup; exit 0 ;;
-  --pubkey) [ -f "$KEY.pub" ] && awk '{print $1, $2}' "$KEY.pub"; exit 0 ;;
+  --pubkey) for f in "$KEY.pub" "$NEW.pub"; do [ -f "$f" ] && awk '{print $1, $2}' "$f"; done; exit 0 ;;
   --check) check; exit ;;
   --clean)
     works "$KEY" || die "$KEY does not work yet; keeping what it replaced"

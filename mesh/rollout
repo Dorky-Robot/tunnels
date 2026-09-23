@@ -82,26 +82,39 @@ one() {
   if [ "$acct" = - ]; then summary="$summary\n$m|installed|no GitHub account"; return; fi
   [ "$acct" = "$GH_USER" ] || { summary="$summary\n$m|installed|$acct: gh here is $GH_USER, add its key by hand"; return; }
 
-  # the key: made there, added here, swapped in there
-  for try in 1 2 3 4 5 6; do
-    st=$(run "$m" "$KGS --prepare $acct" | tail -1)
-    case "$st" in
-      ready) break ;;
-      auth\ *|signing\ *)
-        kind=${st%% *} pub=${st#* }
-        f=$(mktemp); echo "$pub" > "$f"
-        if [ "$kind" = auth ]; then
-          gh ssh-key add "$f" --title "$host" --type authentication >/dev/null 2>&1 && echo "· added to GitHub as $host: authentication key" || true
-        fi
-        # the same key as a signing key, whichever step it was at
-        gh ssh-key add "$f" --title "$host" --type signing >/dev/null 2>&1 && echo "· added to GitHub as $host: signing key" || true
-        rm -f "$f"; sleep 3 ;;  # GitHub takes a moment to honour a new key
-      *) echo "github-key-setup --prepare said: $st"; break ;;
-    esac
-  done
-  if run "$m" "$KGS $acct"; then summary="$summary\n$m|installed|GitHub ✓ pull, push, signing"
-  else summary="$summary\n$m|installed|GitHub ✗ (see above)"; fi
-  keys="$keys\n$host $(run "$m" "$KGS --pubkey $acct" 2>/dev/null)"
+  # the key: made there, added here, swapped in there. What GitHub has is read
+  # from the live list through gh — the public API answers from a cache for a
+  # minute, and `gh ssh-key add` says "added" for a key that was already there.
+  st=$(run "$m" "$KGS --prepare $acct" | tail -1)
+  case "$st" in
+    ready) ;;
+    auth\ *|signing\ *)
+      pub=${st#* }; b=$(echo "$pub" | awk '{print $2}')
+      f=$(mktemp); echo "$pub" > "$f"
+      on_github user/keys "$b" \
+        || { gh ssh-key add "$f" --title "$host" --type authentication >/dev/null && echo "· added to GitHub as $host: authentication key"; } || true
+      on_github user/ssh_signing_keys "$b" \
+        || { gh ssh-key add "$f" --title "$host" --type signing >/dev/null && echo "· added to GitHub as $host: signing key"; } || true
+      rm -f "$f"
+      # until the machine itself sees both: GitHub takes a moment
+      for try in 1 2 3 4 5 6 7 8 9 10; do
+        st=$(run "$m" "$KGS --prepare $acct" | tail -1); [ "$st" = ready ] && break; sleep 3
+      done ;;
+    *) echo "github-key-setup --prepare said: $st" ;;
+  esac
+  if [ "$st" != ready ]; then
+    summary="$summary\n$m|installed|GitHub ✗ its key is not taken yet (${st%% *}); run rollout $m again"; return
+  fi
+  if run "$m" "$KGS $acct"; then
+    summary="$summary\n$m|installed|GitHub ✓ pull, push, signing"
+    # only a machine that finished is pruned for, and both its keys are kept
+    for b in $(run "$m" "$KGS --pubkey $acct" 2>/dev/null | awk '{print $2}'); do keys="$keys\n$host $b"; done
+  else
+    summary="$summary\n$m|installed|GitHub ✗ (see above)"
+  fi
+}
+on_github() {  # on_github <user/keys|user/ssh_signing_keys> <key>
+  gh api "$1" --paginate --jq '.[].key' 2>/dev/null | awk '{print $2}' | grep -qxF "$2"
 }
 
 for m in $todo; do one "$m"; done
@@ -109,16 +122,20 @@ for m in $todo; do one "$m"; done
 # ---- --prune: GitHub keys titled for a machine that are not its key now ----
 if [ -n "$PRUNE" ] && [ -n "$need_gh" ]; then
   printf '\n━━ GitHub keys ━━\n'
+  # keep: "<host> <key>" for every key of every machine that finished this run.
+  # A key titled for one of those machines and not on this list is an older
+  # one of its own; titles for anything else are never touched.
+  keep=$(mktemp); printf '%b\n' "$keys" | awk 'NF == 2' > "$keep"
   tab=$(printf '\t')
-  printf '%b\n' "$keys" | while read -r host current; do
-    [ -n "$current" ] || continue
-    for api in user/keys user/ssh_signing_keys; do
-      gh api "$api" --paginate --jq '.[] | "\(.id)\t\(.title)\t\(.key)"' | while IFS=$tab read -r id title key; do
-        [ "$title" = "$host" ] && [ "${key% *}" != "$current" ] && [ "$key" != "$current" ] || continue
-        gh api -X DELETE "$api/$id" >/dev/null && echo "· deleted an older $host key from GitHub ($api)"
-      done
+  for api in user/keys user/ssh_signing_keys; do
+    gh api "$api" --paginate --jq '.[] | "\(.id)\t\(.title)\t\(.key)"' | while IFS=$tab read -r id title key; do
+      b=$(echo "$key" | awk '{print $2}')
+      awk -v t="$title" '$1 == t {f=1} END {exit !f}' "$keep" || continue
+      awk -v t="$title" -v b="$b" '$1 == t && $2 == b {f=1} END {exit !f}' "$keep" && continue
+      gh api -X DELETE "$api/$id" >/dev/null && echo "· deleted an older $title key from GitHub ($api)"
     done
   done
+  rm -f "$keep"
 fi
 
 printf '\n━━ summary ━━\n'
