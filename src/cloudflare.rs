@@ -16,7 +16,12 @@ struct CfConfigResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 struct CfConfigResult {
-    config: CfConfig,
+    // A tunnel that has never been given ingress comes back as `"config": null`.
+    // Parsing that as a missing field made the token look broken, so a fresh
+    // tunnel could not be adopted until it already had the routes you were
+    // trying to add.
+    #[serde(default)]
+    config: Option<CfConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -407,7 +412,10 @@ fn fetch_tunnel_config(api_token: &str, account_id: &str, tunnel_id: &str) -> Ve
     if !resp.success {
         return Vec::new();
     }
-    resp.result.map(|r| r.config.ingress).unwrap_or_default()
+    resp.result
+        .and_then(|r| r.config)
+        .map(|c| c.ingress)
+        .unwrap_or_default()
 }
 
 /// Add an ingress rule (subdomain mapping) to a tunnel's configuration.
@@ -419,8 +427,11 @@ pub(crate) fn add_route(
     hostname: &str,
     service: &str,
 ) -> Result<RouteResult, String> {
+    // An empty list means either the fetch failed or the tunnel simply has no
+    // routes yet — the first route ever added hits the second case, so ask the
+    // API which it is rather than refusing a tunnel that is merely new.
     let current = fetch_tunnel_config(api_token, account_id, tunnel_id);
-    if current.is_empty() {
+    if current.is_empty() && !fetch_tunnel_config_check(api_token, account_id, tunnel_id) {
         return Err("Could not fetch current tunnel config".into());
     }
 
