@@ -25,33 +25,34 @@
 set -u
 
 # ---- the mesh ------------------------------------------------------------
-# name → the ssh aliases in ~/.ssh/config.d/mesh.conf, plus the local port to
-# use if we fall all the way through to a tunnel. Ports differ per machine so
-# several tunnelled sessions can be open at once; doug-mini keeps 5901 to
-# match the LocalForward some older ~/.ssh/config copies still carry.
+# The machines come from mesh/machines, which install.sh puts at
+# ~/.ssh/config.d/machines — the same list mesh.conf is generated from, so
+# this script cannot know a different set of boxes than ssh does. A machine
+# answers to its name, its host, or any of its aliases; its ssh names are
+# <name>, <name>-lan and cloudflare-<name>, and its vnc column is the local
+# port a tunnelled session uses (one per machine, so several can be open).
 #
 # The remote login is NOT repeated here — it is read from mesh.conf with
 # `ssh -G`, so douggraham-vs-felixflores stays true in one place.
 #
-# A machine with no tunnel leaves cf empty; it simply has one fewer way in.
-# Nothing is in that state today — dorkyrobot2 was, for about an hour.
+# A machine with no tunnel (- in that column) leaves cf empty; it simply has
+# one fewer way in.
 #
-# Add a machine = add a case + a name in machines() + `desktop --install`.
-# --list warns when mesh.conf knows a machine this table does not, so the
-# next box announces itself instead of being quietly unreachable.
-machines() { printf '%s\n' felix-mini doug-mini mac2024 mac2019 dorkyrobot1 dorkyrobot2; }
+# Add a machine = a line in mesh/machines, then install.sh (which runs
+# `desktop --install`). --list still warns when mesh.conf knows a machine the
+# list does not, in case the two were installed from different commits.
+MACHINES=${MESH_MACHINES:-$HOME/.ssh/config.d/machines}
+rows() { grep -v '^[[:space:]]*#' "$MACHINES" 2>/dev/null | awk 'NF'; }
+machines() { rows | awk '{print $1}'; }
 
 lookup() {
-  case "$1" in
-    felix-mini|felixmini|mini|macmini)
-                     mesh=macmini     lan=mini-lan         cf=cloudflare-mini        port=5902 ;;
-    doug-mini|doug)  mesh=doug-mini   lan=doug-mini-lan    cf=cloudflare-doug-mini   port=5901 ;;
-    mac2024|2024)    mesh=mac2024     lan=mac2024-lan      cf=cloudflare-mac2024     port=5904 ;;
-    mac2019|2019)    mesh=mac2019     lan=mac2019-lan      cf=cloudflare-mac2019     port=5903 ;;
-    dorkyrobot1|dr1) mesh=dorkyrobot1 lan=dorkyrobot1-lan  cf=cloudflare-dorkyrobot1 port=5905 ;;
-    dorkyrobot2|dr2) mesh=dorkyrobot2 lan=dorkyrobot2-lan  cf=cloudflare-dorkyrobot2 port=5906 ;;
-    *) return 1 ;;
-  esac
+  local row
+  row=$(rows | awk -v m="$1" '{ if ($1 == m || $2 == m) { print; exit }
+                                 for (i = 8; i <= NF; i++) if ($i == m) { print; exit } }')
+  [ -n "$row" ] || return 1
+  set -- $row
+  mesh=$1 lan=$1-lan port=$6
+  if [ "$5" = - ]; then cf=; else cf=cloudflare-$1; fi
 }
 
 die() { echo "desktop: $*" >&2; exit 1; }
