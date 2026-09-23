@@ -376,6 +376,16 @@ impl Fleet {
             // only works to a tunnel in that same account. Found the hard way:
             // staging-admin was aimed at a tunnel in the other account and
             // the error blamed token permissions.
+            if let (Some((za, _)), Some(sb)) = (self.account_for_host(&r.host), r.standby.as_ref().and_then(|s| self.tunnels.get(s))) {
+                if za != &sb.account {
+                    out.push(format!(
+                        "`{}`: standby `{}` is in account `{}`, not `{za}` where the hostname's zone is — it could never carry it",
+                        r.host,
+                        r.standby.as_deref().unwrap_or(""),
+                        sb.account
+                    ));
+                }
+            }
             if let (Some((za, _)), Some(t)) = (self.account_for_host(&r.host), self.tunnels.get(r.active_tunnel())) {
                 if za != &t.account {
                     out.push(format!(
@@ -571,6 +581,13 @@ service = "http://localhost:2283"
             ..Default::default()
         });
         assert!(f.validate().iter().any(|p| p.contains("publish the tunnels web UI")));
+    }
+
+    #[test]
+    fn a_standby_in_the_other_account_is_refused() {
+        let mut f = sample();
+        f.find_route_mut("media.felixflor.es").unwrap().standby = Some("vet-standby".into());
+        assert!(f.validate().iter().any(|p| p.contains("could never carry it")), "{:?}", f.validate());
     }
 
     #[test]

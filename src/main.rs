@@ -819,7 +819,9 @@ fn import_cmd(machine: Option<String>, host: Option<String>, dry_run: bool, json
                             .unwrap_or_else(|| format!("{} (a tunnel that no longer exists)", short(&t)));
                         notes.push(format!(
                             "{host} is in {alias}'s ingress but DNS sends it to {other} — not imported here{}",
-                            if f.alias_for_id(&t).is_some() {
+                            if f.alias_for_id(&t).is_some()
+                                && f.account_for_host(&host).map(|(a, _)| a) == f.tunnels.get(&alias).map(|x| &x.account)
+                            {
                                 format!("; to keep {alias} as a warm standby: tunnels route add {host} {service} --tunnel {other} --standby {alias}")
                             } else {
                                 String::new()
