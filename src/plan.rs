@@ -552,11 +552,10 @@ pub fn plan(fleet: &Fleet, snap: &Snapshot, local: Option<&LocalObs>) -> Plan {
 pub fn probe_origins(fleet: &Fleet, machine: &str) -> Vec<Finding> {
     let mut out = Vec::new();
     for r in &fleet.routes {
-        let mine = [Some(r.tunnel.as_str()), r.standby.as_deref()]
-            .into_iter()
-            .flatten()
-            .any(|t| fleet.machine_of(t) == Some(machine));
-        if !mine {
+        let active_here = fleet.machine_of(r.active_tunnel()) == Some(machine);
+        let standby_here = !active_here
+            && [Some(r.tunnel.as_str()), r.standby.as_deref()].into_iter().flatten().any(|t| fleet.machine_of(t) == Some(machine));
+        if !active_here && !standby_here {
             continue;
         }
         let Some(port) = crate::fleet::local_port(&r.service) else { continue };
@@ -568,12 +567,16 @@ pub fn probe_origins(fleet: &Fleet, machine: &str) -> Vec<Finding> {
             )
             .is_ok();
         if !ok {
-            out.push(finding(
-                Level::Warn,
-                &r.host,
-                format!("nothing is listening on port {port} here, so {} answers 502", r.host),
-                None,
-            ));
+            out.push(if active_here {
+                finding(Level::Warn, &r.host, format!("nothing is listening on port {port} here, so {} answers 502", r.host), None)
+            } else {
+                finding(
+                    Level::Warn,
+                    &r.host,
+                    format!("this Mac is its standby, but nothing is listening on port {port} here — promoting it now would answer 502"),
+                    None,
+                )
+            });
         }
     }
     out
