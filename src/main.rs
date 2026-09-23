@@ -1213,7 +1213,8 @@ fn print_help() {
     println!("  restart <name>                        Restart a tunnel (kickstart or stop+start)");
     println!("  logs <name> [--lines N]               View tunnel logs (default 50 lines)");
     println!("  add <name> --token <token>            Register a new tunnel");
-    println!("  rm <name>                             Delete a tunnel and its LaunchAgent");
+    println!("  rm <name>                             Forget a tunnel here and remove its LaunchAgent");
+    println!("                                        (the tunnel itself stays in Cloudflare)");
     println!("  rename <old> <new>                    Rename a tunnel");
     println!("  import                                Import existing cloudflared plists");
     println!();
