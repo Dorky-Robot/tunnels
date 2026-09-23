@@ -67,10 +67,32 @@ pub fn newest_from_peers(fleet: &Fleet, me: &str, extra: &[String], timeout: Dur
 }
 
 /// Bring this machine's copy up to date. Returns where a newer copy came from.
+///
+/// Two machines that edit the same version at once both write the next
+/// serial, and one edit would simply lose — which happened on the first
+/// rollout, when mini and mac2024 imported seconds apart and mini vanished
+/// from the fleet. So when the copy being taken has the *same* serial as
+/// ours, the two are merged instead: everything ours has that theirs lacks
+/// is added, and the result is a new serial that every machine then takes.
 pub fn pull(me: &str, extra: &[String], timeout: Duration) -> Result<Option<(String, u64)>> {
     let Some(current) = Fleet::load()? else { return Ok(None) };
     match newest_from_peers(&current, me, extra, timeout) {
         Some((host, f)) => {
+            if f.serial == current.serial {
+                let mut merged = f.clone();
+                let added = merged.absorb(&current);
+                if !added.is_empty() {
+                    merged.serial += 1;
+                    merged.updated_at = crate::util::now_rfc3339();
+                    merged.updated_by = me.to_string();
+                    // a merge that does not validate is dropped: theirs is taken, as before
+                    if merged.validate().is_empty() {
+                        merged.save()?;
+                        notify(&merged, me);
+                        return Ok(Some((format!("{host}, merged with a concurrent edit here ({})", added.join(", ")), merged.serial)));
+                    }
+                }
+            }
             f.save()?;
             Ok(Some((host, f.serial)))
         }

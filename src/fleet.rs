@@ -472,6 +472,40 @@ impl Fleet {
         self.machine_of(tunnel_alias)
     }
 
+    /// Add everything `other` has that this copy lacks — machines, accounts,
+    /// tunnels, routes — and nothing else. For merging two concurrent edits
+    /// of the same version; a deletion on one side may come back, which is
+    /// safer than an addition being lost.
+    pub fn absorb(&mut self, other: &Fleet) -> Vec<String> {
+        let mut added = Vec::new();
+        for (k, v) in &other.machines {
+            if !self.machines.contains_key(k) {
+                self.machines.insert(k.clone(), v.clone());
+                added.push(format!("machine {k}"));
+            }
+        }
+        for (k, v) in &other.accounts {
+            if !self.accounts.contains_key(k) && self.account_alias_for_id(&v.id).is_none() {
+                self.accounts.insert(k.clone(), v.clone());
+                added.push(format!("account {k}"));
+            }
+        }
+        for (k, v) in &other.tunnels {
+            if !self.tunnels.contains_key(k) && self.alias_for_id(&v.id).is_none() {
+                self.tunnels.insert(k.clone(), v.clone());
+                added.push(format!("tunnel {k}"));
+            }
+        }
+        for r in &other.routes {
+            if self.find_route(&r.host).is_none() {
+                self.routes.push(r.clone());
+                added.push(format!("route {}", r.host));
+            }
+        }
+        self.routes.sort_by(|a, b| a.host.cmp(&b.host));
+        added
+    }
+
     /// Rename a tunnel alias everywhere it is used.
     pub fn rename_tunnel(&mut self, old: &str, new: &str) -> Result<()> {
         if self.tunnels.contains_key(new) {
@@ -622,6 +656,22 @@ service = "http://localhost:2283"
         let mut d = sample();
         d.updated_at = "2026-09-23T21:00:00Z".into();
         assert!(d.newer_than(&c) && !c.newer_than(&d));
+    }
+
+    #[test]
+    fn two_edits_of_the_same_version_merge_rather_than_one_losing() {
+        // mini and mac2024 each imported themselves onto serial 13
+        let base = sample();
+        let mut a = base.clone();
+        a.machines.insert("mini".into(), Machine { host: "felixs-mac-mini".into(), note: String::new() });
+        let mut b = base.clone();
+        b.machines.insert("mac2024".into(), Machine { host: "felixs-mac-2024".into(), note: String::new() });
+        b.routes.push(Route { host: "pintig.felixflor.es".into(), tunnel: "dr2-home".into(), service: "http://localhost:3031".into(), ..Default::default() });
+        let added = b.absorb(&a);
+        assert_eq!(added, vec!["machine mini"]);
+        assert!(b.machines.contains_key("mini") && b.machines.contains_key("mac2024"));
+        assert!(b.find_route("pintig.felixflor.es").is_some());
+        assert!(b.absorb(&a).is_empty(), "absorbing twice adds nothing");
     }
 
     #[test]
