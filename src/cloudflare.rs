@@ -109,6 +109,90 @@ pub(crate) fn verify_token(api_token: &str, account_id: &str, tunnel_id: &str) -
     fetch_tunnel_config_check(api_token, account_id, tunnel_id)
 }
 
+/// Find a tunnel by name in Cloudflare, across every account this token can
+/// see. The connector token lives on whichever machine runs the tunnel, but
+/// a name is enough for the API — this is what lets a route be added from
+/// the laptop for a tunnel that one of the minis runs.
+///
+/// `hint_accounts` are account ids already known for this token (from its
+/// stored reach); they are tried alongside whatever `/accounts` lists, so a
+/// token without permission to list accounts still finds its own tunnels.
+pub(crate) fn find_tunnel_by_name(
+    api_token: &str,
+    hint_accounts: &[String],
+    name: &str,
+) -> Option<(String, String)> {
+    let mut accounts: Vec<String> = hint_accounts.to_vec();
+    for id in list_account_ids(api_token) {
+        if !accounts.contains(&id) {
+            accounts.push(id);
+        }
+    }
+    for account_id in accounts {
+        let url = format!(
+            "https://api.cloudflare.com/client/v4/accounts/{}/cfd_tunnel",
+            account_id
+        );
+        let output = Command::new("curl")
+            .args([
+                "-s", "--get", &url,
+                "--data-urlencode", &format!("name={}", name),
+                "--data-urlencode", "is_deleted=false",
+                "-H", &format!("Authorization: Bearer {}", api_token),
+            ])
+            .output();
+        let Ok(o) = output else { continue };
+        if !o.status.success() {
+            continue;
+        }
+        if let Some(tunnel_id) = tunnel_id_from_list(&o.stdout, name) {
+            return Some((account_id, tunnel_id));
+        }
+    }
+    None
+}
+
+fn list_account_ids(api_token: &str) -> Vec<String> {
+    let output = Command::new("curl")
+        .args([
+            "-s",
+            "https://api.cloudflare.com/client/v4/accounts?per_page=50",
+            "-H",
+            &format!("Authorization: Bearer {}", api_token),
+        ])
+        .output();
+    let Ok(o) = output else { return Vec::new() };
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(&o.stdout) else {
+        return Vec::new();
+    };
+    if !val.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return Vec::new();
+    }
+    val.get("result")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.get("id").and_then(|i| i.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The id of the tunnel called `name` in a cfd_tunnel list response.
+/// Cloudflare's `name` filter is an exact match, but the check is repeated
+/// here so a looser server-side match can never hand back a neighbour.
+fn tunnel_id_from_list(body: &[u8], name: &str) -> Option<String> {
+    let val: serde_json::Value = serde_json::from_slice(body).ok()?;
+    if !val.get("success")?.as_bool()? {
+        return None;
+    }
+    val.get("result")?
+        .as_array()?
+        .iter()
+        .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(name))
+        .and_then(|t| t.get("id").and_then(|i| i.as_str()).map(String::from))
+}
+
 /// What a token can actually reach: the Cloudflare accounts it can see,
 /// each with the domains in it.
 ///
@@ -331,7 +415,7 @@ pub(crate) fn sync(cf_api_tokens: &[&str], tunnel_tokens: &[(String, String)]) -
 
     let status = if !unreached.is_empty() {
         format!(
-            "Synced {} route(s) from {} account(s) — {} need tokens (T)",
+            "Synced {} route(s) from {} account(s) — {} need tokens (t a)",
             total_routes, accounts_reached, unreached.len(),
         )
     } else {
@@ -855,4 +939,30 @@ fn parse_cf_response(body: &[u8]) -> Result<String, String> {
         .unwrap_or_else(|| "unknown error".into());
 
     Err(errors)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tunnel_id_from_list;
+
+    #[test]
+    fn picks_the_tunnel_with_exactly_that_name() {
+        let body = br#"{"success":true,"result":[
+            {"id":"aaa","name":"DorkyRobot2-old"},
+            {"id":"bbb","name":"DorkyRobot2"}]}"#;
+        assert_eq!(tunnel_id_from_list(body, "DorkyRobot2"), Some("bbb".into()));
+    }
+
+    #[test]
+    fn a_neighbouring_name_is_not_good_enough() {
+        let body = br#"{"success":true,"result":[{"id":"aaa","name":"DorkyRobot2-old"}]}"#;
+        assert_eq!(tunnel_id_from_list(body, "DorkyRobot2"), None);
+    }
+
+    #[test]
+    fn a_failed_response_finds_nothing() {
+        let body = br#"{"success":false,"errors":[{"code":10000,"message":"Authentication error"}],"result":null}"#;
+        assert_eq!(tunnel_id_from_list(body, "DorkyRobot2"), None);
+        assert_eq!(tunnel_id_from_list(b"not json", "DorkyRobot2"), None);
+    }
 }

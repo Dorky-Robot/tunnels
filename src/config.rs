@@ -107,6 +107,23 @@ pub struct Config {
 }
 
 impl Config {
+    /// Every API token together with the account ids it is known to reach.
+    /// Legacy and per-tunnel tokens carry no reach and come back with none.
+    pub fn api_tokens_with_reach(&self) -> Vec<(&str, Vec<String>)> {
+        self.all_cf_api_tokens()
+            .into_iter()
+            .map(|tok| {
+                let reach = self
+                    .cf_api_tokens
+                    .iter()
+                    .find(|t| t.0.token == tok)
+                    .map(|t| t.0.reach.iter().map(|r| r.account_id.clone()).collect())
+                    .unwrap_or_default();
+                (tok, reach)
+            })
+            .collect()
+    }
+
     /// All configured CF API tokens (merges cf_api_tokens + legacy cf_api_token + per-tunnel tokens)
     pub fn all_cf_api_tokens(&self) -> Vec<&str> {
         let mut tokens: Vec<&str> = self.cf_api_tokens.iter().map(|t| t.0.token.as_str()).collect();

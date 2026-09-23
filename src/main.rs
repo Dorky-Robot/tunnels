@@ -791,22 +791,42 @@ fn cli_import() -> Result<()> {
 }
 
 /// Resolve a tunnel name to its (api_token, account_id, tunnel_id).
-/// Tries all configured API tokens to find one that works.
+///
+/// A tunnel this machine runs is known by its connector token. A tunnel it
+/// does not run is looked up in Cloudflare by name, through every API token
+/// here — the connector token lives where the connector runs, but routes and
+/// DNS are account-level and can be managed from anywhere that holds the
+/// account's API token.
 fn resolve_tunnel(config: &config::Config, tunnel_name: &str) -> Result<(String, String, String)> {
-    let tunnel = config.tunnels.iter()
-        .find(|t| t.name == tunnel_name)
-        .ok_or_else(|| anyhow::anyhow!("tunnel '{}' not found", tunnel_name))?;
-
-    let payload = config::decode_token(&tunnel.token)?;
     let api_tokens = config.all_cf_api_tokens();
 
-    for api_token in &api_tokens {
-        if cloudflare::verify_token(api_token, &payload.account_id, &payload.tunnel_id) {
-            return Ok((api_token.to_string(), payload.account_id, payload.tunnel_id));
+    if let Some(tunnel) = config.tunnels.iter().find(|t| t.name == tunnel_name) {
+        let payload = config::decode_token(&tunnel.token)?;
+        for api_token in &api_tokens {
+            if cloudflare::verify_token(api_token, &payload.account_id, &payload.tunnel_id) {
+                return Ok((api_token.to_string(), payload.account_id, payload.tunnel_id));
+            }
         }
+        anyhow::bail!("No API token works for tunnel '{}'. Add one with: tunnels (TUI) → t a", tunnel_name)
     }
 
-    anyhow::bail!("No API token works for tunnel '{}'. Add one with: tunnels (TUI) → T", tunnel_name)
+    if api_tokens.is_empty() {
+        anyhow::bail!(
+            "tunnel '{}' does not run on this machine, and there is no API token here to look it up with. Add one with: tunnels (TUI) → t a",
+            tunnel_name
+        )
+    }
+    for (api_token, hint_accounts) in config.api_tokens_with_reach() {
+        if let Some((account_id, tunnel_id)) =
+            cloudflare::find_tunnel_by_name(api_token, &hint_accounts, tunnel_name)
+        {
+            return Ok((api_token.to_string(), account_id, tunnel_id));
+        }
+    }
+    anyhow::bail!(
+        "tunnel '{}' does not run on this machine, and none of the {} API token(s) here can see a tunnel by that name in Cloudflare",
+        tunnel_name, api_tokens.len()
+    )
 }
 
 fn cli_routes(tunnel_filter: Option<&str>, json: bool) -> Result<()> {
@@ -815,42 +835,40 @@ fn cli_routes(tunnel_filter: Option<&str>, json: bool) -> Result<()> {
     // If a tunnel name is given and it looks like a flag, skip it
     let tunnel_filter = tunnel_filter.filter(|s| !s.starts_with('-'));
 
-    let tunnels_to_query: Vec<&config::Tunnel> = if let Some(name) = tunnel_filter {
-        let t = config.tunnels.iter().find(|t| t.name == name)
-            .ok_or_else(|| anyhow::anyhow!("tunnel '{}' not found", name))?;
-        vec![t]
-    } else {
-        config.tunnels.iter().collect()
-    };
-
     let api_tokens = config.all_cf_api_tokens();
     if api_tokens.is_empty() {
-        eprintln!("No API tokens configured. Add one in the TUI with T.");
+        eprintln!("No API tokens configured. Add one in the TUI with t a.");
         std::process::exit(1);
+    }
+
+    // (name, api_token, account_id, tunnel_id) for each tunnel to ask about.
+    // A named tunnel may be one another machine runs; resolve_tunnel finds
+    // it in Cloudflare. With no name, it is the tunnels this machine runs.
+    let mut targets: Vec<(String, String, String, String)> = Vec::new();
+    if let Some(name) = tunnel_filter {
+        let (api_token, account_id, tunnel_id) = resolve_tunnel(&config, name)?;
+        targets.push((name.to_string(), api_token, account_id, tunnel_id));
+    } else {
+        for tunnel in &config.tunnels {
+            let Ok(payload) = config::decode_token(&tunnel.token) else { continue };
+            let Some(api_token) = api_tokens
+                .iter()
+                .find(|t| cloudflare::verify_token(t, &payload.account_id, &payload.tunnel_id))
+            else {
+                continue;
+            };
+            targets.push((tunnel.name.clone(), api_token.to_string(), payload.account_id, payload.tunnel_id));
+        }
     }
 
     let mut all_routes: Vec<serde_json::Value> = Vec::new();
 
-    for tunnel in &tunnels_to_query {
-        let payload = match config::decode_token(&tunnel.token) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-
-        // Find a working API token
-        let api_token = api_tokens.iter()
-            .find(|t| cloudflare::verify_token(t, &payload.account_id, &payload.tunnel_id));
-
-        let api_token = match api_token {
-            Some(t) => t,
-            None => continue,
-        };
-
-        let routes = cloudflare::list_routes(api_token, &payload.account_id, &payload.tunnel_id);
+    for (name, api_token, account_id, tunnel_id) in &targets {
+        let routes = cloudflare::list_routes(api_token, account_id, tunnel_id);
         for route in &routes {
             let hostname = route.hostname.as_deref().unwrap_or("(catch-all)");
             all_routes.push(serde_json::json!({
-                "tunnel": tunnel.name,
+                "tunnel": name,
                 "hostname": hostname,
                 "service": route.service,
             }));

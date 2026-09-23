@@ -521,11 +521,13 @@ impl App {
                     self.listening_ports =
                         crate::scan::scan_services().into_iter().map(|s| s.port).collect();
                     self.unreached = sync.unreached;
+                    // An account without a token is reported in the status
+                    // line, not by opening the token dialog over the board:
+                    // a machine that runs a connector for an account it will
+                    // never manage saw that modal at every launch, and it
+                    // swallows `q`. The dialog is one prefix away (t a).
                     self.status_msg = Some(sync.status);
                     self.rebuild_unified_rows();
-                    if !self.unreached.is_empty() {
-                        self.begin_add_api_token();
-                    }
                 }
                 BgResult::Routes { tunnel_name, api_token, account_id, tunnel_id, routes, status_msg } => {
                     if let Some(msg) = status_msg {

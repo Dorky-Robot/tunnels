@@ -118,6 +118,8 @@ tunnels import                       # Import existing plists
 # Routes
 tunnels routes [TUNNEL] [--json]     # List ingress routes
 tunnels route add <host> <port> --tunnel <name>  # Idempotent
+#   --tunnel may name a tunnel another machine runs: it is found in
+#   Cloudflare by name through the API tokens held here
 tunnels route rm <host> --tunnel <name>
 tunnels route mv <old> <new> --tunnel <name>
 
