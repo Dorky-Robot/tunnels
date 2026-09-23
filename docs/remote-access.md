@@ -72,8 +72,12 @@ Then, in the admin console, for **every machine you cannot walk to**:
   Reach it the tailnet way — the port is simply there, no forward, no tunnel:
 
   ```sh
-  open vnc://felixs-mac-mini:5900
+  desktop-felix-mini          # or: desktop felix-mini, desktop --list
   ```
+
+  `desktop` (installed by `mesh/install.sh`) walks the same three paths this
+  document keeps for ssh, tailnet first, and only the tunnel fallback leaves
+  anything running. By hand it is `open vnc://felixs-mac-mini:5900`.
 
   Do **not** build an `ssh -L 5901:localhost:5900` tunnel for this. That was
   the recipe before the tailnet existed, when the only way in was cloudflared
