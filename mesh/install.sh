@@ -10,6 +10,7 @@
 #   ~/.ssh/config.d/mesh.conf         every box, three ways in (see its header)
 #   ~/.ssh/config.d/mesh_known_hosts  host keys taken from each machine itself
 #   ~/.local/bin/tunnel-watchdog.sh   brings back a tunnel that was booted out
+#   ~/.local/bin/desktop + symlinks   desktop-<machine>, a screen in one word
 #   com.dorkyrobot.tunnel-watchdog    runs it every five minutes, finds its own tunnels
 #
 # What it does NOT do, because it cannot be done from one machine:
@@ -37,6 +38,12 @@ fi
 mkdir -p "$HOME/.local/bin" "$HOME/Library/Logs"
 cp "$repo/scripts/tunnel-watchdog.sh" "$HOME/.local/bin/tunnel-watchdog.sh"
 chmod +x "$HOME/.local/bin/tunnel-watchdog.sh"
+
+# desktop-<machine>. --install makes its own symlinks beside itself, so the
+# machine list lives in the script and not in two places.
+cp "$here/desktop" "$HOME/.local/bin/desktop"
+chmod +x "$HOME/.local/bin/desktop"
+"$HOME/.local/bin/desktop" --install >/dev/null
 P="$HOME/Library/LaunchAgents/com.dorkyrobot.tunnel-watchdog.plist"
 launchctl bootout "gui/$(id -u)/com.dorkyrobot.tunnel-watchdog" 2>/dev/null || true
 cp "$here/com.dorkyrobot.tunnel-watchdog.plist" "$P"

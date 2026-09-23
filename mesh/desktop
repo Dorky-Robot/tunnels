@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# desktop — put a mesh machine's screen on yours, in one word.
+#
+#   desktop-felix-mini      the mini's screen
+#   desktop felix-mini      the same; they are one script behind symlinks
+#
+# Named after the machine, like `ssh <name>`, so the command name is the only
+# thing to remember and tab completion finds the rest.
+#
+# It tries the same three ways in the mesh keeps for ssh, in the order that
+# fails for the fewest reasons:
+#
+#   1. the tailnet   5900 is simply there — no tunnel, no forward, no port
+#   2. the LAN       mDNS; the one that survives the internet being down
+#   3. the tunnel    an ssh -L, because cloudflared carries ssh and not vnc
+#
+# Only the third leaves anything running, which is why --list and --stop talk
+# about tunnels and nothing else: a background tunnel you cannot see is worse
+# than a blocked terminal, and the first two paths have nothing to clean up.
+#
+# Before Tailscale this script went straight to step 3 for every machine, and
+# every session cost a spare local port and a stray ssh. Step 1 is not an
+# optimisation of that — it is the absence of it.
+
+set -u
+
+# ---- the mesh ------------------------------------------------------------
+# name → the ssh aliases in ~/.ssh/config.d/mesh.conf, plus the local port to
+# use if we fall all the way through to a tunnel. Ports differ per machine so
+# several tunnelled sessions can be open at once; doug-mini keeps 5901 to
+# match the LocalForward some older ~/.ssh/config copies still carry.
+#
+# The remote login is NOT repeated here — it is read from mesh.conf with
+# `ssh -G`, so douggraham-vs-felixflores stays true in one place.
+#
+# Add a machine = add a case + a name in machines() + `desktop --install`.
+machines() { printf '%s\n' felix-mini doug-mini mac2024 mac2019 dorkyrobot1; }
+
+lookup() {
+  case "$1" in
+    felix-mini|felixmini|mini|macmini)
+                     mesh=macmini     lan=mini-lan         cf=cloudflare-mini        port=5902 ;;
+    doug-mini|doug)  mesh=doug-mini   lan=doug-mini-lan    cf=cloudflare-doug-mini   port=5901 ;;
+    mac2024|2024)    mesh=mac2024     lan=mac2024-lan      cf=cloudflare-mac2024     port=5904 ;;
+    mac2019|2019)    mesh=mac2019     lan=mac2019-lan      cf=cloudflare-mac2019     port=5903 ;;
+    dorkyrobot1|dr1) mesh=dorkyrobot1 lan=dorkyrobot1-lan  cf=cloudflare-dorkyrobot1 port=5905 ;;
+    *) return 1 ;;
+  esac
+}
+
+die() { echo "desktop: $*" >&2; exit 1; }
+
+# `ssh -G` is the single source of truth: it answers with whatever mesh.conf
+# resolved, so this script cannot drift from the ssh config the way a second
+# copy of the hostnames would.
+ssh_field() { ssh -G "$1" 2>/dev/null | awk -v k="$2" '$1==k {print $2; exit}'; }
+
+# -G is connect timeout, -w overall. Both matter: an off-tailnet machine hangs
+# rather than refusing, and a hung probe here looks like a broken command.
+reachable() { nc -z -G 3 -w 3 "$1" 5900 >/dev/null 2>&1; }
+
+listening() { lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1; }
+
+usage() {
+  cat <<USAGE
+usage: desktop <machine>        open its screen by the best path available
+       desktop --list           which machines answer, and by which path
+       desktop --stop <machine> close a tunnel (--stop all for every one)
+       desktop --install        (re)create the desktop-<machine> symlinks
+
+machines: $(machines | tr '\n' ' ')
+USAGE
+}
+
+# ---- commands ------------------------------------------------------------
+do_list() {
+  local m mesh lan cf port host pid
+  for m in $(machines); do
+    lookup "$m"
+    host=$(ssh_field "$mesh" hostname)
+    if [ -n "$host" ] && reachable "$host"; then
+      printf '  %-12s tailnet  %s:5900\n' "$m" "$host"
+      continue
+    fi
+    host=$(ssh_field "$lan" hostname)
+    if [ -n "$host" ] && reachable "$host"; then
+      printf '  %-12s lan      %s:5900\n' "$m" "$host"
+      continue
+    fi
+    if listening "$port"; then
+      pid=$(lsof -nP -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -1)
+      printf '  %-12s tunnel   localhost:%s -> %s  (pid %s)\n' "$m" "$port" "$cf" "$pid"
+    else
+      printf '  %-12s —        no screen on any path\n' "$m"
+    fi
+  done
+}
+
+do_stop() {
+  local m mesh lan cf port pid
+  for m in "$@"; do
+    lookup "$m" || die "unknown machine: $m"
+    if listening "$port"; then
+      # Kill only the listener holding our port, not every ssh to that host —
+      # an interactive shell you have open on the same box should survive this.
+      pid=$(lsof -nP -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -1)
+      kill "$pid" 2>/dev/null && echo "desktop: $m tunnel closed (pid $pid)"
+    else
+      echo "desktop: $m had no tunnel up (the tailnet and LAN paths leave none)"
+    fi
+  done
+}
+
+do_install() {
+  local dir m
+  dir=$(cd "$(dirname "$0")" && pwd)
+  for m in $(machines); do
+    ln -sf "$dir/desktop" "$dir/desktop-$m"
+    echo "desktop: $dir/desktop-$m"
+    # The old name, kept as an alias rather than deleted: it is in muscle
+    # memory and in at least one runbook, and a symlink costs nothing.
+    ln -sf "$dir/desktop" "$dir/remote-$m"
+  done
+}
+
+connect_direct() {
+  local label=$1 alias=$2 host login
+  host=$(ssh_field "$alias" hostname)
+  [ -n "$host" ] || return 1
+  reachable "$host" || return 1
+  login=$(ssh_field "$alias" user)
+  echo "desktop: $label — vnc://$login@$host:5900"
+  open "vnc://$login@$host:5900"
+}
+
+connect_tunnel() {
+  local cf=$1 port=$2 login i
+  login=$(ssh_field "$cf" user)
+  if listening "$port"; then
+    echo "desktop: reusing tunnel on localhost:$port"
+  else
+    echo "desktop: tunnel — $cf …"
+    # ExitOnForwardFailure turns a port that is quietly already taken into a
+    # visible error instead of a session that opens onto nothing.
+    ssh -f -N -L "$port:localhost:5900" -o ExitOnForwardFailure=yes "$cf" \
+      || return 1
+    # ssh -f returns once the forward is requested; give the listener a moment
+    # to actually bind before handing the port to Screen Sharing.
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      listening "$port" && break
+      sleep 0.2
+    done
+    listening "$port" || return 1
+  fi
+  echo "desktop: vnc://$login@localhost:$port   (--stop when done)"
+  open "vnc://$login@localhost:$port"
+}
+
+do_connect() {
+  local name=$1 mesh lan cf port
+  lookup "$name" || die "unknown machine: $name (try: $(machines | tr '\n' ' '))"
+  connect_direct tailnet "$mesh" && exit 0
+  connect_direct lan     "$lan"  && exit 0
+  connect_tunnel "$cf" "$port"   && exit 0
+  die "no way in to $name: not on the tailnet, not on the LAN, and the tunnel would not open.
+     Check \`tailscale status\`, then that the machine has a screen turned on at all —
+     ssh reaching it proves Remote Login, not Screen Sharing or Remote Management."
+}
+
+# ---- dispatch ------------------------------------------------------------
+# Called through a symlink the machine is already chosen, so a flag that takes
+# a machine (--stop) gets it for free: `desktop-doug-mini --stop` is enough.
+self=$(basename "$0")
+case "$self" in
+  desktop-*) default=${self#desktop-} ;;
+  remote-*)  default=${self#remote-}  ;;   # the old name, still symlinked
+  *)         default= ;;
+esac
+
+case "${1:-}" in
+  --list|-l) do_list; exit ;;
+  --install) do_install; exit ;;
+  --stop)
+    shift
+    if [ $# -eq 0 ]; then
+      [ -n "$default" ] || die "--stop needs a machine (or: all)"
+      set -- "$default"
+    fi
+    if [ "$1" = all ]; then do_stop $(machines); else do_stop "$@"; fi
+    exit ;;
+  -h|--help) usage; exit ;;
+  -*) die "unknown option: $1" ;;
+  '') [ -n "$default" ] || { usage; exit; }
+      do_connect "$default" ;;
+  *)  do_connect "$1" ;;
+esac
