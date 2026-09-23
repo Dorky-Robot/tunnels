@@ -1,0 +1,18 @@
+# GitHub accounts a mesh machine can push as. `mesh/build` turns this into
+# ~/.ssh/config.d/github.conf, identical on every machine.
+#
+#   account  the GitHub login; `ssh -T` answers "Hi <account>!"
+#   key      the key file in ~/.ssh — one per machine per account, made there
+#            by `github-key-setup <account>` and never copied between boxes
+#   git      the author a machine whose `github` column names this account
+#            commits as, or - to leave git's identity alone
+#   hosts    the ssh names that sign in as this account. The first line that
+#            lists github.com is what plain git@github.com: remotes use.
+#
+# A second account is another line with its own alias (github.com-<account>)
+# and its own key. A remote picks the account by the alias it is written with:
+#   git@github.com-nerdnest:NerdNest-Engineering/levee.git
+#
+# account        | key                      | git                                  | hosts
+felixflores      | id_dorkyrobot_ed25519    | Felix Flores <felix@dorkyrobot.com>  | github.com github.com-dorkyrobot
+NerdNestFelix    | id_nerdnest_ed25519      | -                                    | github.com-nerdnest

@@ -1,0 +1,38 @@
+# The mesh: every machine, one line each. Everything else in mesh/ that names
+# a machine is generated from this by `mesh/build` — mesh.conf, the known
+# hosts, the authorized_keys block — and `desktop` reads it at run time.
+#
+#   name     the short name: `ssh <name>`, `<name>-lan`, `cloudflare-<name>`,
+#            `desktop-<name>`; also names hostkeys/<name> and keys/<name>.pub
+#   host     its tailnet (MagicDNS) name, which is also `hostname -s` on it;
+#            the LAN path is <host>.local
+#   user     its login
+#   ip       its tailnet address, pinned in known_hosts beside the names
+#   tunnel   the hostname its cloudflared carries ssh on, or - for none
+#   vnc      the local port `desktop` forwards its screen to over the tunnel;
+#            one per machine so several can be open at once
+#   github   the account in mesh/accounts it pushes as, or - for none
+#   aliases  more names for the tailnet path, and for `desktop`
+#
+# Comment lines directly above a machine are carried into its section of
+# mesh.conf, so a note about one box stays next to that box.
+#
+# Adding a machine: docs/remote-access.md, "Adding a machine".
+
+# name       host                 user         ip              tunnel                             vnc   github       aliases
+mac2024      felixs-mac-2024      felixflores  100.104.239.33  ssh-mac2024.felixflor.es           5904  felixflores  2024
+mini         felixs-mac-mini      felixflores  100.69.243.61   ssh-mini.felixflor.es              5902  felixflores  macmini felix-mini felixmini
+mac2019      felixs-mac-2019      felixflores  100.65.87.40    ssh-mac2019.felixflor.es           5903  felixflores  2019
+# Doug's machine, under Doug's own login: it is in the mesh, but pushes to
+# GitHub as nobody here, and keeps its own git identity.
+doug-mini    dougs-mac-mini-2024  douggraham   100.115.192.47  ssh-mini.homesforsalebymonica.com  5901  -            doug
+# Its tunnel lives in the dorkyrobot account while ssh-dorkyrobot1.felixflor.es
+# lives in the gmail one, so `tunnels route add` could write the ingress but not
+# the DNS ("no Cloudflare zone found"). The CNAME was already there by hand and
+# the path works; if it is ever rebuilt, the record has to be made where the
+# zone is, not where the tunnel is.
+dorkyrobot1  dorkyrobot1          felixflores  100.116.247.16  ssh-dorkyrobot1.felixflor.es       5905  felixflores  dr1
+# Note the user: this box's account is `dorkyrobot2`, not felixflores.
+# Its tunnel (DorkyRobot2) and ssh-dorkyrobot2.felixflor.es are in the same
+# Cloudflare account, so `tunnels route add` could write both ingress and DNS.
+dorkyrobot2  dorkyrobot2          dorkyrobot2  100.97.227.67   ssh-dorkyrobot2.felixflor.es       5906  felixflores  dr2
