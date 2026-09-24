@@ -167,12 +167,13 @@ pub fn view(config: &Config, fleet: &Fleet, me: &str) -> MachineTokens {
     let api_tokens: Vec<ApiTokenView> = config
         .api_tokens()
         .iter()
-        .map(|t| ApiTokenView {
-            id: fingerprint(&t.token),
-            hint: t.hint(),
-            covers: t.covers.clone(),
-            reach: t.reach.clone(),
-            valid: Some(Client::new(&t.token).verify().is_ok()),
+        .map(|t| {
+            let valid = Client::new(&t.token).verify().is_ok();
+            // a token kept before reach was recorded (bare-string configs) is
+            // still valid; look up what it reaches rather than calling it
+            // placeless and its account unmanaged
+            let reach = if t.reach.is_empty() && valid { reach_of(&t.token).map(|(_, r)| r).unwrap_or_default() } else { t.reach.clone() };
+            ApiTokenView { id: fingerprint(&t.token), hint: t.hint(), covers: t.covers.clone(), reach, valid: Some(valid) }
         })
         .collect();
     let dir = crate::api::directory(config);
