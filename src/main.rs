@@ -2042,7 +2042,10 @@ fn print_cf(out: &tunnels::api::Outcome, json: bool, scope: Scope) -> Result<i32
         return Ok(code);
     }
     if let Some(v) = &out.via {
-        eprintln!("  (no token here for that account — made by {v}, with its token, and logged there)");
+        eprintln!(
+            "  (no token here for that account — made by {v}, with its token{})",
+            if out.method == "GET" { "" } else { ", and logged there" }
+        );
     }
     for n in &out.notes {
         eprintln!("  {n}");
