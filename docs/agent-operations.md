@@ -2,7 +2,7 @@
 
 *Status: agreed plan, 2026-09-24; every decision is in
 [Decisions](#decisions). Phases 1 and 2 (`tunnels cf`) are built and shipped in
-0.17.0; phase 3 is next.*
+0.17.0, with mesh forwarding in 0.18.0; phase 3a is next.*
 
 ## The idea in one paragraph
 
@@ -244,7 +244,8 @@ Most things never meet any of these, and should stay documented API calls.
 |---|---|---|
 | **1** ✓ | `tunnels cf` for reads: placeholders, token picking, `--json` | an agent can answer "what is the SSL mode on everyday.vet" without any token appearing in its transcript |
 | **2** ✓ | `tunnels cf` writes: preview, `--yes`, before/after log, `cf log`, `cf undo`; refusal of paths `tunnels` owns | a PATCH and its undo round-trip against the fake Cloudflare in tests, and once for real on a throwaway setting |
-| **3** | runbook format, index, `add-a-machine`; the agent's Access check (see below); `publish-the-web-ui` | the web UI loads at `tunnels.felixflor.es` after signing in with id.felixflor.es, with no change buttons; a request without a valid Access token, and any `POST` through Cloudflare, gets 403 from the agent itself |
+| **3a** | agent side, buildable now: verifying the Access token, `admins`, relaying machine actions across the mesh, a target-machine picker in the UI, recording who made each change | tested against a fake Access (its own signing keys): a non-admin gets the page without buttons and 403 on any write; an admin restarts a tunnel on another machine from the page |
+| **3b** | Cloudflare side, waiting on the admin token and the pocket-id client: login provider, Access app, `tunnels.felixflor.es` route; runbook `publish-the-web-ui` | signed in as an admin at `tunnels.felixflor.es`, you can restart a tunnel on mini; signed in as anyone else, you can only look |
 | **4** | the rest of the first runbooks; `CLAUDE.md` points agents to the index | each has been run once for real, and its History section has an entry |
 | **5** | promote whatever phases 3–4 show is worth it | — |
 
@@ -283,7 +284,8 @@ browser ──> tunnels.felixflor.es ──> Cloudflare Access ──> tunnel �
 |---|---|
 | The agent refuses any request carrying `Cf-Ray` and similar headers | It accepts one only with a valid Access token, as above |
 | The fleet file refuses any route to the web port | It allows one only when `[policy.web]` declares its Access app: `public_host`, `team_domain`, `aud` |
-| `/api/*` writes need `X-Tunnels: 1` | Unchanged on the tailnet. Through Cloudflare every write is refused: the internet view is read-only |
+| `/api/*` writes need `X-Tunnels: 1` | Unchanged. Through Cloudflare they also need a verified Access token whose email is in `[policy.web] admins` |
+| Machine actions work only on the machine serving the page | Any machine: the serving agent relays them over the tailnet (`/api/relay/…`) to the target's agent |
 
 New fleet settings (the hostname is decided; the other two come from the
 Access app once it exists):
@@ -293,6 +295,7 @@ Access app once it exists):
 public_host = "tunnels.felixflor.es"
 team_domain = "<team>.cloudflareaccess.com"
 aud = "<the Access app's audience tag>"
+admins = ["felixflores@gmail.com"]   # must match the email on your pocket-id account
 ```
 
 Verifying the token needs RS256 signature checks, which means one new
@@ -300,15 +303,33 @@ dependency (the `jsonwebtoken` crate, or `rsa` + `sha2`). The team's keys
 come from `https://<team_domain>/cdn-cgi/access/certs`; the agent caches them
 and refreshes them when an unknown key id shows up.
 
-### Read-only from the internet
+### An admin interface for the whole mesh, for listed emails
 
-Signing in shows everything the UI shows, and changes nothing. The agent
-refuses every `POST` that arrives through Cloudflare, even with a valid
-Access token, so Apply, prune, takeover, promote and failback work only from
-the tailnet. The UI hides those buttons when it is being viewed through
-Cloudflare. This matters more because anyone pocket-id knows can sign in: a
-phished or shared sign-in can look, but cannot touch a tunnel, a route or a
-DNS record.
+*Changed 2026-09-24: this was read-only; it is now the admin interface.*
+
+- **Anyone pocket-id knows can sign in and look.** Only the emails in
+  `[policy.web] admins` get the change buttons. The agent decides this from
+  the verified Access token's `email` claim, not from the Access policy, so a
+  loose policy can't hand out admin by mistake.
+- **Admin means the whole mesh, not only the machine serving the page.**
+  - Cloudflare actions (apply, prune, takeover, promote, failback,
+    `tunnels cf` writes) run on the serving agent. They use mesh forwarding
+    when it has no token for the account.
+  - Machine actions (start, stop or restart a tunnel, view its logs, run an
+    agent pass, relabel tokens) name a target machine. The serving agent
+    relays them over the tailnet to that machine's agent, at
+    `/api/relay/<action>`.
+  - The receiving agent accepts a relay only from a fleet machine on
+    `policy.remote_from`, checked by its tailnet address as `/api/cf-forward`
+    does. It trusts the relaying agent to have checked the admin's identity.
+- **Every change records who made it:** the admin's email plus "via
+  tunnels.felixflor.es", in the cf log and in the agent's events.
+- **Safeguards stay in the page.** Prune and takeover still ask for
+  confirmation. Destroying a tunnel, rotating a tunnel's secret and
+  changing API tokens stay CLI-only: they are irreversible, and one wrong
+  click from a phone is not the place for them.
+- **Changes need the `X-Tunnels: 1` header** through Cloudflare too, so a
+  page on another site can't drive a signed-in browser.
 
 ### Which machine serves it
 
@@ -360,9 +381,10 @@ that document to match.
 | 5 | Runbook checks run by a tool | Undecided. Keep checks as text an agent reads and judges. Revisit after the first runbooks have been run a few times: if the same check keeps being done mechanically, give it a command |
 | 6 | Who may sign in to the web UI | For now, anyone pocket-id knows |
 | 7 | The public hostname | `tunnels.felixflor.es` |
-| 8 | Can an internet sign-in change anything | No. Read-only; every change needs the tailnet |
+| 8 | Can an internet sign-in change anything | ~~No, read-only~~ Changed the same day: yes, for emails listed in `[policy.web] admins`, and across the whole mesh. Everyone else signed in can only look. Destroy, rotate and token changes stay CLI-only |
 | 9 | Standby for the web UI | None. It stays on dorkyrobot2, where pocket-id also runs |
 
 ## Open questions
 
-None right now. The next step is phase 1: `tunnels cf` for reads.
+1. **The admin email.** `admins` must hold the email on your pocket-id
+   account. felixflores@gmail.com is assumed until you say otherwise.

@@ -465,3 +465,138 @@ fn a_machine_off_the_allowlist_cannot_use_a_peers_token() {
     assert!(out.stderr.contains("not on policy.remote_from"), "{}", out.stderr);
     assert!(b.world().ssl.get("z-vet").is_none(), "nothing changed");
 }
+
+// ------------------------------------------------------------------ the web UI through Cloudflare Access
+
+struct Web {
+    _s: Sandbox,
+    child: std::process::Child,
+    port: u16,
+}
+
+impl Drop for Web {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+    }
+}
+
+fn published_ui() -> Web {
+    let port = free_port();
+    let fleet = FLEET.replace(
+        "web_port = 9",
+        &format!(
+            "web_port = {port}\nremote_from = [\"dr1\", \"dr2\"]\n[policy.web]\npublic_host = \"tunnels.felixflor.es\"\nteam_domain = \"team.example.com\"\naud = \"aud-1\"\nadmins = [\"felix@example.com\"]"
+        ),
+    );
+    let s = sandbox();
+    s.write_fleet(&fleet);
+    let mut c = s.command(&["agent", "run"]);
+    c.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    let child = c.spawn().unwrap();
+    for _ in 0..50 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Web { _s: s, child, port }
+}
+
+fn access_token(email: &str) -> String {
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+    let mut h = Header::new(Algorithm::RS256);
+    h.kid = Some("test-kid".into());
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let claims = json!({ "email": email, "aud": ["aud-1"], "iss": "https://team.example.com", "exp": now + 300, "iat": now });
+    encode(&h, &claims, &EncodingKey::from_rsa_pem(include_bytes!("fixtures/access-test-key.pem")).unwrap()).unwrap()
+}
+
+/// A request as Cloudflare would deliver it: from this Mac's cloudflared, with
+/// Cloudflare's headers, for the public host.
+fn via_cf(w: &Web, method: &str, path: &str, token: Option<&str>, host: &str, body: Option<serde_json::Value>) -> (u16, String) {
+    let a: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let url = format!("http://127.0.0.1:{}{path}", w.port);
+    let mut r = match method {
+        "GET" => {
+            let mut q = a.get(&url).header("Host", host).header("Cf-Ray", "test");
+            if let Some(t) = token {
+                q = q.header("Cf-Access-Jwt-Assertion", t);
+            }
+            q.call().unwrap()
+        }
+        _ => {
+            let mut q = a.post(&url).header("Host", host).header("Cf-Ray", "test").header("X-Tunnels", "1");
+            if let Some(t) = token {
+                q = q.header("Cf-Access-Jwt-Assertion", t);
+            }
+            q.send_json(body.unwrap_or(json!({}))).unwrap()
+        }
+    };
+    let code = r.status().as_u16();
+    (code, r.body_mut().read_to_string().unwrap_or_default())
+}
+
+#[test]
+fn through_cloudflare_nobody_gets_in_without_a_valid_access_token() {
+    let w = published_ui();
+    let (code, _) = via_cf(&w, "GET", "/api/whoami", None, "tunnels.felixflor.es", None);
+    assert_eq!(code, 403, "no token");
+    let (code, _) = via_cf(&w, "GET", "/api/whoami", Some("forged.token.here"), "tunnels.felixflor.es", None);
+    assert_eq!(code, 403, "bad token");
+    let (code, body) = via_cf(&w, "GET", "/api/whoami", Some(&access_token("felix@example.com")), "other.felixflor.es", None);
+    assert_eq!(code, 403, "only the declared public host: {body}");
+}
+
+#[test]
+fn a_guest_can_look_but_not_change_anything() {
+    let w = published_ui();
+    let guest = access_token("guest@example.com");
+    let (code, body) = via_cf(&w, "GET", "/api/whoami", Some(&guest), "tunnels.felixflor.es", None);
+    assert_eq!(code, 200);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!((v["who"].as_str(), v["admin"].as_bool()), (Some("guest@example.com"), Some(false)));
+    let (code, body) = via_cf(&w, "POST", "/api/relay", Some(&guest), "tunnels.felixflor.es", Some(json!({ "machine": "dr2", "action": "agent-pass" })));
+    assert_eq!(code, 403, "{body}");
+    assert!(body.contains("can look but not change"), "{body}");
+    let (code, _) = via_cf(&w, "POST", "/api/apply", Some(&guest), "tunnels.felixflor.es", None);
+    assert_eq!(code, 403);
+}
+
+#[test]
+fn an_admin_acts_and_is_named_in_the_record() {
+    let w = published_ui();
+    let admin = access_token("Felix@Example.com");
+    let (code, body) = via_cf(&w, "POST", "/api/relay", Some(&admin), "tunnels.felixflor.es", Some(json!({ "machine": "dr2", "action": "agent-pass" })));
+    assert_eq!(code, 200, "{body}");
+    let a: ureq::Agent = ureq::Agent::config_builder().build().into();
+    let ev: serde_json::Value = a.get(&format!("http://127.0.0.1:{}/api/agent", w.port)).call().unwrap().body_mut().read_json().unwrap();
+    let events = ev["events"].to_string();
+    assert!(events.contains("felix@example.com: agent pass started"), "{events}");
+}
+
+#[test]
+fn machine_to_machine_endpoints_are_never_reachable_through_cloudflare() {
+    let w = published_ui();
+    let admin = access_token("felix@example.com");
+    for path in ["/api/cf-forward", "/api/relay-exec", "/api/notify"] {
+        let (code, body) = via_cf(&w, "POST", path, Some(&admin), "tunnels.felixflor.es", Some(json!({ "requested_by": "dr1", "action": "agent-pass", "method": "GET", "path": "/x" })));
+        assert_eq!(code, 403, "{path}: {body}");
+    }
+}
+
+#[test]
+fn a_relay_is_only_taken_from_a_machine_on_the_allowlist() {
+    let w = published_ui();
+    let a: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let post = |from: &str| {
+        let mut r = a
+            .post(&format!("http://127.0.0.1:{}/api/relay-exec", w.port))
+            .header("X-Tunnels", "1")
+            .send_json(json!({ "action": "agent-pass", "requested_by": from, "actor": "felix@example.com" }))
+            .unwrap();
+        (r.status().as_u16(), r.body_mut().read_to_string().unwrap_or_default())
+    };
+    assert_eq!(post("dr1").0, 200);
+    let (code, body) = post("doug-mini");
+    assert_eq!(code, 403, "{body}");
+}

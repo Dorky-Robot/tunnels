@@ -126,6 +126,9 @@ fn tunnel_json(t: &FakeTunnel) -> Value {
 }
 
 fn route(w: &mut World, method: &str, path: &str, q: &str, body: &str) -> (u16, Value) {
+    if path == "/cdn-cgi/access/certs" {
+        return (200, serde_json::from_str(include_str!("../fixtures/access-test-certs.json")).unwrap());
+    }
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     let body: Value = serde_json::from_str(body).unwrap_or(Value::Null);
     match (method, parts.as_slice()) {
@@ -332,6 +335,7 @@ impl Sandbox {
             .env("TUNNELS_LAUNCH_AGENTS", self.path("LaunchAgents"))
             .env("TUNNELS_LOG_DIR", self.path("logs"))
             .env("TUNNELS_LAUNCHCTL", "/usr/bin/true")
+            .env("TUNNELS_ACCESS_CERTS_URL", format!("{}/cdn-cgi/access/certs", self.fake.url))
             .env_remove("SSH_CONNECTION")
             .env_remove("SSH_TTY");
         c
