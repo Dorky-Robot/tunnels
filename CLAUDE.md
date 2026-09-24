@@ -47,6 +47,15 @@ the visual interface.
   - Binds to the tailnet IP and loopback only, and rejects non-tailnet addresses and requests
     carrying proxy headers (`Cf-Ray` and similar).
   - POSTs need an `X-Tunnels: 1` header.
+  - `identify()` gives every request an identity. Tailnet or loopback: full rights. Proxied
+    (Cloudflare headers): only from loopback, only for `[policy.web] public_host`, only with a
+    valid Access token; POSTs need an admin. Peer endpoints (`/api/cf-forward`,
+    `/api/relay-exec`, `/api/notify`) refuse anything proxied.
+  - `/api/relay` runs a machine action here or relays it to the target's `/api/relay-exec`,
+    which checks `may_forward` (allowlist plus the caller's tailnet address).
+- **access.rs**: verifies Cloudflare Access tokens: the team's JWKS (cached, refreshed on an
+  unknown key id), RS256, audience, issuer and expiry. Admin = the email is in `[policy.web]
+  admins`. `TUNNELS_ACCESS_CERTS_URL` points it at the tests' fake.
 - **sync.rs**: fleet replication. The file is served at `/api/fleet` and the newest `serial`
   wins. `notify` wakes the peers.
 - **status.rs**: the shared view model used by `tunnels status` and the web UI.

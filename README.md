@@ -175,15 +175,41 @@ standby does not share the primary's data.
 
 `tunnels web` prints the address. The UI shows:
 
-- every account, tunnel, connector and route, with where each hostname's DNS actually points;
-- orphans, and tunnels that are down;
-- the pending plan, with buttons for applying safe changes, pruning, or taking over hostnames;
-- promote and failback buttons;
-- the agent's recent actions and the tunnel logs.
+- every account, tunnel, connector and route, and where each hostname's DNS actually points;
+- orphans, tunnels that are down, and every machine's agent;
+- the pending plan, with buttons to apply it, prune, or take over hostnames;
+- promote and failback;
+- restart and logs for **any tunnel on any machine**, and an agent pass for any machine;
+- every agent's recent actions, and the `tunnels cf` changes made from every machine.
 
-The UI binds only to the Mac's tailnet address and to localhost. It rejects any request from
-elsewhere, including anything that came through a Cloudflare tunnel, and the fleet file refuses
-a route that points at the UI's port.
+### On the tailnet
+
+Every agent serves the UI on its tailnet address and on localhost, with full rights. It rejects
+requests from anywhere else. The tailnet is the way in when everything else is down.
+
+### On the internet, behind Cloudflare Access (optional)
+
+To reach the UI from anywhere, publish it through a tunnel with Cloudflare Access in front:
+
+```toml
+[policy.web]
+public_host = "tunnels.example.com"
+team_domain = "<team>.cloudflareaccess.com"
+aud = "<the Access app's audience tag>"
+admins = ["you@example.com"]
+```
+
+- **The agent checks every request itself.** It verifies the `Cf-Access-Jwt-Assertion` token:
+  the signature against the team's keys, the audience, the issuer and the expiry. It accepts
+  proxied requests only from this Mac's own cloudflared, and only for `public_host`.
+- **Admin rights come from `admins`, not from the Access policy.** Listed emails can change
+  things across the whole mesh. The serving agent relays machine actions over the tailnet to the
+  target machine's agent, and that agent only accepts relays from machines on
+  `policy.remote_from`. Anyone else Access lets in can only look.
+- **Every admin action records who made it.**
+- **Destroy, rotate and token changes stay CLI-only.**
+- **Machine-to-machine endpoints are never reachable through Cloudflare.**
+- **The fleet file refuses any route to the UI's port except `public_host`.**
 
 ## The rest of Cloudflare: `tunnels cf`
 
