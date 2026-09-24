@@ -1,8 +1,8 @@
 # Running Cloudflare with agents: plan
 
 *Status: agreed plan, 2026-09-24; every decision is in
-[Decisions](#decisions). Nothing here is built yet except what the "Today"
-section describes.*
+[Decisions](#decisions). Phases 1 and 2 (`tunnels cf`) are built and shipped in
+0.17.0; phase 3 is next.*
 
 ## The idea in one paragraph
 
@@ -58,6 +58,11 @@ rotate got here.
   failed DNS step rolls back its ingress change.
 - `tunnel forget | destroy | rotate` with honest scope.
 - The web UI on each agent, tailnet only.
+- `tunnels cf` (phases 1–2, 0.17.0): placeholders, token picking, hidden
+  secrets, previews until `--yes`, a per-machine log with before/after,
+  `cf undo`, refusal of what `tunnels` owns, and every machine's log in the
+  web UI. Tested against the fake Cloudflare, and once for real: a TXT record
+  on sarameig.gs was created, changed, and both steps undone.
 
 ## Layer 2: `tunnels cf`
 
@@ -231,8 +236,8 @@ Most things never meet any of these, and should stay documented API calls.
 
 | Phase | What | Done when |
 |---|---|---|
-| **1** | `tunnels cf` for reads: placeholders, token picking, `--json` | an agent can answer "what is the SSL mode on everyday.vet" without any token appearing in its transcript |
-| **2** | `tunnels cf` writes: preview, `--yes`, before/after log, `cf log`, `cf undo`; refusal of paths `tunnels` owns | a PATCH and its undo round-trip against the fake Cloudflare in tests, and once for real on a throwaway setting |
+| **1** ✓ | `tunnels cf` for reads: placeholders, token picking, `--json` | an agent can answer "what is the SSL mode on everyday.vet" without any token appearing in its transcript |
+| **2** ✓ | `tunnels cf` writes: preview, `--yes`, before/after log, `cf log`, `cf undo`; refusal of paths `tunnels` owns | a PATCH and its undo round-trip against the fake Cloudflare in tests, and once for real on a throwaway setting |
 | **3** | runbook format, index, `add-a-machine`; the agent's Access check (see below); `publish-the-web-ui` | the web UI loads at `tunnels.felixflor.es` after signing in with id.felixflor.es, with no change buttons; a request without a valid Access token, and any `POST` through Cloudflare, gets 403 from the agent itself |
 | **4** | the rest of the first runbooks; `CLAUDE.md` points agents to the index | each has been run once for real, and its History section has an entry |
 | **5** | promote whatever phases 3–4 show is worth it | — |
@@ -320,7 +325,9 @@ already running.
   the one dashboard step left.
 - **The token permissions for layer 2:** Access: Organizations (Read),
   Identity Providers (Edit), Apps and Policies (Edit), on the felixflor
-  account.
+  account. Checked 2026-09-24: today's tokens can list Access apps and login
+  providers, but not the organization, and not zone settings (reading SSL
+  mode gets 403). `tunnels cf` now names the missing permission on a 403.
 - **A pocket-id OIDC client** for Cloudflare Access: its redirect URL is
   `https://<team_domain>/cdn-cgi/access/callback`. Whether pocket-id's admin
   API can create the client, or that is one click in its UI, is still to be

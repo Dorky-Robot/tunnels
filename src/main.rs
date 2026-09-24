@@ -79,6 +79,9 @@ enum Cmd {
     /// The agent that keeps this Mac in line and serves the web UI
     #[command(subcommand)]
     Agent(AgentCmd),
+    /// The whole Cloudflare API, by name, with guardrails (reads free, writes previewed, logged, undoable)
+    #[command(subcommand)]
+    Cf(CfCmd),
     /// [read-only] Print (or open) this Mac's web UI address
     Web {
         #[arg(long)]
@@ -288,6 +291,60 @@ enum TokenCmd {
     Rm { index: usize },
 }
 
+#[derive(Args, Clone)]
+struct CfArgs {
+    /// an API path; names resolve: {account:<alias>} {zone:<name>} {tunnel:<alias>} {record:<hostname>}
+    path: String,
+    /// the request body, as JSON
+    #[arg(long, conflicts_with = "data_file")]
+    data: Option<String>,
+    /// the request body, from a file (- for stdin)
+    #[arg(long)]
+    data_file: Option<String>,
+    /// send it; without this a write is only previewed
+    #[arg(long)]
+    yes: bool,
+    /// the account, when the path does not name one (fleet alias or id)
+    #[arg(long)]
+    account: Option<String>,
+    /// allow changing API tokens
+    #[arg(long)]
+    i_mean_tokens: bool,
+    /// allow a write that cannot be undone
+    #[arg(long)]
+    not_undoable: bool,
+}
+
+#[derive(Subcommand)]
+enum CfCmd {
+    /// [read-only] GET a Cloudflare API path
+    #[command(alias = "GET")]
+    Get(CfArgs),
+    /// [cloudflare] POST to a Cloudflare API path (previewed until --yes; logged; undoable)
+    #[command(alias = "POST")]
+    Post(CfArgs),
+    /// [cloudflare] PUT a Cloudflare API path (previewed until --yes; logged; undoable)
+    #[command(alias = "PUT")]
+    Put(CfArgs),
+    /// [cloudflare] PATCH a Cloudflare API path (previewed until --yes; logged; undoable)
+    #[command(alias = "PATCH")]
+    Patch(CfArgs),
+    /// [cloudflare] DELETE a Cloudflare API path (previewed until --yes; logged; undoable where possible)
+    #[command(alias = "DELETE")]
+    Delete(CfArgs),
+    /// [this Mac only] Changes made through `tunnels cf` on this Mac, newest first
+    Log {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// [cloudflare] Put back what a logged change changed (previewed until --yes)
+    Undo {
+        id: String,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum AgentCmd {
     /// [this Mac + cloudflare] Run the agent in the foreground (launchd does this)
@@ -346,6 +403,13 @@ const SCOPES: &[(&str, Scope)] = &[
     ("agent install", Scope::Local),
     ("agent uninstall", Scope::Local),
     ("agent status", Scope::Local),
+    ("cf get", Scope::ReadOnly),
+    ("cf post", Scope::Cloudflare),
+    ("cf put", Scope::Cloudflare),
+    ("cf patch", Scope::Cloudflare),
+    ("cf delete", Scope::Cloudflare),
+    ("cf log", Scope::Local),
+    ("cf undo", Scope::Cloudflare),
     ("web", Scope::ReadOnly),
     ("scan", Scope::Local),
 ];
@@ -422,6 +486,18 @@ fn cmd_path(cmd: &Cmd) -> String {
                 AgentCmd::Status => "status",
             }
         ),
+        Cmd::Cf(c) => format!(
+            "cf {}",
+            match c {
+                CfCmd::Get(_) => "get",
+                CfCmd::Post(_) => "post",
+                CfCmd::Put(_) => "put",
+                CfCmd::Patch(_) => "patch",
+                CfCmd::Delete(_) => "delete",
+                CfCmd::Log { .. } => "log",
+                CfCmd::Undo { .. } => "undo",
+            }
+        ),
         Cmd::Web { .. } => "web".into(),
         Cmd::Scan => "scan".into(),
         Cmd::List => "tunnel list".into(),
@@ -465,7 +541,7 @@ fn announce(what: &str) {
 
 fn current_scope_tag() -> &'static str {
     // the scope was declared in main; recover it from the command table via argv
-    let args: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with('-')).collect();
+    let args: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with('-')).map(|a| a.to_ascii_lowercase()).collect();
     for n in [2, 1] {
         if args.len() >= n {
             let p = args[..n].join(" ");
@@ -519,6 +595,7 @@ fn run(cmd: Cmd, json: bool) -> Result<i32> {
         Cmd::Token(t) => token_cmd(t, json),
         Cmd::Agent(a) => agent_cmd(a, json),
         Cmd::Heal => agent_cmd(AgentCmd::Once, json),
+        Cmd::Cf(c) => cf_cmd(c, json),
         Cmd::Web { open } => web_cmd(open, json),
         Cmd::Scan => scan_cmd(json),
     }
@@ -1785,6 +1862,171 @@ fn agent_cmd(cmd: AgentCmd, json: bool) -> Result<i32> {
             Ok(0)
         }
     }
+}
+
+fn cf_cmd(cmd: CfCmd, json: bool) -> Result<i32> {
+    use tunnels::api;
+    let c = ctx()?;
+    let fleet = c.fleet.clone().unwrap_or_default();
+    let (method, a) = match cmd {
+        CfCmd::Get(a) => ("GET", a),
+        CfCmd::Post(a) => ("POST", a),
+        CfCmd::Put(a) => ("PUT", a),
+        CfCmd::Patch(a) => ("PATCH", a),
+        CfCmd::Delete(a) => ("DELETE", a),
+        CfCmd::Log { limit } => {
+            let recs = api::load_log(limit);
+            if json {
+                print_json(&serde_json::json!({ "scope": Scope::Local, "machine": c.me, "records": recs }))?;
+                return Ok(0);
+            }
+            if recs.is_empty() {
+                println!("no changes made through `tunnels cf` on this Mac");
+            }
+            for r in &recs {
+                println!(
+                    "{}  {}  {} {:<6} {}{}{}",
+                    r.id,
+                    r.at,
+                    if r.ok { "✓" } else { "✗" },
+                    r.method,
+                    r.path,
+                    if r.undo.is_some() { "" } else { "   (not undoable)" },
+                    r.undoes.as_ref().map(|u| format!("   (undid {u})")).unwrap_or_default()
+                );
+                for d in api::diff(r.before.as_ref(), r.after.as_ref()) {
+                    println!("        {d}");
+                }
+            }
+            return Ok(0);
+        }
+        CfCmd::Undo { id, yes } => {
+            let rec = api::find(&id).ok_or_else(|| anyhow!("no change {id} in this Mac's log — `tunnels cf log`; an undo runs on the machine that made the change"))?;
+            let u = rec.undo.clone().ok_or_else(|| anyhow!("change {id} ({} {}) cannot be undone", rec.method, rec.path))?;
+            announce(&format!("undo {id}: {} {}", u.method, u.path));
+            if u.best_effort {
+                eprintln!("  (best effort: re-creating a deleted resource may not give it back exactly as it was)");
+            }
+            let out = api::call(
+                api::Call {
+                    method: &u.method,
+                    path: &u.path,
+                    body: u.body.clone(),
+                    yes,
+                    account: rec.account_id.as_deref(),
+                    i_mean_tokens: api::is_token_path(&u.path),
+                    not_undoable: true,
+                    undoes: Some(id.clone()),
+                },
+                &c.config,
+                &fleet,
+                &c.me,
+            )?;
+            return print_cf(&out, json, scope_of("cf undo"));
+        }
+    };
+    let body = match (&a.data, &a.data_file) {
+        (Some(d), _) => Some(serde_json::from_str(d).context("--data is not JSON")?),
+        (None, Some(f)) => {
+            let text = if f == "-" {
+                let mut s = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
+                s
+            } else {
+                std::fs::read_to_string(f)?
+            };
+            Some(serde_json::from_str(&text).context("--data-file is not JSON")?)
+        }
+        (None, None) => None,
+    };
+    if method != "GET" {
+        announce(&format!("{method} {}", a.path));
+    }
+    let out = api::call(
+        api::Call {
+            method,
+            path: &a.path,
+            body,
+            yes: a.yes,
+            account: a.account.as_deref(),
+            i_mean_tokens: a.i_mean_tokens,
+            not_undoable: a.not_undoable,
+            undoes: None,
+        },
+        &c.config,
+        &fleet,
+        &c.me,
+    )?;
+    print_cf(&out, json, if method == "GET" { Scope::ReadOnly } else { Scope::Cloudflare })
+}
+
+fn print_cf(out: &tunnels::api::Outcome, json: bool, scope: Scope) -> Result<i32> {
+    use tunnels::api;
+    let code = if out.refused.is_some() || (out.sent && !out.ok) { 1 } else { 0 };
+    if json {
+        let mut v = serde_json::to_value(out)?;
+        v["scope"] = serde_json::to_value(scope)?;
+        print_json(&v)?;
+        return Ok(code);
+    }
+    for n in &out.notes {
+        eprintln!("  {n}");
+    }
+    if out.resolved_path != out.path {
+        eprintln!("  → {} {}", out.method, out.resolved_path);
+    }
+    if let Some(why) = &out.refused {
+        println!("✗ refused: {why}");
+        return Ok(1);
+    }
+    if out.method == "GET" {
+        let v = out.response.clone().unwrap_or_default();
+        let shown = if out.ok { v.get("result").cloned().unwrap_or(v) } else { v };
+        println!("{}", serde_json::to_string_pretty(&shown)?);
+        if out.hidden_secrets {
+            eprintln!("  (secrets in the response were hidden)");
+        }
+        if !out.ok {
+            eprintln!("✗ Cloudflare answered {}", out.status.unwrap_or(0));
+            if out.status == Some(403) {
+                eprintln!("  {}", api::permission_hint(&out.resolved_path));
+            }
+        }
+        return Ok(code);
+    }
+    if !out.sent {
+        println!("before:  {}", out.before.as_ref().map(|b| b.to_string()).unwrap_or_else(|| "(nothing read)".into()));
+        match &out.undo {
+            Some(u) => println!("undo:    {} {} {}", u.method, u.path, u.body.as_ref().map(|b| b.to_string()).unwrap_or_default()),
+            None => println!("undo:    none — this cannot be undone"),
+        }
+        println!("\npreview only — nothing sent. Add --yes to send it.");
+        return Ok(0);
+    }
+    if out.ok {
+        println!("✓ {} {} — Cloudflare answered {}", out.method, out.path, out.status.unwrap_or(0));
+    } else {
+        let v = out.response.clone().unwrap_or_default();
+        println!("✗ {} {} — Cloudflare answered {}: {}", out.method, out.path, out.status.unwrap_or(0), v.get("errors").cloned().unwrap_or(v));
+        if out.status == Some(403) {
+            println!("  {}", api::permission_hint(&out.resolved_path));
+        }
+    }
+    let d = api::diff(out.before.as_ref(), out.after.as_ref());
+    if out.ok {
+        if d.is_empty() {
+            println!("  check: reading it back shows no difference — the change may not have taken, or it was already so");
+        } else {
+            println!("  check: read back after the change:");
+            for x in d {
+                println!("    {x}");
+            }
+        }
+    }
+    if let Some(id) = &out.log_id {
+        println!("  logged as {id}{}", if out.undo.is_some() { format!(" — undo with: tunnels cf undo {id}") } else { " (cannot be undone)".into() });
+    }
+    Ok(code)
 }
 
 fn web_cmd(open: bool, json: bool) -> Result<i32> {

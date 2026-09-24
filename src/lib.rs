@@ -12,6 +12,7 @@
 //! the same three steps, so they cannot disagree.
 
 pub mod agent;
+pub mod api;
 pub mod apply;
 pub mod cf;
 pub mod config;

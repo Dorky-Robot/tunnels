@@ -105,7 +105,7 @@ async function load(fresh) {
   } catch (e) {
     $("#app").innerHTML = `<div class="card lvl-error">${esc(e.message)}</div>`;
   } finally { $("#refresh").disabled = false; }
-  loadAgent(); loadPeers();
+  loadAgent(); loadPeers(); loadCfLog();
 }
 
 async function loadAgent() {
@@ -117,6 +117,16 @@ async function loadAgent() {
       (tick ? ` · last pass ${tick.at} (${tick.took_ms} ms)` : "") + (tick && tick.error ? ` · ✗ ${tick.error}` : "");
     el.innerHTML = (v.events || []).map(e => `<div><span class="mute">${esc(e.at)}</span> ${esc(e.kind.padEnd(8))} ${esc(e.message)}</div>`).join("")
       || `<div class="mute">nothing yet — the agent has had nothing to fix</div>`;
+  } catch { }
+}
+
+async function loadCfLog() {
+  try {
+    const v = await (await fetch("/api/cf-log?all=1")).json();
+    const el = $("#cflog"); if (!el) return;
+    el.innerHTML = v.length ? v.map(r => `<div><span class="mute">${esc(r.at)}</span> ${r.ok ? "✓" : "✗"} ${esc(r.machine)} ${esc(r.method)} ${esc(r.path)}` +
+      `${r.undoes ? ` <span class="tag">undid ${esc(r.undoes)}</span>` : ""}${r.undo ? "" : ` <span class="tag warn">not undoable</span>`} <span class="mute">${esc(r.id)}</span></div>`).join("")
+      : `<div class="mute">No changes through <span class="mono">tunnels cf</span> yet.</div>`;
   } catch { }
 }
 
@@ -222,6 +232,8 @@ function render() {
     }
   }
 
+  html += `<h2>Cloudflare changes <span class="mute" style="text-transform:none;letter-spacing:0">(tunnels cf, every machine)</span></h2>
+    <div class="card"><div class="events" id="cflog"><div class="mute">loading…</div></div></div>`;
   html += `<h2>Agent</h2><div class="card"><div class="mute" id="agent-meta"></div><div class="events" id="events" style="margin-top:8px"></div>
     <div class="toolbar"><button data-logs="agent">agent log</button></div></div>`;
   html += `<div class="card" id="logbox" style="display:none"><div class="row"><b id="logtitle"></b><span style="flex:1"></span><button id="logclose">close</button></div><pre id="logtext"></pre></div>`;

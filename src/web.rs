@@ -163,6 +163,42 @@ fn handle(shared: Shared, mut req: Request) {
             let peers: Vec<serde_json::Value> = handles.into_iter().filter_map(|h| h.join().ok()).collect();
             reply_json(req, 200, &peers);
         }
+        (Method::Get, "/api/cf-log") => {
+            // this machine's `tunnels cf` changes; with all=1, every peer's too,
+            // gathered here so the browser only ever talks to one agent
+            let mut recs: Vec<serde_json::Value> =
+                crate::api::load_log(100).into_iter().filter_map(|r| serde_json::to_value(r).ok()).collect();
+            if query.contains("all=1") {
+                let fleet = Fleet::load().ok().flatten().unwrap_or_default();
+                let me = { let (m, _) = &*shared; m.lock().unwrap().machine.clone() };
+                let port = fleet.policy.web_port;
+                let handles: Vec<_> = fleet
+                    .machines
+                    .iter()
+                    .filter(|(n, _)| **n != me)
+                    .map(|(_, m)| {
+                        let h = m.host.clone();
+                        std::thread::spawn(move || {
+                            let a: ureq::Agent = ureq::Agent::config_builder()
+                                .timeout_global(Some(std::time::Duration::from_secs(3)))
+                                .build()
+                                .into();
+                            a.get(&format!("http://{h}:{port}/api/cf-log"))
+                                .call()
+                                .ok()
+                                .and_then(|mut r| r.body_mut().read_json::<Vec<serde_json::Value>>().ok())
+                                .unwrap_or_default()
+                        })
+                    })
+                    .collect();
+                for h in handles {
+                    recs.extend(h.join().unwrap_or_default());
+                }
+                recs.sort_by(|a, b| b["at"].as_str().unwrap_or("").cmp(a["at"].as_str().unwrap_or("")));
+                recs.truncate(200);
+            }
+            reply_json(req, 200, &recs);
+        }
         (Method::Get, "/api/logs") => {
             let name = query.split('&').find_map(|kv| kv.strip_prefix("tunnel=")).unwrap_or("");
             let name = name.replace("%20", " ");

@@ -40,6 +40,10 @@ pub struct World {
     pub records: Vec<Record>,
     pub log: Vec<(String, String)>,
     pub fail_dns_writes: bool,
+    /// zone id → ssl mode
+    pub ssl: BTreeMap<String, String>,
+    /// account id → Access apps
+    pub access_apps: BTreeMap<String, Vec<Value>>,
     next: u32,
 }
 
@@ -194,6 +198,38 @@ fn route(w: &mut World, method: &str, path: &str, q: &str, body: &str) -> (u16, 
                 _ => err(404, "no such endpoint"),
             }
         }
+        ("GET", ["zones", z, "settings", "ssl"]) => {
+            let v = w.ssl.get(*z).cloned().unwrap_or_else(|| "full".into());
+            ok(json!({ "id": "ssl", "value": v, "editable": true, "modified_on": "t0" }))
+        }
+        ("PATCH", ["zones", z, "settings", "ssl"]) => {
+            let v = body["value"].as_str().unwrap_or("").to_string();
+            w.ssl.insert(z.to_string(), v.clone());
+            ok(json!({ "id": "ssl", "value": v, "editable": true, "modified_on": "t1" }))
+        }
+        ("GET", ["accounts", a, "access", "apps"]) => ok(Value::Array(w.access_apps.get(*a).cloned().unwrap_or_default())),
+        ("POST", ["accounts", a, "access", "apps"]) => {
+            w.next += 1;
+            let mut app = body.clone();
+            app["id"] = json!(format!("app{}", w.next));
+            app["aud"] = json!("aud-secretless");
+            w.access_apps.entry(a.to_string()).or_default().push(app.clone());
+            ok(app)
+        }
+        ("GET", ["accounts", a, "access", "apps", id]) => match w.access_apps.get(*a).and_then(|v| v.iter().find(|x| x["id"] == *id)) {
+            Some(app) => ok(app.clone()),
+            None => err(404, "app not found"),
+        },
+        ("DELETE", ["accounts", a, "access", "apps", id]) => {
+            if let Some(v) = w.access_apps.get_mut(*a) {
+                v.retain(|x| x["id"] != *id);
+            }
+            ok(json!({ "id": id }))
+        }
+        ("GET", ["accounts", a, "access", "identity_providers", _id]) => {
+            let _ = a;
+            ok(json!({ "id": "idp1", "name": "pocket-id", "config": { "client_id": "cid", "client_secret": "very-secret" } }))
+        }
         ("GET", ["zones", z, "dns_records"]) => {
             let ty = query(q, "type");
             let name = query(q, "name");
@@ -207,6 +243,10 @@ fn route(w: &mut World, method: &str, path: &str, q: &str, body: &str) -> (u16, 
                     .collect(),
             ))
         }
+        ("GET", ["zones", _z, "dns_records", id]) => match w.records.iter().find(|r| r.id == *id) {
+            Some(r) => ok(json!({ "id": r.id, "name": r.name, "type": r.rtype, "content": r.content, "proxied": true })),
+            None => err(404, "no record"),
+        },
         ("POST", ["zones", z, "dns_records"]) => {
             if w.fail_dns_writes {
                 return err(403, "Authentication error");

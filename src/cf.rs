@@ -266,6 +266,26 @@ impl Client {
         Ok((env.result, env.result_info))
     }
 
+    /// Any request, for `tunnels cf`: the status and the whole response body,
+    /// whatever it says. Errors only when Cloudflare could not be reached.
+    pub fn raw(&self, method: &str, path: &str, body: Option<Value>) -> CfResult<(u16, Value)> {
+        let url = self.url(path);
+        let auth = format!("Bearer {}", self.token);
+        let res = match method {
+            "GET" => self.http.get(&url).header("Authorization", &auth).call(),
+            "DELETE" => self.http.delete(&url).header("Authorization", &auth).call(),
+            "PUT" => self.http.put(&url).header("Authorization", &auth).send_json(body.unwrap_or(Value::Null)),
+            "POST" => self.http.post(&url).header("Authorization", &auth).send_json(body.unwrap_or(Value::Null)),
+            "PATCH" => self.http.patch(&url).header("Authorization", &auth).send_json(body.unwrap_or(Value::Null)),
+            m => return Err(CfError { status: 0, message: format!("unsupported method {m}") }),
+        };
+        let mut resp = res.map_err(|e| CfError { status: 0, message: format!("could not reach Cloudflare: {e}") })?;
+        let status = resp.status().as_u16();
+        let text = resp.body_mut().read_to_string().unwrap_or_default();
+        let v = serde_json::from_str(&text).unwrap_or(Value::String(text));
+        Ok((status, v))
+    }
+
     fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> CfResult<T> {
         let (v, _) = self.send("GET", path, None)?;
         serde_json::from_value(v).map_err(|e| CfError { status: 0, message: format!("decoding {path}: {e}") })

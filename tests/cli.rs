@@ -301,3 +301,102 @@ fn json_output_carries_the_scope() {
     assert_eq!(v["scope"], "local");
     assert!(s.world().log.is_empty(), "listing this Mac's tunnels asked Cloudflare: {:?}", s.world().log);
 }
+
+// ------------------------------------------------------------------ tunnels cf
+
+#[test]
+fn cf_reads_by_name_and_never_shows_a_token() {
+    let s = sandbox();
+    let out = s.run(&["cf", "GET", "/zones/{zone:everyday.vet}/settings/ssl"]);
+    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    assert!(out.stdout.contains("\"value\": \"full\""), "{}", out.stdout);
+    assert!(out.stderr.contains("{zone:everyday.vet} = z-vet"), "shows what the name became: {}", out.stderr);
+    assert!(!out.stdout.contains("good-token") && !out.stderr.contains("good-token"));
+    // a connector token is a secret too, even when asked for directly
+    let out = s.run(&["cf", "get", "/accounts/{account:home}/cfd_tunnel/{tunnel:dr2-home}/token"]);
+    assert!(out.stdout.contains("hidden by tunnels"), "{}", out.stdout);
+    assert!(!out.stdout.contains(&token_for("acct-home", HOME, "s0")));
+    // and so is an identity provider's client secret
+    let out = s.run(&["cf", "get", "/accounts/{account:home}/access/identity_providers/idp1"]);
+    assert!(out.stdout.contains("hidden by tunnels") && !out.stdout.contains("very-secret"), "{}", out.stdout);
+}
+
+#[test]
+fn cf_ambiguous_names_are_errors_not_guesses() {
+    let s = sandbox();
+    // two Cloudflare tunnels are called DorkyRobot2, in two accounts
+    let out = s.run(&["cf", "get", "/accounts/{account:vet}/cfd_tunnel/{tunnel:DorkyRobot2}"]);
+    assert_ne!(out.code, 0);
+    assert!(out.stderr.contains("names 2 tunnels"), "{}", out.stderr);
+}
+
+#[test]
+fn cf_writes_are_previews_until_yes_then_logged_and_undoable() {
+    let s = sandbox();
+    let path = "/zones/{zone:everyday.vet}/settings/ssl";
+    let out = s.run(&["cf", "patch", path, "--data", r#"{"value":"strict"}"#]);
+    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    assert!(out.stdout.contains("preview only"), "{}", out.stdout);
+    assert!(out.stderr.contains("[cloudflare]"), "scope announced: {}", out.stderr);
+    assert!(s.world().writes().is_empty(), "a preview sent something: {:?}", s.world().writes());
+
+    let out = s.run(&["cf", "patch", path, "--data", r#"{"value":"strict"}"#, "--yes", "--json"]);
+    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(v["scope"], "cloudflare");
+    assert_eq!(v["after"]["value"], "strict", "it read the change back");
+    assert_eq!(v["undo"]["body"], json!({ "value": "full" }));
+    let id = v["log_id"].as_str().unwrap().to_string();
+    assert_eq!(s.world().ssl.get("z-vet").map(String::as_str), Some("strict"));
+
+    let log = s.run(&["cf", "log"]);
+    assert!(log.stdout.contains(&id) && log.stdout.contains("value: \"full\" → \"strict\""), "{}", log.stdout);
+
+    let out = s.run(&["cf", "undo", &id, "--yes"]);
+    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    assert_eq!(s.world().ssl.get("z-vet").map(String::as_str), Some("full"), "undone");
+    let log = s.run(&["cf", "log"]);
+    assert!(log.stdout.contains(&format!("(undid {id})")), "{}", log.stdout);
+}
+
+#[test]
+fn cf_a_post_is_undone_by_deleting_what_it_made() {
+    let s = sandbox();
+    let out = s.run(&["cf", "post", "/accounts/{account:home}/access/apps", "--data", r#"{"name":"tunnels","domain":"tunnels.felixflor.es"}"#, "--yes", "--json"]);
+    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(v["after"]["domain"], "tunnels.felixflor.es");
+    assert_eq!(s.world().access_apps["acct-home"].len(), 1);
+    let id = v["log_id"].as_str().unwrap().to_string();
+    let out = s.run(&["cf", "undo", &id, "--yes"]);
+    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    assert!(s.world().access_apps["acct-home"].is_empty());
+}
+
+#[test]
+fn cf_refuses_what_tunnels_owns() {
+    let s = sandbox();
+    let out = s.run(&["cf", "put", "/accounts/{account:home}/cfd_tunnel/{tunnel:dr2-home}/configurations", "--data", "{}", "--yes"]);
+    assert_ne!(out.code, 0);
+    assert!(out.stdout.contains("refused") && out.stdout.contains("tunnels route"), "{}", out.stdout);
+    let out = s.run(&[
+        "cf", "post", "/zones/{zone:felixflor.es}/dns_records",
+        "--data", &format!(r#"{{"type":"CNAME","name":"x.felixflor.es","content":"{HOME}.cfargotunnel.com"}}"#), "--yes",
+    ]);
+    assert_ne!(out.code, 0);
+    assert!(out.stdout.contains("belong to its route"), "{}", out.stdout);
+    // and an existing tunnel CNAME cannot be changed or deleted through it either
+    let out = s.run(&["cf", "delete", "/zones/{zone:felixflor.es}/dns_records/{record:media.felixflor.es}", "--yes"]);
+    assert_ne!(out.code, 0);
+    assert!(out.stdout.contains("belong to its route"), "{}", out.stdout);
+    assert!(s.world().writes().is_empty(), "{:?}", s.world().writes());
+}
+
+#[test]
+fn cf_token_changes_need_their_own_flag() {
+    let s = sandbox();
+    let out = s.run(&["cf", "post", "/user/tokens", "--data", "{}", "--yes", "--account", "home"]);
+    assert_ne!(out.code, 0);
+    assert!(out.stdout.contains("--i-mean-tokens"), "{}", out.stdout);
+    assert!(s.world().writes().is_empty());
+}

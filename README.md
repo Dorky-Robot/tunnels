@@ -184,6 +184,34 @@ The UI binds only to the Mac's tailnet address and to localhost. It rejects any 
 elsewhere, including anything that came through a Cloudflare tunnel, and the fleet file refuses
 a route that points at the UI's port.
 
+## The rest of Cloudflare: `tunnels cf`
+
+For anything `tunnels` doesn't model (Access, zone settings, WAF), `tunnels cf` passes calls
+through to the whole Cloudflare API, with guardrails:
+
+```bash
+tunnels cf get   '/zones/{zone:example.com}/settings/ssl'
+tunnels cf get   '/accounts/{account:myaccount}/access/apps'
+tunnels cf patch '/zones/{zone:example.com}/settings/ssl' --data '{"value":"strict"}'         # preview
+tunnels cf patch '/zones/{zone:example.com}/settings/ssl' --data '{"value":"strict"}' --yes   # send
+tunnels cf log                   # changes made from this Mac, with before → after
+tunnels cf undo <id> --yes       # put it back
+```
+
+- **Names instead of ids.** Write `{account:<alias>}`, `{zone:<name>}`, `{tunnel:<alias>}` or
+  `{record:<hostname>}`, and the right id is filled in. An ambiguous name is an error that lists
+  the candidates.
+- **No secrets in view.** The token for the account is picked for you and never printed.
+  Connector tokens, client secrets and API token values in responses are hidden.
+- **Reads are free; writes are previews until `--yes`.** Every write is read back after it is sent
+  and logged on this Mac, together with the request that undoes it. A write with no way to undo
+  it needs `--not-undoable`; token changes need `--i-mean-tokens`.
+- **What `tunnels` owns is refused.** Tunnel ingress, tunnel tokens and tunnel CNAMEs go through
+  `tunnels route` and `tunnels tunnel`, so the fleet file stays the truth.
+- **The web UI shows every machine's `cf` log** in one timeline.
+- **A 403 says which permission is missing.** The Tunnel and DNS permissions `tunnels` needs don't
+  cover zone settings or Access.
+
 ## Scripts and agents
 
 - Every command accepts `--json`, and its output includes `"scope"`.

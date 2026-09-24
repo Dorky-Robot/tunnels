@@ -52,6 +52,11 @@ the visual interface.
 - **status.rs**: the shared view model used by `tunnels status` and the web UI.
 - **scope.rs**: `Scope` for every command. `cf::Client::new` panics if the current command
   declared `Local`.
+- **api.rs**: `tunnels cf`, a pass-through to the whole Cloudflare API. It resolves
+  `{account|zone|tunnel|record:name}` placeholders, picks the token, hides secrets in
+  responses, and refuses writes to what `tunnels` owns (cfd_tunnel, tunnel CNAMEs).
+  Writes are previews until `--yes`; each is logged to `cf-log/` with before, after and an
+  undo request. Plan: `docs/agent-operations.md`.
 - **main.rs**: the clap CLI. The `SCOPES` table is the single source of truth for scopes, and
   tests hold every command's help text to it.
 
