@@ -579,6 +579,10 @@ pub fn install_agent(exe: &str) -> Result<()> {
     if !out.status.success() && !is_already_bootstrapped(&diagnostic(&out)) {
         anyhow::bail!("launchctl bootstrap failed: {}{}", diagnostic(&out).trim(), hint_for(&diagnostic(&out)));
     }
+    // On doug-mini a fresh bootstrap over ssh left the job loaded and never
+    // started, RunAtLoad notwithstanding. A plain kickstart (no -k) starts a
+    // job that is not running and leaves a running one alone.
+    let _ = launchctl().args(["kickstart", &target]).output();
     Ok(())
 }
 
