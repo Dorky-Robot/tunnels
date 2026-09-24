@@ -38,6 +38,7 @@ pub struct ConnectorView {
     pub tunnel_id: Option<String>,
     pub alias: Option<String>,
     pub account: Option<String>,
+    pub account_id: Option<String>,
     /// loaded, not loaded, no plist
     pub state: String,
     /// kept in a 0600 token file (true) or inline in the plist (false)
@@ -50,11 +51,82 @@ pub struct ConnectorView {
     pub runs_elsewhere: Option<String>,
 }
 
+/// One Cloudflare account on one machine: the API tokens that reach it and
+/// the tunnels in it. Tokens and tunnels belong to accounts, so this is how
+/// they are read — "can this machine manage its tunnels in that account?"
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountGroup {
+    pub account_id: String,
+    /// the fleet's alias for it, if the fleet knows it
+    pub alias: Option<String>,
+    pub name: String,
+    pub zones: Vec<String>,
+    pub api_tokens: Vec<ApiTokenView>,
+    pub connectors: Vec<ConnectorView>,
+    /// an API token here that Cloudflare accepts reaches this account: its
+    /// tunnels can be checked, re-fetched and rotated from this machine
+    pub manageable: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MachineTokens {
     pub machine: String,
     pub api_tokens: Vec<ApiTokenView>,
     pub connectors: Vec<ConnectorView>,
+    /// the same tokens, by Cloudflare account
+    pub accounts: Vec<AccountGroup>,
+    /// API tokens that reach no account (rejected, or never labelled)
+    pub unplaced: Vec<ApiTokenView>,
+}
+
+/// Group a machine's tokens by the Cloudflare account they belong to. An API
+/// token that reaches two accounts is listed under both.
+pub fn group(api_tokens: &[ApiTokenView], connectors: &[ConnectorView], fleet: &Fleet) -> (Vec<AccountGroup>, Vec<ApiTokenView>) {
+    let mut groups: Vec<AccountGroup> = Vec::new();
+    let ensure = |id: &str, name: &str, groups: &mut Vec<AccountGroup>| -> usize {
+        if let Some(i) = groups.iter().position(|g| g.account_id == id) {
+            if groups[i].name.is_empty() && !name.is_empty() {
+                groups[i].name = name.to_string();
+            }
+            return i;
+        }
+        let alias = fleet.account_alias_for_id(id).cloned();
+        let fa = alias.as_ref().and_then(|a| fleet.accounts.get(a));
+        groups.push(AccountGroup {
+            account_id: id.to_string(),
+            name: if name.is_empty() { fa.map(|a| a.name.clone()).unwrap_or_default() } else { name.to_string() },
+            zones: fa.map(|a| a.zones.clone()).unwrap_or_default(),
+            alias,
+            api_tokens: Vec::new(),
+            connectors: Vec::new(),
+            manageable: false,
+        });
+        groups.len() - 1
+    };
+    let mut unplaced = Vec::new();
+    for t in api_tokens {
+        if t.reach.is_empty() {
+            unplaced.push(t.clone());
+            continue;
+        }
+        for r in &t.reach {
+            let i = ensure(&r.account_id, &r.account_name, &mut groups);
+            if groups[i].zones.is_empty() {
+                groups[i].zones = r.zones.clone();
+            }
+            groups[i].api_tokens.push(t.clone());
+            if t.valid == Some(true) {
+                groups[i].manageable = true;
+            }
+        }
+    }
+    for c in connectors {
+        let Some(id) = &c.account_id else { continue };
+        let i = ensure(id, "", &mut groups);
+        groups[i].connectors.push(c.clone());
+    }
+    groups.sort_by(|a, b| a.alias.clone().unwrap_or(a.name.clone()).cmp(&b.alias.clone().unwrap_or(b.name.clone())));
+    (groups, unplaced)
 }
 
 /// A short, stable name for a token that reveals nothing about it.
@@ -92,7 +164,7 @@ pub fn reach_of(token: &str) -> Result<(String, Vec<Reach>)> {
 
 /// Everything about this machine's tokens, with no token in it.
 pub fn view(config: &Config, fleet: &Fleet, me: &str) -> MachineTokens {
-    let api_tokens = config
+    let api_tokens: Vec<ApiTokenView> = config
         .api_tokens()
         .iter()
         .map(|t| ApiTokenView {
@@ -127,14 +199,17 @@ pub fn view(config: &Config, fleet: &Fleet, me: &str) -> MachineTokens {
                 tunnel_id: id,
                 alias: decl.as_ref().map(|(a, _)| a.clone()),
                 account: acct.as_deref().and_then(|a| fleet.account_alias_for_id(a).cloned()).or(acct.clone()),
+                account_id: acct.clone(),
                 state: state.into(),
                 token_file: !launchd::plist_has_inline_token(&t.name),
                 current,
                 runs_elsewhere: decl.and_then(|(_, d)| d.machine).filter(|m| m != me),
             }
         })
-        .collect();
-    MachineTokens { machine: me.to_string(), api_tokens, connectors }
+        .collect::<Vec<_>>();
+    let api_tokens: Vec<ApiTokenView> = api_tokens;
+    let (accounts, unplaced) = group(&api_tokens, &connectors, fleet);
+    MachineTokens { machine: me.to_string(), api_tokens, connectors, accounts, unplaced }
 }
 
 /// Keep an API token on this machine, after finding out what it reaches.
@@ -206,6 +281,56 @@ pub fn refetch_connector(config: &mut Config, fleet: &Fleet, key: &str) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn api(id: &str, valid: bool, accts: &[(&str, &str)]) -> ApiTokenView {
+        ApiTokenView {
+            id: id.into(),
+            hint: format!("{id}…"),
+            covers: String::new(),
+            reach: accts.iter().map(|(i, n)| Reach { account_id: i.to_string(), account_name: n.to_string(), zones: vec![] }).collect(),
+            valid: Some(valid),
+        }
+    }
+
+    fn conn(name: &str, acct: &str) -> ConnectorView {
+        ConnectorView {
+            name: name.into(),
+            tunnel_id: None,
+            alias: None,
+            account: None,
+            account_id: Some(acct.into()),
+            state: "loaded".into(),
+            token_file: true,
+            current: Some(true),
+            runs_elsewhere: None,
+        }
+    }
+
+    #[test]
+    fn tokens_and_tunnels_are_grouped_by_their_account() {
+        let fleet = crate::fleet::tests::sample();
+        let (groups, unplaced) = group(
+            &[api("a", true, &[("acct-home", "Home")]), api("b", true, &[("acct-vet", "Vet"), ("acct-home", "Home")]), api("c", false, &[])],
+            &[conn("t1", "acct-home"), conn("t2", "acct-vet"), conn("t3", "acct-other")],
+            &fleet,
+        );
+        let home = groups.iter().find(|g| g.account_id == "acct-home").unwrap();
+        assert_eq!(home.alias.as_deref(), Some("home"));
+        assert_eq!(home.api_tokens.len(), 2, "a token reaching two accounts is under both");
+        assert_eq!(home.connectors.len(), 1);
+        assert!(home.manageable);
+        // a tunnel in an account no token here reaches: grouped, and not manageable
+        let other = groups.iter().find(|g| g.account_id == "acct-other").unwrap();
+        assert!(other.api_tokens.is_empty() && !other.manageable);
+        assert_eq!(unplaced.len(), 1, "a token that reaches nothing is set apart");
+    }
+
+    #[test]
+    fn a_rejected_token_does_not_make_its_account_manageable() {
+        let fleet = crate::fleet::tests::sample();
+        let (groups, _) = group(&[api("a", false, &[("acct-home", "Home")])], &[conn("t1", "acct-home")], &fleet);
+        assert!(!groups[0].manageable);
+    }
 
     #[test]
     fn a_fingerprint_is_short_stable_and_reveals_nothing() {

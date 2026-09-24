@@ -268,6 +268,7 @@ function render() {
 
 async function loadTokens(machine) {
   tokMachine = machine;
+  history.replaceState(null, "", "#tokens=" + encodeURIComponent(machine));
   document.querySelectorAll("[data-tokm]").forEach(b => b.className = b.dataset.tokm === machine ? "primary" : "");
   const el = $("#tokbody"); if (!el) return;
   el.innerHTML = `<div class="mute">asking ${esc(machine)}… (checking every token with Cloudflare takes a few seconds)</div>`;
@@ -277,21 +278,36 @@ async function loadTokens(machine) {
     v = await r.json(); if (!r.ok) throw new Error(v.error || r.statusText);
   } catch (e) { el.innerHTML = `<div class="lvl-error">${esc(e.message)}</div>`; return; }
   const yes = (x, good, bad, unknown) => x === true ? `<span class="tag good">${good}</span>` : x === false ? `<span class="tag bad">${bad}</span>` : `<span class="tag">${unknown}</span>`;
-  let h = `<div class="mute" style="margin-bottom:6px">API tokens on ${esc(machine)}: what this machine may do in Cloudflare. Shown by a hint; never shown again once added.</div><table>`;
-  h += v.api_tokens.map(t => `<tr><td class="mono">${esc(t.hint)} <span class="mute">${esc(t.id)}</span></td>
-      <td>${t.reach.length ? t.reach.map(r => `<b>${esc(r.account_name)}</b><br><span class="mute">${esc(r.zones.join(" · "))}</span>`).join("<br>") : esc(t.covers || "(not labelled — re-check)")}</td>
+  const apiRow = (t, acct) => {
+    const others = t.reach.filter(r => r.account_id !== acct).map(r => r.account_name);
+    return `<tr><td class="mono">${esc(t.hint)} <span class="mute">${esc(t.id)}</span></td>
+      <td><span class="mute">API token</span>${others.length ? ` <span class="tag">also reaches ${esc(others.join(", "))}</span>` : ""}</td>
       <td>${yes(t.valid, "works", "rejected by Cloudflare", "?")}</td>
-      <td style="text-align:right"><button data-tokrm="${esc(t.id)}" class="danger">remove</button></td></tr>`).join("")
-    || `<tr><td class="mute">no API tokens on ${esc(machine)}</td></tr>`;
-  h += `</table><div class="toolbar"><input id="toknew" type="password" placeholder="paste a Cloudflare API token" autocomplete="off" style="flex:1;min-width:260px;font:inherit;padding:4px 8px;border-radius:6px;border:1px solid var(--line);background:var(--card);color:var(--ink)">
-      <button class="primary" data-tokadd="1">add to ${esc(machine)}</button><button data-tokrefresh="1">re-check all</button></div>`;
-  h += `<div class="mute" style="margin:16px 0 6px">Tunnel (connector) tokens on ${esc(machine)}: what lets cloudflared run each tunnel. Fetched from Cloudflare by the agent; never pasted.</div><table>`;
-  h += v.connectors.map(c => `<tr><td><b>${esc(c.alias || c.name)}</b> <span class="mute">${esc(c.name)} · ${esc((c.tunnel_id || "").slice(0, 8))} · ${esc(c.account || "")}</span></td>
-      <td>${esc(c.state)} · ${c.token_file ? "token file" : `<span class="tag warn">token in plist</span>`}${c.runs_elsewhere ? ` <span class="tag warn">fleet runs it on ${esc(c.runs_elsewhere)}</span>` : ""}</td>
+      <td style="text-align:right"><button data-tokrm="${esc(t.id)}" class="danger">remove</button></td></tr>`;
+  };
+  const conRow = c => `<tr><td><b>${esc(c.alias || c.name)}</b> <span class="mute">${esc(c.name)} · ${esc((c.tunnel_id || "").slice(0, 8))}</span></td>
+      <td><span class="mute">tunnel token</span> · ${esc(c.state)} · ${c.token_file ? "token file" : `<span class="tag warn">token in plist</span>`}${c.runs_elsewhere ? ` <span class="tag warn">fleet runs it on ${esc(c.runs_elsewhere)}</span>` : ""}</td>
       <td>${yes(c.current, "current", "stale — rotated elsewhere", "can't check here")}</td>
-      <td style="text-align:right"><button data-conrefetch="${esc(c.alias || c.name)}">re-fetch</button> <button class="danger" data-conrotate="${esc(c.alias || c.name)}">rotate</button></td></tr>`).join("")
-    || `<tr><td class="mute">no tunnels on ${esc(machine)}</td></tr>`;
-  el.innerHTML = h + `</table>`;
+      <td style="text-align:right"><button data-conrefetch="${esc(c.alias || c.name)}">re-fetch</button> <button class="danger" data-conrotate="${esc(c.alias || c.name)}">rotate</button></td></tr>`;
+  let h = `<div class="mute" style="margin-bottom:10px">On ${esc(machine)}, by Cloudflare account: the API tokens that let this machine manage the account, and the tunnels it runs in it. Tokens are shown by a hint and never shown again once added.</div>`;
+  for (const g of v.accounts) {
+    h += `<div style="border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:10px">
+      <div class="row"><b>${esc(g.alias || g.name || g.account_id.slice(0, 8))}</b>
+        <span class="mute">${esc(g.name)} · ${esc(g.zones.join(", ") || "no zones")}</span>
+        <span style="flex:1"></span>
+        ${g.manageable ? `<span class="tag good">managed from here</span>` : `<span class="tag warn">no working API token here — its tunnels can't be checked or re-fetched from ${esc(machine)}</span>`}</div>
+      <table>${g.api_tokens.map(t => apiRow(t, g.account_id)).join("")}${g.connectors.map(conRow).join("")}
+        ${!g.api_tokens.length && !g.connectors.length ? `<tr><td class="mute">nothing</td></tr>` : ""}</table></div>`;
+  }
+  if (v.unplaced.length) {
+    h += `<div style="border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:10px"><div class="row"><b>API tokens that reach no account</b>
+      <span class="mute">rejected by Cloudflare, or never labelled — re-check, or remove</span></div>
+      <table>${v.unplaced.map(t => apiRow(t, "")).join("")}</table></div>`;
+  }
+  if (!v.accounts.length && !v.unplaced.length) h += `<div class="mute">no tokens on ${esc(machine)}</div>`;
+  h += `<div class="toolbar"><input id="toknew" type="password" placeholder="paste a Cloudflare API token — it lands under the account(s) it reaches" autocomplete="off" style="flex:1;min-width:260px;font:inherit;padding:4px 8px;border-radius:6px;border:1px solid var(--line);background:var(--card);color:var(--ink)">
+      <button class="primary" data-tokadd="1">add to ${esc(machine)}</button><button data-tokrefresh="1">re-check all</button></div>`;
+  el.innerHTML = h;
 }
 
 async function tokenAction(action, tunnel, arg, doneMsg) {
@@ -373,7 +389,11 @@ document.addEventListener("click", async e => {
   } catch (err) { toast("✗ " + err.message, 8000); b.disabled = false; }
 });
 
-whoami().then(() => load(false));
+whoami().then(() => load(false)).then(() => {
+  // #tokens=<machine> opens that machine's tokens, for links and bookmarks
+  const m = (location.hash.match(/^#tokens=(.+)$/) || [])[1];
+  if (m && me.admin) { loadTokens(decodeURIComponent(m)); setTimeout(() => $("#tokbody") && $("#tokbody").scrollIntoView(), 300); }
+});
 setInterval(() => { loadAgent(); loadPeers(); }, 15000);
 setInterval(() => load(false), 60000);
 </script>

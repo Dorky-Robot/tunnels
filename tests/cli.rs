@@ -634,6 +634,12 @@ fn an_admin_sees_each_machines_tokens_but_never_a_token() {
     assert_eq!(v["api_tokens"][0]["valid"], true);
     let home = v["connectors"].as_array().unwrap().iter().find(|c| c["alias"] == "dr2-home").unwrap().clone();
     assert_eq!(home["current"], true, "{home}");
+    // grouped by account: each account with its API token and its tunnels
+    let g = v["accounts"].as_array().unwrap().iter().find(|g| g["alias"] == "home").unwrap().clone();
+    assert_eq!(g["manageable"], true);
+    assert_eq!(g["api_tokens"].as_array().unwrap().len(), 1);
+    let names: Vec<&str> = g["connectors"].as_array().unwrap().iter().map(|c| c["alias"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["dr2-home"], "only this account's tunnels");
     let guest = sign_in(&w, "guest@example.com");
     assert_eq!(public(&w, "GET", "/api/mesh-tokens?machine=dr2", Some(&guest), "tunnels.felixflor.es", None).code, 403);
 }

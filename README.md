@@ -181,7 +181,9 @@ standby does not share the primary's data.
 - promote and failback;
 - restart and logs for **any tunnel on any machine**, and an agent pass for any machine;
 - every agent's recent actions, and the `tunnels cf` changes made from every machine;
-- **tokens, per machine** (admins only):
+- **tokens, per machine and grouped by Cloudflare account** (admins only; link straight to one
+  with `#tokens=<machine>`). Each account shows its API tokens with the tunnels it runs, and warns
+  when no working API token for that account is on the machine:
   - API tokens: each shown by a hint, the accounts and domains it reaches, and whether
     Cloudflare still accepts it. You can add one by pasting it, remove one, or re-check them all.
   - Tunnel (connector) tokens: whether each still matches Cloudflare (a rotation elsewhere makes
