@@ -109,6 +109,17 @@ pub fn run() -> Result<()> {
     ));
     eprintln!("{} tunnels agent {} starting as {machine}", util::now_rfc3339(), env!("CARGO_PKG_VERSION"));
     crate::web::spawn(shared.clone(), port);
+    // Say we are here. A machine that joins edits the fleet file before its
+    // agent is listening, so the peers' fetch of that edit fails and they do
+    // not know to look again — doug-mini's import sat unseen until it was
+    // announced by hand. Once the web server is up, announce it.
+    if let Some(f) = fleet.clone() {
+        let me = machine.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            sync::notify(&f, &me);
+        });
+    }
 
     let exe = exe_identity();
     loop {
