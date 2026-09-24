@@ -25,5 +25,6 @@ pub mod scan;
 pub mod scope;
 pub mod status;
 pub mod sync;
+pub mod tokens;
 pub mod util;
 pub mod web;

@@ -619,3 +619,61 @@ fn a_relay_is_only_taken_from_a_machine_on_the_allowlist() {
     let (code, body) = post("doug-mini");
     assert_eq!(code, 403, "{body}");
 }
+
+// ------------------------------------------------------------------ tokens in the web UI
+
+#[test]
+fn an_admin_sees_each_machines_tokens_but_never_a_token() {
+    let w = published_ui();
+    let c = sign_in(&w, "felix@example.com");
+    let r = public(&w, "GET", "/api/mesh-tokens?machine=dr2", Some(&c), "tunnels.felixflor.es", None);
+    assert_eq!(r.code, 200, "{}", r.body);
+    assert!(!r.body.contains("good-token"), "an API token leaked: {}", r.body);
+    assert!(!r.body.contains(&token_for("acct-home", HOME, "s0")), "a connector token leaked");
+    let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+    assert_eq!(v["api_tokens"][0]["valid"], true);
+    let home = v["connectors"].as_array().unwrap().iter().find(|c| c["alias"] == "dr2-home").unwrap().clone();
+    assert_eq!(home["current"], true, "{home}");
+    let guest = sign_in(&w, "guest@example.com");
+    assert_eq!(public(&w, "GET", "/api/mesh-tokens?machine=dr2", Some(&guest), "tunnels.felixflor.es", None).code, 403);
+}
+
+#[test]
+fn an_admin_adds_and_removes_an_api_token_from_the_page() {
+    let w = published_ui();
+    let c = sign_in(&w, "felix@example.com");
+    let r = public(&w, "POST", "/api/relay", Some(&c), "tunnels.felixflor.es", Some(json!({ "machine": "dr2", "action": "token-add", "arg": "second-token" })));
+    assert_eq!(r.code, 200, "{}", r.body);
+    assert!(!r.body.contains("second-token"), "the token came back in the answer: {}", r.body);
+    let toks: Vec<String> = w.s.config()["cf_api_tokens"].as_array().unwrap().iter().map(|t| t["token"].as_str().unwrap().to_string()).collect();
+    assert_eq!(toks, vec!["good-token", "second-token"]);
+    let id = tunnels::tokens::fingerprint("second-token");
+    let r = public(&w, "POST", "/api/relay", Some(&c), "tunnels.felixflor.es", Some(json!({ "machine": "dr2", "action": "token-rm", "arg": id })));
+    assert_eq!(r.code, 200, "{}", r.body);
+    assert_eq!(w.s.config()["cf_api_tokens"].as_array().unwrap().len(), 1);
+    // a connector token pasted by mistake is refused, not stored as an API token
+    let r = public(&w, "POST", "/api/relay", Some(&c), "tunnels.felixflor.es", Some(json!({ "machine": "dr2", "action": "token-add", "arg": token_for("acct-home", HOME, "s0") })));
+    assert_eq!(r.code, 400, "{}", r.body);
+    assert!(r.body.contains("connector"), "{}", r.body);
+}
+
+#[test]
+fn a_stale_connector_token_is_refetched_and_a_tunnel_rotated_from_the_page() {
+    let w = published_ui();
+    let c = sign_in(&w, "felix@example.com");
+    // rotated somewhere else: Cloudflare has a new secret, this machine the old one
+    w.s.world().tunnels.iter_mut().find(|t| t.id == HOME).unwrap().secret = "s1".into();
+    let r = public(&w, "GET", "/api/mesh-tokens?machine=dr2", Some(&c), "tunnels.felixflor.es", None);
+    let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+    assert_eq!(v["connectors"].as_array().unwrap().iter().find(|c| c["alias"] == "dr2-home").unwrap()["current"], false);
+    let r = public(&w, "POST", "/api/relay", Some(&c), "tunnels.felixflor.es", Some(json!({ "machine": "dr2", "action": "connector-refetch", "tunnel": "dr2-home" })));
+    assert_eq!(r.code, 200, "{}", r.body);
+    let stored = |s: &Sandbox| s.config()["tunnels"].as_array().unwrap().iter().find(|t| t["name"] == "DorkyRobot2").unwrap()["token"].as_str().unwrap().to_string();
+    assert_eq!(stored(&w.s), token_for("acct-home", HOME, "s1"));
+    // and a rotation: a new secret in Cloudflare, taken here
+    let r = public(&w, "POST", "/api/relay", Some(&c), "tunnels.felixflor.es", Some(json!({ "machine": "dr2", "action": "tunnel-rotate", "tunnel": "dr2-home" })));
+    assert_eq!(r.code, 200, "{}", r.body);
+    let secret = w.s.world().tunnel(HOME).secret.clone();
+    assert_ne!(secret, "s1");
+    assert_eq!(stored(&w.s), token_for("acct-home", HOME, &secret));
+}

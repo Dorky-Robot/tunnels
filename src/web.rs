@@ -224,6 +224,41 @@ fn handle(shared: Shared, mut req: Request) {
             );
         }
         (Method::Get, "/api/whoami") => reply_json(req, 200, &who),
+        (Method::Get, "/api/tokens") => {
+            if !who.admin {
+                return reply_err(req, 403, "tokens are for admins");
+            }
+            let config = Config::load().unwrap_or_default();
+            let fleet = Fleet::load().ok().flatten().unwrap_or_default();
+            let me = { let (m, _) = &*shared; m.lock().unwrap().machine.clone() };
+            reply_json(req, 200, &crate::tokens::view(&config, &fleet, &me));
+        }
+        (Method::Get, "/api/mesh-tokens") => {
+            if !who.admin {
+                return reply_err(req, 403, "tokens are for admins");
+            }
+            let machine = query.split('&').find_map(|kv| kv.strip_prefix("machine=")).unwrap_or("").to_string();
+            let fleet = Fleet::load().ok().flatten().unwrap_or_default();
+            let me = { let (m, _) = &*shared; m.lock().unwrap().machine.clone() };
+            if machine.is_empty() || machine == me {
+                let config = Config::load().unwrap_or_default();
+                return reply_json(req, 200, &crate::tokens::view(&config, &fleet, &me));
+            }
+            let Some(m) = fleet.machines.get(&machine) else { return reply_err(req, 404, "no such machine") };
+            let a: ureq::Agent = ureq::Agent::config_builder()
+                .timeout_global(Some(std::time::Duration::from_secs(30)))
+                .http_status_as_error(false)
+                .build()
+                .into();
+            match a.get(&format!("http://{}:{}/api/tokens", m.host, fleet.policy.web_port)).call() {
+                Ok(mut r) => {
+                    let code = r.status().as_u16();
+                    let v: serde_json::Value = r.body_mut().read_json().unwrap_or(serde_json::Value::Null);
+                    reply_json(req, code, &v)
+                }
+                Err(e) => reply_err(req, 502, &format!("{machine} is not answering: {e}")),
+            }
+        }
         (Method::Get, "/api/mesh-logs") => {
             let q = |k: &str| query.split('&').find_map(|kv| kv.strip_prefix(&format!("{k}="))).unwrap_or("").replace("%20", " ");
             let (machine, tunnel) = (q("machine"), q("tunnel"));
@@ -252,12 +287,15 @@ fn handle(shared: Shared, mut req: Request) {
                 action: String,
                 #[serde(default)]
                 tunnel: String,
+                /// a token to add, or the id of one to remove; never logged
+                #[serde(default)]
+                arg: String,
             }
             let Ok(r) = serde_json::from_str::<R>(&body) else { return reply_err(req, 400, "want {machine, action, tunnel}") };
             let fleet = Fleet::load().ok().flatten().unwrap_or_default();
             let me = { let (m, _) = &*shared; m.lock().unwrap().machine.clone() };
             if r.machine == me {
-                return match exec_local(&shared, &r.action, &r.tunnel, &who.who) {
+                return match exec_local(&shared, &r.action, &r.tunnel, &r.arg, &who.who) {
                     Ok(msg) => reply_json(req, 200, &serde_json::json!({ "ok": true, "message": msg })),
                     Err(e) => reply_err(req, 400, &format!("{e:#}")),
                 };
@@ -271,7 +309,7 @@ fn handle(shared: Shared, mut req: Request) {
             let res = a
                 .post(&format!("http://{}:{}/api/relay-exec", m.host, fleet.policy.web_port))
                 .header("X-Tunnels", "1")
-                .send_json(serde_json::json!({ "action": r.action, "tunnel": r.tunnel, "requested_by": me, "actor": who.who }));
+                .send_json(serde_json::json!({ "action": r.action, "tunnel": r.tunnel, "arg": r.arg, "requested_by": me, "actor": who.who }));
             match res {
                 Ok(mut resp) => {
                     let code = resp.status().as_u16();
@@ -287,6 +325,8 @@ fn handle(shared: Shared, mut req: Request) {
                 action: String,
                 #[serde(default)]
                 tunnel: String,
+                #[serde(default)]
+                arg: String,
                 requested_by: String,
                 #[serde(default)]
                 actor: String,
@@ -297,7 +337,7 @@ fn handle(shared: Shared, mut req: Request) {
                 return reply_err(req, 403, &why);
             }
             let actor = format!("{} via {}", if x.actor.is_empty() { "?" } else { &x.actor }, x.requested_by);
-            match exec_local(&shared, &x.action, &x.tunnel, &actor) {
+            match exec_local(&shared, &x.action, &x.tunnel, &x.arg, &actor) {
                 Ok(msg) => reply_json(req, 200, &serde_json::json!({ "ok": true, "message": msg })),
                 Err(e) => reply_err(req, 400, &format!("{e:#}")),
             }
@@ -535,8 +575,43 @@ fn local_logs(key: &str) -> String {
 
 /// Carry out an admin's action on this Mac. Restarts keep the job loaded
 /// (kickstart) whenever the plist allows, so nothing is ever left booted out.
-fn exec_local(shared: &Shared, action: &str, tunnel: &str, actor: &str) -> Result<String> {
+fn exec_local(shared: &Shared, action: &str, tunnel: &str, arg: &str, actor: &str) -> Result<String> {
     let msg = match action {
+        "token-add" => {
+            let mut config = Config::load()?;
+            let covers = crate::tokens::add(&mut config, arg)?;
+            format!("added an API token here — {covers}")
+        }
+        "token-rm" => {
+            let mut config = Config::load()?;
+            let covers = crate::tokens::remove(&mut config, arg)?;
+            format!(
+                "forgot API token {arg} here{} (only here: if Cloudflare still accepts it, revoke it at dash.cloudflare.com/profile/api-tokens)",
+                if covers.is_empty() { String::new() } else { format!(" — {covers}") }
+            )
+        }
+        "token-refresh" => {
+            let mut config = Config::load()?;
+            let rs = crate::tokens::refresh(&mut config);
+            let bad = rs.iter().filter(|(_, r)| r.is_err()).count();
+            format!("re-checked {} API token(s) here; {bad} rejected by Cloudflare", rs.len())
+        }
+        "connector-refetch" => {
+            let mut config = Config::load()?;
+            let fleet = Fleet::load()?.unwrap_or_default();
+            crate::tokens::refetch_connector(&mut config, &fleet, tunnel)?
+        }
+        "tunnel-rotate" => {
+            // the CLI's rotate, run here: new secret in Cloudflare, this
+            // machine takes the new token; peers fetch theirs on their next pass
+            let exe = std::env::current_exe()?;
+            let out = std::process::Command::new(exe).args(["tunnel", "rotate", tunnel]).output()?;
+            let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            if !out.status.success() {
+                return Err(anyhow!("{}", text.trim()));
+            }
+            text.lines().filter(|l| l.starts_with('✓')).collect::<Vec<_>>().join(" ").trim_start_matches("✓ ").to_string()
+        }
         "tunnel-restart" | "tunnel-start" => {
             let t = local_tunnel(tunnel).ok_or_else(|| anyhow!("no tunnel `{tunnel}` runs on this machine"))?;
             if action == "tunnel-start" {

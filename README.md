@@ -180,7 +180,14 @@ standby does not share the primary's data.
 - the pending plan, with buttons to apply it, prune, or take over hostnames;
 - promote and failback;
 - restart and logs for **any tunnel on any machine**, and an agent pass for any machine;
-- every agent's recent actions, and the `tunnels cf` changes made from every machine.
+- every agent's recent actions, and the `tunnels cf` changes made from every machine;
+- **tokens, per machine** (admins only):
+  - API tokens: each shown by a hint, the accounts and domains it reaches, and whether
+    Cloudflare still accepts it. You can add one by pasting it, remove one, or re-check them all.
+  - Tunnel (connector) tokens: whether each still matches Cloudflare (a rotation elsewhere makes
+    it stale). You can re-fetch one, or rotate a tunnel after typing its name.
+  - A token is never shown again once added. A pasted token goes only to the machine that
+    keeps it, over the tailnet.
 
 ### On the tailnet
 
@@ -216,7 +223,8 @@ tunnels route add tunnels.example.com 7630 --tunnel <a tunnel on the machine tha
   that agent only accepts relays from machines on `policy.remote_from`. Anyone else who signs
   in can only look.
 - **Every admin action records who made it.**
-- **Destroy, rotate and token changes stay CLI-only.**
+- **Destroying a tunnel stays CLI-only.** Token changes and rotation are on the page, for
+  admins.
 - **Machine-to-machine endpoints are never reachable from the internet.**
 - **The fleet file refuses any route to the UI's port except `public_host`.**
 

@@ -12,7 +12,7 @@ use tunnels::config::{self, Config};
 use tunnels::fleet::{self, Fleet, Route, TunnelDecl};
 use tunnels::observe::{self, Snapshot, Want};
 use tunnels::scope::{self, Scope};
-use tunnels::{cf, launchd, plan, scan, status, sync, util, web};
+use tunnels::{launchd, plan, scan, status, sync, util, web};
 
 #[derive(Parser)]
 #[command(
@@ -1796,32 +1796,8 @@ fn token_cmd(cmd: TokenCmd, json: bool) -> Result<i32> {
     }
 }
 
-/// What a token reaches: its accounts, and the zones in each, as a label and
-/// as structure.
 fn reach_of(token: &str) -> Result<(String, Vec<config::Reach>)> {
-    let client = cf::Client::new(token);
-    client.verify().context("Cloudflare does not accept this token")?;
-    let zones = client.zones().unwrap_or_default();
-    let mut reach: Vec<config::Reach> = Vec::new();
-    for z in &zones {
-        match reach.iter_mut().find(|r| r.account_id == z.account_id) {
-            Some(r) => r.zones.push(z.name.clone()),
-            None => reach.push(config::Reach { account_id: z.account_id.clone(), account_name: z.account_name.clone(), zones: vec![z.name.clone()] }),
-        }
-    }
-    for a in client.accounts().unwrap_or_default() {
-        if !reach.iter().any(|r| r.account_id == a.id) {
-            reach.push(config::Reach { account_id: a.id, account_name: a.name, zones: vec![] });
-        }
-    }
-    if reach.is_empty() {
-        bail!("this token reaches no account and no zone — wrong Cloudflare account, or missing permissions");
-    }
-    for r in &mut reach {
-        r.zones.sort();
-    }
-    let covers = reach.iter().map(|r| format!("{} ({})", r.account_name, r.zones.join(", "))).collect::<Vec<_>>().join(" · ");
-    Ok((covers, reach))
+    tunnels::tokens::reach_of(token)
 }
 
 // ---------------------------------------------------------------- agent / web / scan

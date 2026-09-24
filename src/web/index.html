@@ -78,6 +78,7 @@ const $ = (s, el = document) => el.querySelector(s);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 let state = null;
 let me = { who: "tailnet", admin: true, via_cloudflare: false };
+let tokMachine = null;
 
 function toast(msg, ms = 4000) {
   const t = $("#toast"); t.textContent = msg; t.style.display = "block";
@@ -250,6 +251,11 @@ function render() {
   html += `<h2>Machines</h2><div class="card" id="machines">${s.machines.map(([n, h]) =>
     `<div class="action"><span class="mono">·</span><div><b>${esc(n)}</b> <span class="mute">${esc(h)}</span> <span class="mute" data-health="${esc(n)}"></span></div>
      <div>${me.admin ? `<button data-relay="${esc(n)}|agent-pass|">agent pass</button>` : ""}</div></div>`).join("")}</div>`;
+  if (me.admin) {
+    html += `<h2>Tokens</h2><div class="card">
+      <div class="row" id="tokmachines">${s.machines.map(([n]) => `<button data-tokm="${esc(n)}"${n === tokMachine ? ' class="primary"' : ""}>${esc(n)}</button>`).join(" ")}</div>
+      <div id="tokbody" style="margin-top:10px"><div class="mute">Pick a machine.</div></div></div>`;
+  }
   html += `<h2>Cloudflare changes <span class="mute" style="text-transform:none;letter-spacing:0">(tunnels cf, every machine)</span></h2>
     <div class="card"><div class="events" id="cflog"><div class="mute">loading…</div></div></div>`;
   html += `<h2>Agent</h2><div class="card"><div class="mute" id="agent-meta"></div><div class="events" id="events" style="margin-top:8px"></div>
@@ -258,6 +264,40 @@ function render() {
   html += `<h2>Fleet file</h2><div class="card"><details><summary>serial ${s.serial} — edit with <span class="mono">tunnels fleet edit</span></summary><pre id="fleettext">…</pre></details></div>`;
   $("#app").innerHTML = html;
   fetch("/api/fleet").then(r => r.text()).then(t => { const el = $("#fleettext"); if (el) el.textContent = t; });
+}
+
+async function loadTokens(machine) {
+  tokMachine = machine;
+  document.querySelectorAll("[data-tokm]").forEach(b => b.className = b.dataset.tokm === machine ? "primary" : "");
+  const el = $("#tokbody"); if (!el) return;
+  el.innerHTML = `<div class="mute">asking ${esc(machine)}… (checking every token with Cloudflare takes a few seconds)</div>`;
+  let v;
+  try {
+    const r = await fetch("/api/mesh-tokens?machine=" + encodeURIComponent(machine));
+    v = await r.json(); if (!r.ok) throw new Error(v.error || r.statusText);
+  } catch (e) { el.innerHTML = `<div class="lvl-error">${esc(e.message)}</div>`; return; }
+  const yes = (x, good, bad, unknown) => x === true ? `<span class="tag good">${good}</span>` : x === false ? `<span class="tag bad">${bad}</span>` : `<span class="tag">${unknown}</span>`;
+  let h = `<div class="mute" style="margin-bottom:6px">API tokens on ${esc(machine)}: what this machine may do in Cloudflare. Shown by a hint; never shown again once added.</div><table>`;
+  h += v.api_tokens.map(t => `<tr><td class="mono">${esc(t.hint)} <span class="mute">${esc(t.id)}</span></td>
+      <td>${t.reach.length ? t.reach.map(r => `<b>${esc(r.account_name)}</b><br><span class="mute">${esc(r.zones.join(" · "))}</span>`).join("<br>") : esc(t.covers || "(not labelled — re-check)")}</td>
+      <td>${yes(t.valid, "works", "rejected by Cloudflare", "?")}</td>
+      <td style="text-align:right"><button data-tokrm="${esc(t.id)}" class="danger">remove</button></td></tr>`).join("")
+    || `<tr><td class="mute">no API tokens on ${esc(machine)}</td></tr>`;
+  h += `</table><div class="toolbar"><input id="toknew" type="password" placeholder="paste a Cloudflare API token" autocomplete="off" style="flex:1;min-width:260px;font:inherit;padding:4px 8px;border-radius:6px;border:1px solid var(--line);background:var(--card);color:var(--ink)">
+      <button class="primary" data-tokadd="1">add to ${esc(machine)}</button><button data-tokrefresh="1">re-check all</button></div>`;
+  h += `<div class="mute" style="margin:16px 0 6px">Tunnel (connector) tokens on ${esc(machine)}: what lets cloudflared run each tunnel. Fetched from Cloudflare by the agent; never pasted.</div><table>`;
+  h += v.connectors.map(c => `<tr><td><b>${esc(c.alias || c.name)}</b> <span class="mute">${esc(c.name)} · ${esc((c.tunnel_id || "").slice(0, 8))} · ${esc(c.account || "")}</span></td>
+      <td>${esc(c.state)} · ${c.token_file ? "token file" : `<span class="tag warn">token in plist</span>`}${c.runs_elsewhere ? ` <span class="tag warn">fleet runs it on ${esc(c.runs_elsewhere)}</span>` : ""}</td>
+      <td>${yes(c.current, "current", "stale — rotated elsewhere", "can't check here")}</td>
+      <td style="text-align:right"><button data-conrefetch="${esc(c.alias || c.name)}">re-fetch</button> <button class="danger" data-conrotate="${esc(c.alias || c.name)}">rotate</button></td></tr>`).join("")
+    || `<tr><td class="mute">no tunnels on ${esc(machine)}</td></tr>`;
+  el.innerHTML = h + `</table>`;
+}
+
+async function tokenAction(action, tunnel, arg, doneMsg) {
+  try { const r = await post("/api/relay", { machine: tokMachine, action, tunnel: tunnel || "", arg: arg || "" }); toast("✓ " + (r.message || doneMsg), 7000); }
+  catch (err) { toast("✗ " + err.message, 9000); }
+  loadTokens(tokMachine);
 }
 
 function symbol(a) {
@@ -271,6 +311,24 @@ document.addEventListener("click", async e => {
   const b = e.target.closest("button"); if (!b) return;
   if (b.id === "refresh") return load(true);
   if (b.id === "logclose") { $("#logbox").style.display = "none"; return; }
+  if (b.dataset.tokm) return loadTokens(b.dataset.tokm);
+  if (b.dataset.tokadd) {
+    const t = $("#toknew").value.trim(); if (!t) return toast("paste a token first");
+    b.disabled = true; $("#toknew").value = "";
+    return tokenAction("token-add", "", t);
+  }
+  if (b.dataset.tokrefresh) return tokenAction("token-refresh");
+  if (b.dataset.tokrm) {
+    if (!confirm(`Forget API token ${b.dataset.tokrm} on ${tokMachine}? It keeps working in Cloudflare until you revoke it there.`)) return;
+    return tokenAction("token-rm", "", b.dataset.tokrm);
+  }
+  if (b.dataset.conrefetch) return tokenAction("connector-refetch", b.dataset.conrefetch);
+  if (b.dataset.conrotate) {
+    const name = b.dataset.conrotate;
+    const typed = prompt(`Rotate ${name}: Cloudflare issues a new secret and EVERY old connector token for it stops working. ${tokMachine} takes the new one now; any other machine running it fetches it on its next agent pass.\n\nType the tunnel's name to rotate it:`);
+    if (typed !== name) return typed === null ? undefined : toast("not rotated — the name did not match");
+    return tokenAction("tunnel-rotate", name);
+  }
   if (b.dataset.mlogs) {
     const [machine, tunnel] = b.dataset.mlogs.split("|");
     const t = await (await fetch(`/api/mesh-logs?machine=${encodeURIComponent(machine)}&tunnel=${encodeURIComponent(tunnel)}`)).text();

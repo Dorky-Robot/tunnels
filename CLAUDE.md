@@ -58,6 +58,11 @@ an agent on every machine. There is no TUI. The web UI, served by every agent on
   provider's JWKS (RS256, audience = client_id, issuer, expiry), and in-memory sessions behind
   an HttpOnly, Secure, SameSite=Lax cookie. Admin = the email is in `[policy.web] admins`.
   Never Cloudflare Access: Felix's rule is that apps sign people in themselves.
+- **tokens.rs**: a machine's tokens for the UI, with no secret in any view. API tokens are
+  identified by a sha256 fingerprint; connector tokens carry whether they still match
+  Cloudflare. It also holds add/remove/refresh and `refetch_connector`. The UI reaches them
+  through `/api/mesh-tokens` and the relay actions `token-add|token-rm|token-refresh|connector-refetch|tunnel-rotate`
+  (rotate runs the CLI's `tunnel rotate` on the target machine).
 - **sync.rs**: fleet replication. The file is served at `/api/fleet` and the newest `serial`
   wins. `notify` wakes the peers.
 - **status.rs**: the shared view model used by `tunnels status` and the web UI.
