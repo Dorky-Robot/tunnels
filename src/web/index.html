@@ -58,6 +58,11 @@
   #toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--ink); color: var(--bg); padding: 8px 14px; border-radius: 8px; font-size: 13px; display: none; max-width: 90vw; white-space: pre-wrap; z-index: 5; }
   .loading { color: var(--mute); padding: 40px 0; text-align: center; }
   details summary { cursor: pointer; color: var(--mute); }
+  .askbox { border: 1px solid var(--accent); border-radius: 8px; padding: 10px 12px; margin: 6px 0; background: var(--bg); }
+  .askbox.danger { border-color: var(--down); }
+  .askbox .toolbar { margin-top: 8px; }
+  .askbox input { font: inherit; padding: 4px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--card); color: var(--ink); min-width: 220px; margin-top: 8px; }
+  .askresult { margin-top: 6px; white-space: pre-wrap; font-size: 13px; }
 </style>
 </head>
 <body>
@@ -310,8 +315,52 @@ async function loadTokens(machine) {
   el.innerHTML = h;
 }
 
+/// A confirmation on the page, right under the button that asked for it —
+/// never a browser dialog. `type` makes the person type a name first; `go`
+/// does the work and returns what to say; the answer stays in the panel.
+function ask(b, { text, type, danger, label, go, after }) {
+  document.querySelectorAll(".ask").forEach(x => x.remove());
+  const tr = b.closest("tr");
+  const box = document.createElement(tr ? "tr" : "div");
+  box.className = "ask";
+  const inner = `<div class="askbox${danger ? " danger" : ""}"><div>${text}</div>
+    ${type ? `<input class="asktype" placeholder="type ${esc(type)} to confirm" autocomplete="off" spellcheck="false">` : ""}
+    <div class="toolbar"><button class="${danger ? "danger" : "primary"} askgo"${type ? " disabled" : ""}>${esc(label || "confirm")}</button><button class="askno">cancel</button></div>
+    <div class="askresult"></div></div>`;
+  if (tr) { box.innerHTML = `<td colspan="9">${inner}</td>`; tr.after(box); }
+  else { box.innerHTML = inner; (b.closest(".toolbar, .action, .row") || b.parentElement).after(box); }
+  const goBtn = box.querySelector(".askgo"), input = box.querySelector(".asktype"), out = box.querySelector(".askresult");
+  if (input) { input.focus(); input.addEventListener("input", () => { goBtn.disabled = input.value.trim() !== type; }); }
+  box.querySelector(".askno").addEventListener("click", ev => { ev.stopPropagation(); box.remove(); });
+  goBtn.addEventListener("click", async ev => {
+    ev.stopPropagation();
+    goBtn.disabled = true; box.querySelector(".askno").disabled = true; if (input) input.disabled = true;
+    out.className = "askresult mute"; out.textContent = "working…";
+    try {
+      const msg = await go();
+      out.className = "askresult"; out.innerHTML = `<span class="lvl-info">✓</span> ${esc(msg)}`;
+      box.querySelector(".askno").textContent = "close"; box.querySelector(".askno").disabled = false;
+      if (after) setTimeout(after, 1500);
+    } catch (err) {
+      out.className = "askresult lvl-error"; out.textContent = "✗ " + err.message;
+      goBtn.disabled = !!type && input.value.trim() !== type; box.querySelector(".askno").disabled = false; if (input) input.disabled = false;
+    }
+  });
+}
+
+async function relayMsg(machine, action, tunnel, arg) {
+  const r = await post("/api/relay", { machine, action, tunnel: tunnel || "", arg: arg || "" });
+  return r.message || "done";
+}
+
+/// Hostnames a tunnel is serving right now, for saying what a restart touches.
+function servedBy(alias) {
+  const t = state && state.tunnels.find(x => x.alias === alias);
+  return t ? t.routes.filter(r => r.active).map(r => r.host) : [];
+}
+
 async function tokenAction(action, tunnel, arg, doneMsg) {
-  try { const r = await post("/api/relay", { machine: tokMachine, action, tunnel: tunnel || "", arg: arg || "" }); toast("✓ " + (r.message || doneMsg), 7000); }
+  try { toast("✓ " + (await relayMsg(tokMachine, action, tunnel, arg) || doneMsg), 7000); }
   catch (err) { toast("✗ " + err.message, 9000); }
   loadTokens(tokMachine);
 }
@@ -335,15 +384,19 @@ document.addEventListener("click", async e => {
   }
   if (b.dataset.tokrefresh) return tokenAction("token-refresh");
   if (b.dataset.tokrm) {
-    if (!confirm(`Forget API token ${b.dataset.tokrm} on ${tokMachine}? It keeps working in Cloudflare until you revoke it there.`)) return;
-    return tokenAction("token-rm", "", b.dataset.tokrm);
+    const id = b.dataset.tokrm, m = tokMachine;
+    return ask(b, { danger: true, label: `forget it on ${m}`,
+      text: `Forget API token <span class="mono">${esc(id)}</span> on <b>${esc(m)}</b>. Only here: if Cloudflare still accepts it, it keeps working until you revoke it at dash.cloudflare.com.`,
+      go: () => relayMsg(m, "token-rm", "", id), after: () => loadTokens(m) });
   }
   if (b.dataset.conrefetch) return tokenAction("connector-refetch", b.dataset.conrefetch);
   if (b.dataset.conrotate) {
-    const name = b.dataset.conrotate;
-    const typed = prompt(`Rotate ${name}: Cloudflare issues a new secret and EVERY old connector token for it stops working. ${tokMachine} takes the new one now; any other machine running it fetches it on its next agent pass.\n\nType the tunnel's name to rotate it:`);
-    if (typed !== name) return typed === null ? undefined : toast("not rotated — the name did not match");
-    return tokenAction("tunnel-rotate", name);
+    const name = b.dataset.conrotate, m = tokMachine, hosts = servedBy(name);
+    return ask(b, { danger: true, type: name, label: `rotate ${name}`,
+      text: `<b>Rotate ${esc(name)}.</b> Cloudflare issues a new secret and <b>every old connector token for it stops working</b>.
+        ${esc(m)} takes the new one and restarts the tunnel now${hosts.length ? ` — a few seconds of downtime for <b>${esc(hosts.join(", "))}</b>` : ""};
+        any other machine holding it fetches the new one on its next agent pass.`,
+      go: () => relayMsg(m, "tunnel-rotate", name), after: () => loadTokens(m) });
   }
   if (b.dataset.mlogs) {
     const [machine, tunnel] = b.dataset.mlogs.split("|");
@@ -355,13 +408,13 @@ document.addEventListener("click", async e => {
   }
   if (b.dataset.relay) {
     const [machine, action, tunnel] = b.dataset.relay.split("|");
-    const what = action === "agent-pass" ? `run an agent pass on ${machine}` : `restart ${tunnel} on ${machine}`;
-    if (!confirm(`${what[0].toUpperCase()}${what.slice(1)}?`)) return;
-    b.disabled = true;
-    try { const r = await post("/api/relay", { machine, action, tunnel }); toast("✓ " + r.message); }
-    catch (err) { toast("✗ " + err.message, 8000); }
-    b.disabled = false; setTimeout(() => load(true), 4000);
-    return;
+    const hosts = action === "tunnel-restart" ? servedBy(tunnel) : [];
+    return ask(b, {
+      label: action === "agent-pass" ? `run it on ${machine}` : `restart ${tunnel}`,
+      text: action === "agent-pass"
+        ? `Run an agent pass on <b>${esc(machine)}</b> now: it syncs the fleet file, repairs what drifted, and restarts what is down.`
+        : `Restart <b>${esc(tunnel)}</b> on <b>${esc(machine)}</b>${hosts.length ? ` — a few seconds of downtime for <b>${esc(hosts.join(", "))}</b>` : ""}.`,
+      go: () => relayMsg(machine, action, tunnel), after: () => load(true) });
   }
   if (b.dataset.logs) {
     const name = b.dataset.logs;
@@ -371,22 +424,23 @@ document.addEventListener("click", async e => {
     $("#logbox").style.display = "block"; $("#logbox").scrollIntoView({ behavior: "smooth" });
     return;
   }
-  try {
-    if (b.dataset.apply) {
-      if (b.dataset.confirm && !confirm(b.dataset.confirm)) return;
+  if (b.dataset.apply) {
+    const body = JSON.parse(b.dataset.apply);
+    const go = async () => reportText(await post("/api/apply", body));
+    if (!b.dataset.confirm) {
       b.disabled = true; toast("applying…", 60000);
-      const r = await post("/api/apply", JSON.parse(b.dataset.apply));
-      toast(reportText(r), 9000); load(true);
-    } else if (b.dataset.promote) {
-      if (!confirm(`Send ${b.dataset.promote} to its standby now?`)) return;
-      b.disabled = true; const r = await post("/api/promote", { host: b.dataset.promote });
-      toast(reportText(r), 9000); load(true);
-    } else if (b.dataset.failback) {
-      if (!confirm(`Send ${b.dataset.failback} back to its primary now?`)) return;
-      b.disabled = true; const r = await post("/api/failback", { host: b.dataset.failback });
-      toast(reportText(r), 9000); load(true);
+      try { toast(await go(), 9000); } catch (err) { toast("✗ " + err.message, 8000); }
+      b.disabled = false; return load(true);
     }
-  } catch (err) { toast("✗ " + err.message, 8000); b.disabled = false; }
+    return ask(b, { danger: !!body.yes, label: body.yes ? "take them over" : "prune them", text: esc(b.dataset.confirm), go, after: () => load(true) });
+  }
+  if (b.dataset.promote || b.dataset.failback) {
+    const host = b.dataset.promote || b.dataset.failback, promote = !!b.dataset.promote;
+    return ask(b, { danger: true, label: promote ? "send it to the standby" : "send it back",
+      text: promote ? `Send <b>${esc(host)}</b>'s traffic to its <b>standby</b> now. DNS moves; the primary keeps running.`
+                    : `Send <b>${esc(host)}</b>'s traffic back to its <b>primary</b> now.`,
+      go: async () => reportText(await post(promote ? "/api/promote" : "/api/failback", { host })), after: () => load(true) });
+  }
 });
 
 whoami().then(() => load(false)).then(() => {
@@ -394,8 +448,10 @@ whoami().then(() => load(false)).then(() => {
   const m = (location.hash.match(/^#tokens=(.+)$/) || [])[1];
   if (m && me.admin) { loadTokens(decodeURIComponent(m)); setTimeout(() => $("#tokbody") && $("#tokbody").scrollIntoView(), 300); }
 });
-setInterval(() => { loadAgent(); loadPeers(); }, 15000);
-setInterval(() => load(false), 60000);
+// refreshes re-draw the page; hold them while a confirmation is open
+const asking = () => !!document.querySelector(".ask");
+setInterval(() => { if (!asking()) { loadAgent(); loadPeers(); } }, 15000);
+setInterval(() => { if (!asking()) load(false); }, 60000);
 </script>
 </body>
 </html>
