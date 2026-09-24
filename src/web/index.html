@@ -61,7 +61,8 @@
   .askbox { border: 1px solid var(--accent); border-radius: 8px; padding: 10px 12px; margin: 6px 0; background: var(--bg); }
   .askbox.danger { border-color: var(--down); }
   .askbox .toolbar { margin-top: 8px; }
-  .askbox input { font: inherit; padding: 4px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--card); color: var(--ink); min-width: 220px; margin-top: 8px; }
+  .askbox input:not([type=checkbox]) { font: inherit; padding: 4px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--card); color: var(--ink); min-width: 220px; margin-top: 8px; }
+  .askbox label { display: inline-flex; align-items: center; gap: 4px; margin-right: 14px; white-space: nowrap; }
   .askresult { margin-top: 6px; white-space: pre-wrap; font-size: 13px; }
 </style>
 </head>
@@ -432,17 +433,23 @@ document.addEventListener("click", async e => {
     const a = accounts[+b.dataset.acctapi], name = a.alias || a.name;
     const holders = [...new Set(a.holders.map(([m]) => m))];
     const all = (state ? state.machines.map(([n]) => n) : holders);
-    return ask(b, { label: "put it on the machines, retire the old one",
-      text: `<b>Rotate the ${esc(name)} API token.</b> In Cloudflare: My Profile → API Tokens → the token for ${esc(name)} → <i>Roll</i>
-        (same permissions; the old value stops working at once, so paste the new one right away) — or create a new token with the same permissions. Paste it here:`,
+    const distinct = [...new Map(a.holders.map(([m, t]) => [t.id, t.hint])).values()];
+    const how = distinct.length > 1
+      ? `${esc(name)} has <b>${distinct.length} different API tokens</b> on these machines (${distinct.map(esc).join(", ")}). One new token will replace all of them.
+         In Cloudflare: My Profile → API Tokens → <i>Create Token</i> with the same permissions (Cloudflare Tunnel: Edit, DNS: Edit, Zone: Read for ${esc(name)}), and paste it here.
+         Afterwards, delete the old ones there — they are listed when this finishes.`
+      : `In Cloudflare: My Profile → API Tokens → the token for ${esc(name)} → <i>Roll</i> (same permissions; the old value stops working at once, so paste the new one right away) — or create a new one with the same permissions. Paste it here:`;
+    return ask(b, { label: "put it on the machines, retire the old ones",
+      text: `<b>Rotate the ${esc(name)} API token.</b> ${how}`,
       fields: `<input class="acctok" type="password" placeholder="the new API token" autocomplete="off" style="width:100%;max-width:520px">
-        <div style="margin-top:8px">Put it on: ${all.map(m => `<label style="margin-right:10px;white-space:nowrap"><input type="checkbox" class="acctm" value="${esc(m)}"${holders.includes(m) ? " checked" : ""}> ${esc(m)}</label>`).join("")}</div>`,
+        <div style="margin-top:8px">Put it on: ${all.map(m => `<label><input type="checkbox" class="acctm" value="${esc(m)}"${holders.includes(m) ? " checked" : ""}>${esc(m)}</label>`).join("")}</div>`,
       valid: box => box.querySelector(".acctok").value.trim().length > 20 && box.querySelectorAll(".acctm:checked").length > 0,
       go: async box => {
         const token = box.querySelector(".acctok").value.trim(); box.querySelector(".acctok").value = "";
         const machines = [...box.querySelectorAll(".acctm:checked")].map(x => x.value);
         const r = await post("/api/account/rotate-api", { account_id: a.account_id, token, machines });
-        return lines(r) + "\n\nIf you created a new token rather than rolling one, delete the old one in Cloudflare now.";
+        const retired = r.results.flatMap(x => (x.message.match(/retired \d+ old token\(s\) here: (.*?)(;|$)/) || [, ""])[1].split(", ").filter(Boolean));
+        return lines(r) + (retired.length ? `\n\nNow delete these old tokens in Cloudflare (My Profile → API Tokens): ${[...new Set(retired)].join(", ")}` : "");
       }, after: loadAccounts });
   }
   if (b.dataset.accttun) {
