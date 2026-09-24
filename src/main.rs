@@ -514,6 +514,11 @@ fn cmd_path(cmd: &Cmd) -> String {
 }
 
 fn main() {
+    // `tunnels … | head` should end quietly when head stops reading, as every
+    // other Unix tool does, not panic with "failed printing to stdout"
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let cli = Cli::parse();
     let json = cli.json;
     let cmd = cli.cmd.unwrap_or(Cmd::Status { local: false });
