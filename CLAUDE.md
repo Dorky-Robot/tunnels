@@ -1,8 +1,8 @@
 # tunnels
 
 Cloudflare tunnels across a fleet of Macs, driven by a config file and a CLI and kept in line by
-an agent on every machine. There is no TUI. The web UI, served by the agent and tailnet-only, is
-the visual interface.
+an agent on every machine. There is no TUI. The web UI, served by every agent on the tailnet
+(and optionally on a public hostname behind pocket-id sign-in), is the visual interface.
 
 ## Architecture
 
@@ -42,10 +42,10 @@ the visual interface.
     but only after two bad passes and at most once every 5 minutes.
   - It refetches a rotated connector token, repairs drift it owns, and performs automatic
     failover.
-  - It exits when the binary changes so that launchd starts the new one.
+  - When the binary changes (`brew upgrade`) it execs the new one in place; its plist is
+    `ProcessType Interactive` because launchd deferred its respawn on doug-mini.
 - **web.rs** + **web/index.html**: the agent's HTTP API and the UI.
-  - Binds to the tailnet IP and loopback only, and rejects non-tailnet addresses and requests
-    carrying proxy headers (`Cf-Ray` and similar).
+  - Binds to the tailnet IP and loopback only, and rejects non-tailnet addresses.
   - POSTs need an `X-Tunnels: 1` header.
   - `door()` decides how a request arrived. Tailnet or loopback: full rights. Proxied
     (Cloudflare headers): only from loopback, only for `[policy.web] public_host`, and then
