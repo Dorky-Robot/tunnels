@@ -137,7 +137,7 @@ async function loadCfLog() {
     const v = await (await fetch("/api/cf-log?all=1")).json();
     const el = $("#cflog"); if (!el) return;
     el.innerHTML = v.length ? v.map(r => `<div><span class="mute">${esc(r.at)}</span> ${r.ok ? "✓" : "✗"} ${esc(r.machine)} ${esc(r.method)} ${esc(r.path)}` +
-      `${r.undoes ? ` <span class="tag">undid ${esc(r.undoes)}</span>` : ""}${r.undo ? "" : ` <span class="tag warn">not undoable</span>`} <span class="mute">${esc(r.id)}</span></div>`).join("")
+      `${r.undoes ? ` <span class="tag">undid ${esc(r.undoes)}</span>` : ""}${!r.ok ? ` <span class="tag">failed; nothing changed</span>` : r.undo ? "" : ` <span class="tag warn">not undoable</span>`} <span class="mute">${esc(r.id)}</span></div>`).join("")
       : `<div class="mute">No changes through <span class="mono">tunnels cf</span> yet.</div>`;
   } catch { }
 }
