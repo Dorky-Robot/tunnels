@@ -72,43 +72,123 @@ fn header<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
     req.headers().iter().find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name)).map(|h| h.value.as_str())
 }
 
-/// Who is asking. On the tailnet: the tailnet, with full rights, as always.
-/// Through Cloudflare: only via this Mac's own cloudflared, only for the
-/// public host the fleet file declares, and only with an Access token the
-/// agent verifies itself; admin rights come from `[policy.web] admins`.
-fn identify(req: &Request) -> Result<crate::access::Identity, String> {
+/// How a request arrived.
+enum Door {
+    /// the tailnet or this Mac: full rights, as always
+    Tailnet,
+    /// the public hostname, through this Mac's cloudflared: sign-in required
+    Public(crate::fleet::WebPolicy),
+}
+
+/// Which door a request came through, or why it may not come in at all.
+/// Through Cloudflare: only via this Mac's own cloudflared (so from
+/// loopback), and only for the public host the fleet file declares.
+fn door(req: &Request) -> Result<Door, String> {
     let remote = req.remote_addr().map(|a| a.ip());
-    let via_proxy = ["Cf-Ray", "Cf-Connecting-Ip", "X-Forwarded-For", "Forwarded", "Cf-Warp-Tag-Id", "Cf-Access-Jwt-Assertion"]
+    let via_proxy = ["Cf-Ray", "Cf-Connecting-Ip", "X-Forwarded-For", "Forwarded", "Cf-Warp-Tag-Id"]
         .iter()
         .any(|n| header(req, n).is_some());
     if !via_proxy {
         return match remote {
-            Some(ip) if util::is_tailnet_or_loopback(&ip) => Ok(crate::access::Identity::tailnet()),
+            Some(ip) if util::is_tailnet_or_loopback(&ip) => Ok(Door::Tailnet),
             _ => Err("tailnet only".into()),
         };
     }
-    // cloudflared runs on this Mac, so anything proxied arrives from loopback
     if !remote.map(|ip| ip.is_loopback()).unwrap_or(false) {
         return Err("proxied requests are only accepted from this Mac's own cloudflared".into());
     }
     let fleet = Fleet::load().ok().flatten().unwrap_or_default();
-    let Some(web) = fleet.policy.web.as_ref() else {
+    let Some(web) = fleet.policy.web.clone() else {
         return Err("the web UI is not published: the fleet file has no [policy.web]".into());
     };
     let host = header(req, "Host").unwrap_or("").split(':').next().unwrap_or("");
     if !host.eq_ignore_ascii_case(&web.public_host) {
         return Err(format!("the web UI is published only as {}", web.public_host));
     }
-    let token = header(req, "Cf-Access-Jwt-Assertion").ok_or("no Cloudflare Access token — sign in through Access")?;
-    crate::access::verify(token, web).map_err(|e| format!("{e:#}"))
+    Ok(Door::Public(web))
+}
+
+fn redirect(req: Request, to: &str, cookie: Option<String>) {
+    let mut r = Response::from_string("").with_status_code(302).with_header(Header::from_bytes("Location", to).unwrap());
+    if let Some(c) = cookie {
+        r = r.with_header(Header::from_bytes("Set-Cookie", c).unwrap());
+    }
+    let _ = req.respond(r);
+}
+
+fn page(req: Request, code: u16, text: &str) {
+    let html = format!(
+        "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'><title>tunnels</title>\
+         <body style='font:15px -apple-system,sans-serif;max-width:32rem;margin:15vh auto;padding:0 1rem'>\
+         <h2>tunnels</h2><p>{}</p><p><a href='/auth/login'>Sign in with pocket-id</a></p>",
+        text.replace('<', "&lt;")
+    );
+    let _ = req.respond(
+        Response::from_string(html).with_status_code(code).with_header(Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap()),
+    );
+}
+
+/// The sign-in routes on the public door: /auth/login, /auth/callback, /auth/logout.
+fn auth_route(req: Request, path: &str, query: &str, web: &crate::fleet::WebPolicy) {
+    let q = |k: &str| {
+        query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix(&format!("{k}=")))
+            .map(|v| v.replace("%2F", "/").replace("%3A", ":").replace("%40", "@").replace("%2B", "+").replace("%3D", "="))
+            .unwrap_or_default()
+    };
+    match path {
+        "/auth/login" => match crate::access::login_url(web) {
+            Ok(url) => redirect(req, &url, None),
+            Err(e) => page(req, 503, &format!("{e:#}")),
+        },
+        "/auth/callback" => {
+            if !q("error").is_empty() {
+                return page(req, 403, &format!("pocket-id did not sign you in ({})", q("error")));
+            }
+            match crate::access::finish(web, &q("code"), &q("state")) {
+                Ok((sid, who)) => {
+                    eprintln!("{} web: {} signed in{}", util::now_rfc3339(), who.who, if who.admin { " (admin)" } else { "" });
+                    redirect(req, "/", Some(crate::access::set_cookie(&sid)))
+                }
+                Err(e) => page(req, 403, &format!("{e:#}")),
+            }
+        }
+        "/auth/logout" => {
+            crate::access::logout(header(&req, "Cookie"));
+            let _ = req.respond(
+                Response::from_string("")
+                    .with_status_code(302)
+                    .with_header(Header::from_bytes("Location", "/auth/signed-out").unwrap())
+                    .with_header(Header::from_bytes("Set-Cookie", crate::access::clear_cookie()).unwrap()),
+            );
+        }
+        _ => page(req, 200, "Signed out."),
+    }
 }
 
 fn handle(shared: Shared, mut req: Request) {
-    let who = match identify(&req) {
-        Ok(w) => w,
+    let d = match door(&req) {
+        Ok(d) => d,
         Err(why) => {
             let _ = req.respond(Response::from_string(why).with_status_code(403));
             return;
+        }
+    };
+    let who = match &d {
+        Door::Tailnet => crate::access::Identity::tailnet(),
+        Door::Public(web) => {
+            let url = req.url().to_string();
+            let (p, q) = url.split_once('?').unwrap_or((url.as_str(), ""));
+            if p.starts_with("/auth/") {
+                let (p, q) = (p.to_string(), q.to_string());
+                return auth_route(req, &p, &q, web);
+            }
+            match crate::access::session(web, header(&req, "Cookie")) {
+                Some(w) => w,
+                None if req.method() == &Method::Get && !p.starts_with("/api/") => return redirect(req, "/auth/login", None),
+                None => return reply_err(req, 401, "sign in first: /auth/login"),
+            }
         }
     };
     let url = req.url().to_string();

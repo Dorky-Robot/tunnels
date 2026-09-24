@@ -253,6 +253,14 @@ Most things never meet any of these, and should stay documented API calls.
 
 ## The web UI on the internet
 
+*Changed 2026-09-24: no Cloudflare Access. As with the other admin sites on
+the mesh (admin.homesforsalebymonica.com), the agent signs people in with
+pocket-id itself: a plain route, and one public OIDC client in pocket-id with
+callback `https://tunnels.felixflor.es/auth/callback`. Built in 0.20.0.
+Where the text below says "Access token", read "pocket-id ID token"; the
+Cloudflare Access steps (login provider, Access app, team domain, AUD) no
+longer apply.*
+
 Decision 4: ssh stays on the tailnet, and the web UI becomes reachable from
 the internet through Cloudflare, with sign-in through id.felixflor.es.
 
@@ -384,6 +392,7 @@ that document to match.
 | 6 | Who may sign in to the web UI | For now, anyone pocket-id knows |
 | 7 | The public hostname | `tunnels.felixflor.es` |
 | 8 | Can an internet sign-in change anything | ~~No, read-only~~ Changed the same day: yes, for emails listed in `[policy.web] admins`, and across the whole mesh. Everyone else signed in can only look. Destroy, rotate and token changes stay CLI-only |
+| 10 | Cloudflare Access, or the app signs in itself | The app signs in itself, with pocket-id; never Cloudflare Access (Felix, standing rule) |
 | 9 | Standby for the web UI | None. It stays on dorkyrobot2, where pocket-id also runs |
 
 ## Open questions

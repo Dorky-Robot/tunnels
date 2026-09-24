@@ -47,15 +47,17 @@ the visual interface.
   - Binds to the tailnet IP and loopback only, and rejects non-tailnet addresses and requests
     carrying proxy headers (`Cf-Ray` and similar).
   - POSTs need an `X-Tunnels: 1` header.
-  - `identify()` gives every request an identity. Tailnet or loopback: full rights. Proxied
-    (Cloudflare headers): only from loopback, only for `[policy.web] public_host`, only with a
-    valid Access token; POSTs need an admin. Peer endpoints (`/api/cf-forward`,
+  - `door()` decides how a request arrived. Tailnet or loopback: full rights. Proxied
+    (Cloudflare headers): only from loopback, only for `[policy.web] public_host`, and then
+    `/auth/*` or a live session. POSTs need an admin. Peer endpoints (`/api/cf-forward`,
     `/api/relay-exec`, `/api/notify`) refuse anything proxied.
   - `/api/relay` runs a machine action here or relays it to the target's `/api/relay-exec`,
     which checks `may_forward` (allowlist plus the caller's tailnet address).
-- **access.rs**: verifies Cloudflare Access tokens: the team's JWKS (cached, refreshed on an
-  unknown key id), RS256, audience, issuer and expiry. Admin = the email is in `[policy.web]
-  admins`. `TUNNELS_ACCESS_CERTS_URL` points it at the tests' fake.
+- **access.rs**: sign-in for the public UI. The agent is itself an OIDC client of pocket-id:
+  authorization code + PKCE with a public client (no secret), the ID token verified against the
+  provider's JWKS (RS256, audience = client_id, issuer, expiry), and in-memory sessions behind
+  an HttpOnly, Secure, SameSite=Lax cookie. Admin = the email is in `[policy.web] admins`.
+  Never Cloudflare Access: Felix's rule is that apps sign people in themselves.
 - **sync.rs**: fleet replication. The file is served at `/api/fleet` and the newest `serial`
   wins. `notify` wakes the peers.
 - **status.rs**: the shared view model used by `tunnels status` and the web UI.

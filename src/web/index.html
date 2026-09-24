@@ -100,7 +100,9 @@ function reportText(r) {
 async function whoami() {
   try { me = await (await fetch("/api/whoami")).json(); } catch { }
   const el = $("#whoami");
-  el.textContent = me.via_cloudflare ? `${me.who} · ${me.admin ? "admin" : "can look, not change"}` : "on the tailnet · admin";
+  el.innerHTML = me.via_cloudflare
+    ? `${esc(me.who)} · ${me.admin ? "admin" : "can look, not change"} · <a href="/auth/logout">sign out</a>`
+    : "on the tailnet · admin";
   el.className = "tag " + (me.admin ? "good" : "");
 }
 

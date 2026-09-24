@@ -187,28 +187,37 @@ standby does not share the primary's data.
 Every agent serves the UI on its tailnet address and on localhost, with full rights. It rejects
 requests from anywhere else. The tailnet is the way in when everything else is down.
 
-### On the internet, behind Cloudflare Access (optional)
+### On the internet, with sign-in (optional)
 
-To reach the UI from anywhere, publish it through a tunnel with Cloudflare Access in front:
+To reach the UI from anywhere, route a hostname to the agent's port like any other site, and
+let the agent sign people in with your OpenID Connect provider (pocket-id, for example). You
+don't need Cloudflare Access or anything in the Cloudflare dashboard.
 
 ```toml
 [policy.web]
 public_host = "tunnels.example.com"
-team_domain = "<team>.cloudflareaccess.com"
-aud = "<the Access app's audience tag>"
+issuer = "https://id.example.com"        # your OIDC provider
+client_id = "…"                           # a public client, callback https://tunnels.example.com/auth/callback
 admins = ["you@example.com"]
 ```
 
-- **The agent checks every request itself.** It verifies the `Cf-Access-Jwt-Assertion` token:
-  the signature against the team's keys, the audience, the issuer and the expiry. It accepts
-  proxied requests only from this Mac's own cloudflared, and only for `public_host`.
-- **Admin rights come from `admins`, not from the Access policy.** Listed emails can change
-  things across the whole mesh. The serving agent relays machine actions over the tailnet to the
-  target machine's agent, and that agent only accepts relays from machines on
-  `policy.remote_from`. Anyone else Access lets in can only look.
+```bash
+tunnels route add tunnels.example.com 7630 --tunnel <a tunnel on the machine that serves it>
+```
+
+- **Sign-in:** the standard authorization-code flow with PKCE. The client is public, so no
+  client secret is stored on any Mac. The agent checks the ID token against the provider's
+  published keys (signature, audience, issuer, expiry) and keeps sessions in memory for 12
+  hours. Restarting the agent signs everyone out.
+- **Only through this Mac's own cloudflared, and only for `public_host`.** Anything else that
+  arrives proxied is refused.
+- **Admin rights come from `admins`.** Listed emails can change things across the whole mesh:
+  the serving agent relays machine actions over the tailnet to the target machine's agent, and
+  that agent only accepts relays from machines on `policy.remote_from`. Anyone else who signs
+  in can only look.
 - **Every admin action records who made it.**
 - **Destroy, rotate and token changes stay CLI-only.**
-- **Machine-to-machine endpoints are never reachable through Cloudflare.**
+- **Machine-to-machine endpoints are never reachable from the internet.**
 - **The fleet file refuses any route to the UI's port except `public_host`.**
 
 ## The rest of Cloudflare: `tunnels cf`

@@ -66,15 +66,15 @@ pub struct Policy {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct WebPolicy {
-    /// the hostname the UI is published at
+    /// the hostname the UI is published at, as a plain tunnel route
     pub public_host: String,
-    /// the Zero Trust team domain, `<team>.cloudflareaccess.com`
+    /// the OIDC provider people sign in with, e.g. https://id.felixflor.es
     #[serde(default)]
-    pub team_domain: String,
-    /// the Access application's audience tag
+    pub issuer: String,
+    /// the public OIDC client registered there (callback https://<public_host>/auth/callback)
     #[serde(default)]
-    pub aud: String,
-    /// emails that may change things through the UI; everyone else Access lets in can only look
+    pub client_id: String,
+    /// emails that may change things through the UI; anyone else who signs in can only look
     #[serde(default)]
     pub admins: Vec<String>,
 }

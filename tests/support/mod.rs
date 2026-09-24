@@ -44,6 +44,10 @@ pub struct World {
     pub ssl: BTreeMap<String, String>,
     /// account id → Access apps
     pub access_apps: BTreeMap<String, Vec<Value>>,
+    /// the fake's own address, for the pretend pocket-id
+    pub base_url: String,
+    /// PKCE verifiers pocket-id was shown, by code
+    pub oidc_verifiers: Vec<String>,
     next: u32,
 }
 
@@ -91,6 +95,8 @@ impl Fake {
     pub fn start(world: World) -> Fake {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let url = format!("http://{}", server.server_addr().to_ip().unwrap());
+        let mut world = world;
+        world.base_url = url.clone();
         let world = Arc::new(Mutex::new(world));
         let w = world.clone();
         std::thread::spawn(move || {
@@ -126,8 +132,37 @@ fn tunnel_json(t: &FakeTunnel) -> Value {
 }
 
 fn route(w: &mut World, method: &str, path: &str, q: &str, body: &str) -> (u16, Value) {
-    if path == "/cdn-cgi/access/certs" {
+    // a pretend pocket-id: discovery, keys, and a token endpoint that signs
+    // an ID token for the email the code names ("code-<email>")
+    if path == "/.well-known/openid-configuration" {
+        let b = w.base_url.clone();
+        return (200, json!({
+            "issuer": b, "authorization_endpoint": format!("{b}/authorize"),
+            "token_endpoint": format!("{b}/api/oidc/token"), "jwks_uri": format!("{b}/.well-known/jwks.json"),
+        }));
+    }
+    if path == "/.well-known/jwks.json" {
         return (200, serde_json::from_str(include_str!("../fixtures/access-test-certs.json")).unwrap());
+    }
+    if path == "/api/oidc/token" && method == "POST" {
+        let form: BTreeMap<String, String> = body
+            .split('&')
+            .filter_map(|kv| kv.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.replace("%40", "@").replace("%3A", ":").replace("%2F", "/")))
+            .collect();
+        let verifier = form.get("code_verifier").cloned().unwrap_or_default();
+        if verifier.len() < 43 || form.get("grant_type").map(String::as_str) != Some("authorization_code") {
+            return (400, json!({ "error": "invalid_grant" }));
+        }
+        w.oidc_verifiers.push(verifier);
+        let email = form.get("code").and_then(|c| c.strip_prefix("code-")).unwrap_or("").to_string();
+        use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+        let mut h = Header::new(Algorithm::RS256);
+        h.kid = Some("test-kid".into());
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let claims = json!({ "email": email, "aud": form.get("client_id").cloned().unwrap_or_default(), "iss": w.base_url, "exp": now + 300, "iat": now });
+        let t = encode(&h, &claims, &EncodingKey::from_rsa_pem(include_bytes!("../fixtures/access-test-key.pem")).unwrap()).unwrap();
+        return (200, json!({ "id_token": t, "access_token": "x", "token_type": "Bearer" }));
     }
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     let body: Value = serde_json::from_str(body).unwrap_or(Value::Null);
@@ -335,7 +370,6 @@ impl Sandbox {
             .env("TUNNELS_LAUNCH_AGENTS", self.path("LaunchAgents"))
             .env("TUNNELS_LOG_DIR", self.path("logs"))
             .env("TUNNELS_LAUNCHCTL", "/usr/bin/true")
-            .env("TUNNELS_ACCESS_CERTS_URL", format!("{}/cdn-cgi/access/certs", self.fake.url))
             .env_remove("SSH_CONNECTION")
             .env_remove("SSH_TTY");
         c
