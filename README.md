@@ -181,26 +181,18 @@ standby does not share the primary's data.
 - promote and failback;
 - restart and logs for **any tunnel on any machine**, and an agent pass for any machine;
 - every agent's recent actions, and the `tunnels cf` changes made from every machine;
-- **Cloudflare accounts** (admins only): one card per account, one row per machine. Each row
-  shows that machine's API token for the account and the tunnel it runs in it, with the buttons
-  on the row itself:
-  - **Rotate API token** (or **add** it, if the machine has none): paste a rolled or new token.
-    It is checked, put on that machine (tick others to give them the same token), and the old
-    token for the account is retired there. A token that also reaches another account is kept
-    and named.
-  - **Rotate tunnel:** a new secret for that tunnel, taken by its machine, after you type the
-    tunnel's name. The panel lists the hostnames that blip.
-  - **Paste tunnel token:** a token refreshed in the dashboard, checked in the browser to belong
-    to that tunnel, then installed where it runs.
-- **tokens, per machine and grouped by Cloudflare account** (admins only; link straight to one
-  with `#tokens=<machine>`). Each account shows its API tokens with the tunnels it runs, and warns
-  when no working API token for that account is on the machine:
-  - API tokens: each shown by a hint, the accounts and domains it reaches, and whether
-    Cloudflare still accepts it. You can add one by pasting it, remove one, or re-check them all.
-  - Tunnel (connector) tokens: whether each still matches Cloudflare (a rotation elsewhere makes
-    it stale). You can re-fetch one, or rotate a tunnel after typing its name.
-  - A token is never shown again once added. A pasted token goes only to the machine that
-    keeps it, over the tailnet.
+- **one card per machine**, and inside it each Cloudflare account:
+  - that machine's API token for the account (whether Cloudflare accepts it), with **rotate** (or
+    **add**) for admins. Paste a rolled or new token; it is checked, put on that machine (tick
+    others to give them the same one), and the old token for the account is retired there.
+  - the tunnels the machine runs in that account, each with its state, whether its tunnel token
+    is current, **logs**, **restart**, **rotate tunnel** (you type its name) and **paste tunnel
+    token** (checked to belong to that tunnel);
+  - every subdomain each tunnel serves, with where its DNS really points, plus promote and
+    failback for routes with a standby.
+
+  Tunnels that no fleet machine runs are listed after the machines. `#machine=<name>` links to a
+  card.
 
 ### On the tailnet
 
