@@ -64,6 +64,52 @@
   .askbox input:not([type=checkbox]) { font: inherit; padding: 4px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--card); color: var(--ink); min-width: 220px; margin-top: 8px; }
   .askbox label { display: inline-flex; align-items: center; gap: 4px; margin-right: 14px; white-space: nowrap; }
   .askresult { margin-top: 6px; white-space: pre-wrap; font-size: 13px; }
+
+  /* machine view — a type scale per level (machine > account > tunnel > subdomain) and an 8px
+     spacing grid; NN/g visual hierarchy, Carbon 2x grid */
+  .mcard { padding: 0; }
+  .mcard > summary { list-style: none; display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; padding: 16px; cursor: pointer; color: var(--ink); }
+  .mcard > summary::-webkit-details-marker { display: none; }
+  .mcard[open] > summary { border-bottom: 1px solid var(--line); }
+  .mbody { padding: 0 16px 16px; }
+  .chev { color: var(--mute); transition: transform .15s; display: inline-block; width: 12px; }
+  details[open] > summary .chev { transform: rotate(90deg); }
+  .mname { font-size: 18px; font-weight: 700; }
+  .msum { color: var(--mute); font-size: 13px; }
+  .acct { margin-top: 24px; }
+  .acct-h { display: flex; gap: 8px; align-items: baseline; font-size: 12px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--mute); padding-bottom: 8px; border-bottom: 1px solid var(--line); }
+  .acct-h .acct-name { text-transform: none; letter-spacing: 0; font-weight: 400; }
+  .tun { margin-top: 16px; }
+  .tun-h { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; }
+  .tname { font-weight: 600; font-size: 15px; }
+  .tun-acts { display: flex; gap: 4px; flex-wrap: wrap; margin-left: auto; }
+  .routes { table-layout: fixed; margin-top: 8px; }
+  .routes td { padding: 8px 8px 8px 0; }
+  .routes td:first-child { width: auto; }
+  .routes .svc { color: var(--mute); }
+  /* status: icon + text + color, never color alone (Carbon status indicators) */
+  .status { display: inline-flex; gap: 4px; align-items: baseline; font-size: 13px; white-space: nowrap; }
+  .status.ok { color: var(--up); } .status.bad { color: var(--down); } .status.warn { color: var(--warn); } .status.info { color: var(--mute); }
+  /* quiet buttons for routine actions; one visible emphasis level per row (Material 3, Atlassian) */
+  button.text { border-color: transparent; background: transparent; color: var(--accent); padding: 4px 8px; }
+  button.text:hover { border-color: var(--line); }
+  /* security actions kept apart from routine ones (NN/g proximity of consequential options, Primer danger zone) */
+  .dz { margin-top: 24px; border: 1px solid var(--line); border-radius: 8px; }
+  .dz > summary { list-style: none; padding: 8px 12px; color: var(--mute); font-size: 13px; }
+  .dz > summary::-webkit-details-marker { display: none; }
+  .dz-row { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; padding: 8px 12px; border-top: 1px solid var(--line); }
+  .dz-row .grow { flex: 1; min-width: 220px; }
+  time { white-space: nowrap; }
+  /* touch: 44pt targets (Apple HIG), 8dp apart (Material) */
+  @media (pointer: coarse) { button { min-height: 44px; padding: 8px 14px; } .tun-h, .toolbar, .dz-row { gap: 8px; } }
+  @media (max-width: 700px) {
+    header { position: static; padding: 12px; gap: 8px 12px; }
+    main { padding: 8px 12px 48px; }
+    .mcard > summary, .mbody { padding-left: 12px; padding-right: 12px; }
+    .routes { table-layout: auto; } .routes col { width: auto !important; } .routes .svc { display: none; }
+    .routes td:first-child { word-break: break-word; }
+    .tun-acts { width: 100%; margin-left: -8px; }
+  }
 </style>
 </head>
 <body>
@@ -131,9 +177,9 @@ async function loadAgent() {
     const v = await (await fetch("/api/agent")).json();
     const el = $("#events"); if (!el) return;
     const tick = v.last_tick;
-    $("#agent-meta").textContent = `agent v${v.version} on ${v.machine} · up since ${v.started_at}` +
-      (tick ? ` · last pass ${tick.at} (${tick.took_ms} ms)` : "") + (tick && tick.error ? ` · ✗ ${tick.error}` : "");
-    el.innerHTML = (v.events || []).map(e => `<div><span class="mute">${esc(e.at)}</span> ${esc(e.kind.padEnd(8))} ${esc(e.message)}</div>`).join("")
+    $("#agent-meta").innerHTML = `agent v${esc(v.version)} on ${esc(v.machine)} · running since ${ago(v.started_at)}` +
+      (tick ? ` · last sync ${ago(tick.at)} (${tick.took_ms} ms)` : "") + (tick && tick.error ? ` · ${st("bad", tick.error)}` : "");
+    el.innerHTML = (v.events || []).map(e => `<div><span class="mute">${ago(e.at)}</span> ${esc(e.kind.padEnd(8))} ${esc(e.message)}</div>`).join("")
       || `<div class="mute">nothing yet — the agent has had nothing to fix</div>`;
   } catch { }
 }
@@ -142,7 +188,7 @@ async function loadCfLog() {
   try {
     const v = await (await fetch("/api/cf-log?all=1")).json();
     const el = $("#cflog"); if (!el) return;
-    el.innerHTML = v.length ? v.map(r => `<div><span class="mute">${esc(r.at)}</span> ${r.ok ? "✓" : "✗"} ${esc(r.machine)} ${esc(r.method)} ${esc(r.path)}` +
+    el.innerHTML = v.length ? v.map(r => `<div><span class="mute">${ago(r.at)}</span> ${r.ok ? "✓" : "✗"} ${esc(r.machine)} ${esc(r.method)} ${esc(r.path)}` +
       `${r.undoes ? ` <span class="tag">undid ${esc(r.undoes)}</span>` : ""}${!r.ok ? ` <span class="tag">failed; nothing changed</span>` : r.undo ? "" : ` <span class="tag warn">not undoable</span>`} <span class="mute">${esc(r.id)}</span></div>`).join("")
       : `<div class="mute">No changes through <span class="mono">tunnels cf</span> yet.</div>`;
   } catch { }
@@ -152,7 +198,7 @@ async function loadPeers() {
   try {
     const v = await (await fetch("/api/peers")).json();
     v.forEach(p => { const el = document.querySelector(`[data-health="${CSS.escape(p.machine)}"]`);
-      if (el) el.textContent = p.health ? `v${p.health.version} · serial ${p.health.serial} · last pass ${p.health.last_tick ? p.health.last_tick.at : "—"}` : "not answering"; });
+      if (el) el.innerHTML = p.health ? `v${esc(p.health.version)} · synced ${ago(p.health.last_tick && p.health.last_tick.at)}` : st("bad", "not answering"); });
     $("#peers").innerHTML = v.map(p => {
       const h = p.health; const ok = !!h;
       const title = ok ? `v${h.version} · fleet serial ${h.serial ?? "—"}` : "not answering";
@@ -161,26 +207,40 @@ async function loadPeers() {
   } catch { }
 }
 
+/// "4 min ago", with the exact time on hover (Cloudscape timestamps).
+function ago(iso) {
+  if (!iso) return "—";
+  const t = Date.parse(iso); if (isNaN(t)) return esc(iso);
+  const s = Math.max(0, (Date.now() - t) / 1000);
+  const txt = s < 60 ? "just now" : s < 3600 ? `${Math.floor(s / 60)} min ago` : s < 86400 ? `${Math.floor(s / 3600)} h ago` : `${Math.floor(s / 86400)} d ago`;
+  return `<time datetime="${esc(iso)}" title="${esc(new Date(t).toLocaleString())}">${txt}</time>`;
+}
+
+/// A status as icon + text + color (never color alone).
+function st(kind, text, title) {
+  const icon = { ok: "✓", bad: "✗", warn: "▲", info: "·" }[kind] || "·";
+  return `<span class="status ${kind}"${title ? ` title="${esc(title)}"` : ""}>${icon} ${esc(text)}</span>`;
+}
+
+/// Only what needs attention: a working DNS record says nothing.
 function dnsTag(r) {
   switch (r.dns) {
-    case "ok": return `<span class="tag good">dns ok</span>`;
-    case "missing": return `<span class="tag bad">no dns</span>`;
-    case "elsewhere": return `<span class="tag warn">dns → ${esc(r.dns_target)}</span>`;
-    case "—": return "";
-    default: return `<span class="tag">dns ${esc(r.dns)}</span>`;
+    case "missing": return st("bad", "no DNS record");
+    case "elsewhere": return st("warn", `DNS points to ${r.dns_target}`);
+    default: return "";
   }
 }
 
 function roleTag(r) {
-  if (r.role === "primary") return r.active ? "" : `<span class="tag">primary (not active)</span>`;
-  if (r.role === "standby") return r.active ? `<span class="tag warn">standby · ACTIVE</span>` : `<span class="tag">standby</span>`;
-  return `<span class="tag warn">not in fleet</span>`;
+  if (r.role === "primary") return r.active ? "" : st("info", "traffic on standby");
+  if (r.role === "standby") return r.active ? st("warn", "serving from here (standby)") : `<span class="mute">standby</span>`;
+  return st("warn", "not in the fleet file");
 }
 
 function render() {
   const s = state;
-  $("#meta").textContent = `seen from ${s.machine} · fleet serial ${s.serial}` +
-    (s.updated_by ? ` · last changed by ${s.updated_by} at ${s.updated_at}` : "") + ` · v${s.version}`;
+  $("#meta").innerHTML = `seen from ${esc(s.machine)} · fleet serial ${s.serial}` +
+    (s.updated_by ? ` · changed ${ago(s.updated_at)} by ${esc(s.updated_by)}` : "") + ` · v${esc(s.version)}`;
 
   const standbyRoutes = new Map();
   s.tunnels.forEach(t => t.routes.forEach(r => { if (r.role === "standby") standbyRoutes.set(r.host, r); }));
@@ -220,7 +280,9 @@ function render() {
   }
   html += `</div>`;
 
-  html += `<h2>Machines</h2><div id="machinecards">${renderMachines()}</div>`;
+  html += `<div class="row" style="align-items:center;margin:28px 0 10px"><h2 style="margin:0">Machines</h2><span style="flex:1"></span>
+    <button class="text" data-mall="open">Expand all</button><button class="text" data-mall="close">Collapse all</button></div>
+    <div id="machinecards">${renderMachines()}</div>`;
   const known = new Set(s.machines.map(([n]) => n));
   const loose = s.tunnels.filter(t => !t.machine || !known.has(t.machine));
   if (loose.length) {
@@ -306,68 +368,117 @@ async function loadAccounts() {
 
 const curTag = x => x === true ? `<span class="tag good">current</span>` : x === false ? `<span class="tag bad">stale</span>` : "";
 
-/// One tunnel: its state and buttons, then every subdomain it serves.
+/// One tunnel: its state and its routine actions, then every subdomain it
+/// serves. Token rotation lives in the machine's "Tokens & rotation" section.
 function tunnelBlock(t, m, acct, admin) {
   const name = t.alias || t.cf_name;
-  const ai = acct ? accounts.indexOf(acct) : -1;
   const held = acct && m ? acct.tunnels.find(([h, c]) => h === m && c.alias === t.alias) : null;
-  const standbyRoutes = new Map();
-  state.tunnels.forEach(x => x.routes.forEach(r => { if (r.role === "standby") standbyRoutes.set(r.host, r); }));
-  const btns = admin && m && t.alias ? `
-    <button data-mlogs="${esc(m)}|${esc(t.alias)}">logs</button>
-    <button data-relay="${esc(m)}|tunnel-restart|${esc(t.alias)}">restart</button>
-    <button class="danger" data-rowtun="${ai}|${esc(m)}|${esc(t.alias)}">rotate tunnel</button>
-    <button data-rowcon="${ai}|${esc(m)}|${esc(t.alias)}|${esc(t.id)}">paste tunnel token</button>` : (m && t.alias ? `<button data-mlogs="${esc(m)}|${esc(t.alias)}">logs</button>` : "");
-  return `<div class="row" style="margin-top:10px">
-      <i class="dot ${esc(t.state)}"></i><b>${esc(name)}</b>
-      ${t.in_fleet ? "" : `<span class="tag bad">not in fleet · tokens still work</span>`}
-      <span class="mute">tunnel ${esc(t.id.slice(0, 8))}${t.alias && t.cf_name && t.cf_name !== t.alias ? ` · Cloudflare: ${esc(t.cf_name)}` : ""}</span>
-      ${curTag(held ? held[1].current : null)}
-      ${held && !held[1].token_file ? `<span class="tag warn">token in plist</span>` : ""}
-      <span class="mute">${t.state === "up" ? `${t.connectors}× ${esc(t.colos.join(", "))}` : esc(t.state)}</span>
-      <span style="flex:1"></span>${btns}</div>
-    ${t.routes.length ? `<table>${t.routes.map(r => {
-      const sb = r.role === "primary" ? standbyRoutes.get(r.host) : null;
-      const btn = !admin ? ""
-        : r.role === "primary" && sb && r.active ? `<button data-promote="${esc(r.host)}">promote standby</button>`
-        : r.role === "standby" && r.active ? `<button data-failback="${esc(r.host)}">fail back</button>` : "";
-      return `<tr><td><a href="https://${esc(r.host)}" target="_blank" rel="noopener">${esc(r.host)}</a></td>
-        <td class="mono">${esc(r.service)}</td>
-        <td>${roleTag(r)} ${dnsTag(r)} ${r.failover ? `<span class="tag">failover ${esc(r.failover)}</span>` : ""}</td>
-        <td style="text-align:right">${btn}</td></tr>`;
-    }).join("")}</table>` : `<div class="mute">no subdomains</div>`}`;
+  const standby = new Set(); state.tunnels.forEach(x => x.routes.forEach(r => { if (r.role === "standby") standby.add(r.host); }));
+  const canFailOver = t.routes.filter(r => r.role === "primary" && r.active && standby.has(r.host));
+  const canFailBack = t.routes.filter(r => r.role === "standby" && r.active);
+  const health = t.state === "up" ? st("ok", `Up · ${t.connectors} connection${t.connectors === 1 ? "" : "s"}`, t.colos.join(", ") + (t.versions.length ? ` · cloudflared ${t.versions.join(", ")}` : ""))
+    : t.state === "down" ? st("bad", "Down — no connections") : st("warn", t.state === "missing" ? "Missing in Cloudflare" : "Unknown");
+  const btns = !m || !t.alias ? "" : `<span class="tun-acts">
+    <button class="text" data-mlogs="${esc(m)}|${esc(t.alias)}">Logs</button>
+    ${admin ? `<button class="text" data-relay="${esc(m)}|tunnel-restart|${esc(t.alias)}">Restart</button>` : ""}
+    ${admin && canFailOver.length ? `<button class="text" data-failover="${esc(t.alias)}">Fail over to standby…</button>` : ""}
+    ${admin && canFailBack.length ? `<button class="text" data-failbackt="${esc(t.alias)}">Fail back…</button>` : ""}</span>`;
+  // where this tunnel's hostnames can fail over to, or which primary it stands in for
+  const pairs = [...new Set(state.tunnels.filter(x => x !== t).flatMap(x => x.routes
+    .filter(r => t.routes.some(q => q.host === r.host) && (canFailOver.length ? r.role === "standby" : r.role === "primary"))
+    .map(() => `${x.alias || x.cf_name}${x.machine ? ` on ${x.machine}` : ""}`)))];
+  const pairText = pairs.length ? `<span class="mute">${canFailOver.length || t.routes.every(r => r.role !== "standby") ? "standby" : "standby for"}: ${esc(pairs.join(", "))}</span>` : "";
+  return `<div class="tun"><div class="tun-h">
+      <span class="tname">${esc(name)}</span>${health}${pairText}
+      ${t.in_fleet ? "" : st("warn", "not in the fleet file — its tokens still work")}
+      ${held && held[1].current === false ? st("bad", "tunnel token out of date") : ""}
+      ${btns}</div>
+    ${t.routes.length ? `<table class="routes"><colgroup><col style="width:44%"><col style="width:26%"><col></colgroup>${t.routes.map(r => `<tr>
+        <td><a href="https://${esc(r.host)}" target="_blank" rel="noopener">${esc(r.host)}</a></td>
+        <td class="svc mono">${esc(r.service)}</td>
+        <td>${roleTag(r)} ${dnsTag(r)}</td></tr>`).join("")}</table>` : `<div class="mute">no subdomains</div>`}
+  </div>`;
 }
 
-/// A card per machine: for each Cloudflare account, the machine's API token
-/// for it, the tunnels it runs in it, and the subdomains each serves.
+let openMachines = null;   // names the person has open; null until the first draw decides
+const openDZ = new Set();
+
+/// What is wrong on a machine, as short phrases — what makes a card open itself.
+function machineIssues(m) {
+  const out = [];
+  for (const t of state.tunnels.filter(t => t.machine === m)) {
+    if (t.state !== "up") out.push(`${t.alias || t.cf_name} is ${t.state}`);
+    const dns = t.routes.filter(r => r.active && (r.dns === "missing" || r.dns === "elsewhere")).length;
+    if (dns) out.push(`${dns} DNS problem${dns > 1 ? "s" : ""}`);
+  }
+  for (const a of accounts) {
+    a.holders.filter(([h, t]) => h === m && !t.valid).forEach(() => out.push(`${a.alias || a.name} API token rejected`));
+    a.tunnels.filter(([h, c]) => h === m && c.current === false && !c.runs_elsewhere).forEach(([, c]) => out.push(`${c.alias || c.name} token out of date`));
+    const runsHere = state.tunnels.some(t => t.machine === m && t.account === (a.alias || a.name));
+    if (runsHere && !a.holders.some(([h, t]) => h === m && t.valid)) out.push(`no ${a.alias || a.name} API token`);
+  }
+  return out;
+}
+
+/// The machine's tokens, per account, with the actions that change them —
+/// kept apart from the routine tunnel actions above.
+function tokensSection(m, aliases, acctOf) {
+  const rows = aliases.map(alias => {
+    const acct = acctOf(alias); if (!acct) return "";
+    const ai = accounts.indexOf(acct);
+    const toks = acct.holders.filter(([h]) => h === m).map(([, t]) => t);
+    const tuns = state.tunnels.filter(t => t.machine === m && t.account === alias && t.alias);
+    const copies = acct.tunnels.filter(([h, c]) => h === m && c.runs_elsewhere).map(([, c]) => c);
+    const tokText = toks.length ? toks.map(t => `<span class="mono">${esc(t.hint)}</span> ${t.valid ? st("ok", "works") : st("bad", "rejected by Cloudflare")}`).join(" · ") : st("info", "none on this machine");
+    return `<div class="dz-row"><div class="grow"><b>${esc(alias)}</b> API token · ${tokText}</div>
+        <button data-rowapi="${ai}|${esc(m)}">${toks.length ? "Rotate API token…" : "Add API token…"}</button></div>`
+      + tuns.map(t => {
+          const c = acct.tunnels.find(([h, x]) => h === m && x.alias === t.alias);
+          const inPlist = c && !c[1].token_file;
+          return `<div class="dz-row"><div class="grow"><b>${esc(t.alias)}</b> tunnel token ·
+              ${c ? (c[1].current === false ? st("bad", "out of date") : c[1].current ? st("ok", "current") : st("info", "can't check here")) : st("info", "checking")}
+              ${inPlist ? `<span class="mute" title="The token is written inside this tunnel's launch file; the next restart moves it to a locked token file.">· kept in the launch file</span>` : ""}</div>
+            <button data-rowcon="${ai}|${esc(m)}|${esc(t.alias)}|${esc(t.id)}">Paste new tunnel token…</button>
+            <button class="danger" data-rowtun="${ai}|${esc(m)}|${esc(t.alias)}">Rotate tunnel…</button></div>`;
+        }).join("")
+      + copies.map(c => `<div class="dz-row"><div class="grow mute">${esc(c.alias || c.name)} — a copy of its tunnel token is stored here; it runs on ${esc(c.runs_elsewhere)}</div></div>`).join("");
+  }).join("");
+  return `<details class="dz" data-dz="${esc(m)}"${openDZ.has(m) ? " open" : ""}><summary><span class="chev">›</span> Tokens &amp; rotation</summary>
+    ${accounts.length ? rows : `<div class="dz-row mute">${accountsError ? esc(accountsError) : "checking tokens on every machine…"}</div>`}</details>`;
+}
+
+/// A card per machine, collapsed to a summary line when all is well
+/// (NN/g accordions: open the ones with problems, keep the rest one line).
 function renderMachines() {
   const s = state; if (!s) return "";
   const aliases = [...new Set([...accounts.map(a => a.alias || a.name), ...s.tunnels.filter(t => t.in_fleet).map(t => t.account)])].sort();
   const acctOf = alias => accounts.find(a => (a.alias || a.name) === alias) || null;
+  const issuesBy = Object.fromEntries(s.machines.map(([m]) => [m, machineIssues(m)]));
+  if (openMachines === null) {
+    const hash = (location.hash.match(/^#(?:machine|tokens)=(.+)$/) || [])[1];
+    openMachines = new Set(s.machines.map(([m]) => m).filter(m => issuesBy[m].length || (hash && decodeURIComponent(hash) === m)));
+  }
   return s.machines.map(([m, host]) => {
+    const tuns = s.tunnels.filter(t => t.machine === m);
+    const subs = tuns.reduce((n, t) => n + t.routes.length, 0);
+    const issues = issuesBy[m];
+    const summary = `${tuns.length} tunnel${tuns.length === 1 ? "" : "s"} · ${subs} subdomain${subs === 1 ? "" : "s"} · ` +
+      (issues.length ? st(issues.some(x => /down|rejected|out of date|missing/.test(x)) ? "bad" : "warn", issues.join(", ")) : st("ok", "all healthy"));
     const blocks = aliases.map(alias => {
-      const acct = acctOf(alias), ai = acct ? accounts.indexOf(acct) : -1;
-      const tuns = s.tunnels.filter(t => t.machine === m && t.account === alias);
-      const toks = acct ? acct.holders.filter(([h]) => h === m).map(([, t]) => t) : [];
-      const copies = acct ? acct.tunnels.filter(([h, c]) => h === m && c.runs_elsewhere).map(([, c]) => c) : [];
-      if (!tuns.length && !toks.length && !copies.length && !me.admin) return "";
-      const tokLine = !acct
-        ? `<span class="mute">${accountsError ? "tokens: " + esc(accountsError) : "checking tokens…"}</span>`
-        : toks.length ? toks.map(t => `API token <span class="mono">${esc(t.hint)}</span> ${t.valid ? `<span class="tag good">works</span>` : `<span class="tag bad">rejected by Cloudflare</span>`}`).join(" · ")
-        : `<span class="mute">no API token for ${esc(alias)} here</span>`;
-      const tokBtn = me.admin && acct ? `<button data-rowapi="${ai}|${esc(m)}">${toks.length ? "rotate API token" : "add API token"}</button>` : "";
-      return `<div style="border-top:1px solid var(--line);margin-top:10px;padding-top:8px">
-        <div class="row"><b>${esc(alias)}</b><span class="mute">${esc(acct ? acct.name : "")}</span><span style="flex:1"></span>${tokLine} ${tokBtn}</div>
-        ${tuns.map(t => tunnelBlock(t, m, acct, me.admin)).join("")}
-        ${copies.map(c => `<div class="mute" style="margin-top:6px">${esc(c.alias || c.name)} <span class="tag warn">a copy of its token is here — it runs on ${esc(c.runs_elsewhere)}</span></div>`).join("")}
-        ${!tuns.length && !copies.length ? `<div class="mute" style="margin-top:4px">no tunnels in ${esc(alias)} on this machine</div>` : ""}
-      </div>`;
+      const acct = acctOf(alias);
+      const here = tuns.filter(t => t.account === alias);
+      if (!here.length) return "";
+      return `<div class="acct"><div class="acct-h">${esc(alias)} <span class="acct-name">${esc(acct ? acct.name : "")}</span></div>
+        ${here.map(t => tunnelBlock(t, m, acct, me.admin)).join("")}</div>`;
     }).join("");
-    return `<div class="card" id="m-${esc(m)}">
-      <div class="row"><span class="alias">${esc(m)}</span><span class="mute">${esc(host)}</span><span class="mute" data-health="${esc(m)}"></span>
-        <span style="flex:1"></span>${me.admin ? `<button data-relay="${esc(m)}|agent-pass|">agent pass</button>` : ""}</div>
-      ${blocks}</div>`;
-  }).join("") + (me.admin ? `<div class="toolbar" style="margin-bottom:10px"><button data-acctreload="1">re-check tokens</button></div>` : "");
+    return `<details class="card mcard" id="m-${esc(m)}" data-m="${esc(m)}"${openMachines.has(m) ? " open" : ""}>
+      <summary><span class="chev">›</span><span class="mname">${esc(m)}</span><span class="msum">${summary}</span>
+        <span style="flex:1"></span><span class="msum" data-health="${esc(m)}"></span>
+        ${me.admin ? `<button class="text" data-relay="${esc(m)}|agent-pass|">Sync now</button>` : ""}</summary>
+      <div class="mbody">${blocks || `<div class="mute" style="margin-top:16px">no tunnels on this machine</div>`}
+        ${me.admin ? tokensSection(m, aliases, acctOf) : ""}</div>
+    </details>`;
+  }).join("") + (me.admin ? `<div class="toolbar" style="margin-bottom:10px"><button class="text" data-acctreload="1">Re-check tokens</button></div>` : "");
 }
 
 /// The tunnel id inside a connector token (base64 JSON with "t"), or "".
@@ -382,11 +493,48 @@ function symbol(a) {
   return "−";
 }
 
+// remember which machine cards and token sections are open, across redraws
+document.addEventListener("toggle", e => {
+  const d = e.target;
+  if (d.matches && d.matches("details.mcard") && openMachines) d.open ? openMachines.add(d.dataset.m) : openMachines.delete(d.dataset.m);
+  if (d.matches && d.matches("details.dz")) d.open ? openDZ.add(d.dataset.dz) : openDZ.delete(d.dataset.dz);
+}, true);
+
 document.addEventListener("click", async e => {
   const b = e.target.closest("button"); if (!b) return;
+  if (b.closest("summary")) {   // a button in a card's header must not fold the card, and its panel must be visible
+    e.preventDefault();
+    const d = b.closest("details"); if (d && !d.open) d.open = true;
+  }
   if (b.id === "refresh") return load(true);
   if (b.id === "logclose") { $("#logbox").style.display = "none"; return; }
   if (b.dataset.acctreload) return loadAccounts();
+  if (b.dataset.mall) {
+    const open = b.dataset.mall === "open";
+    document.querySelectorAll("details.mcard").forEach(d => { d.open = open; });
+    openMachines = new Set(open ? state.machines.map(([m]) => m) : []);
+    return;
+  }
+  if (b.dataset.failover || b.dataset.failbackt) {
+    const alias = b.dataset.failover || b.dataset.failbackt, over = !!b.dataset.failover;
+    const t = state.tunnels.find(x => x.alias === alias);
+    const standby = new Set(); state.tunnels.forEach(x => x.routes.forEach(r => { if (r.role === "standby") standby.add(r.host); }));
+    const hosts = over ? t.routes.filter(r => r.role === "primary" && r.active && standby.has(r.host)).map(r => r.host)
+                       : t.routes.filter(r => r.role === "standby" && r.active).map(r => r.host);
+    return ask(b, { danger: true, label: over ? "Fail over the ticked ones" : "Fail back the ticked ones",
+      text: over ? `<b>Send traffic for these subdomains to their standby.</b> DNS moves; ${esc(alias)} keeps running.`
+                 : `<b>Send traffic for these subdomains back to their primary.</b>`,
+      fields: `<div style="margin-top:8px">${hosts.map(h => `<label><input type="checkbox" class="fohost" value="${esc(h)}" checked>${esc(h)}</label>`).join("")}</div>`,
+      valid: box => box.querySelectorAll(".fohost:checked").length > 0,
+      go: async box => {
+        const out = [];
+        for (const h of [...box.querySelectorAll(".fohost:checked")].map(x => x.value)) {
+          try { await post(over ? "/api/promote" : "/api/failback", { host: h }); out.push(`✓ ${h}`); }
+          catch (err) { out.push(`✗ ${h}: ${err.message}`); }
+        }
+        return out.join("\n");
+      }, after: () => load(true) });
+  }
   if (b.dataset.rowapi) {
     const [ai, m] = b.dataset.rowapi.split("|"); const a = accounts[+ai]; if (!a) return toast("still checking tokens — try again in a moment");
     const name = a.alias || a.name;
@@ -440,9 +588,9 @@ document.addEventListener("click", async e => {
     const [machine, action, tunnel] = b.dataset.relay.split("|");
     const hosts = action === "tunnel-restart" ? servedBy(tunnel) : [];
     return ask(b, {
-      label: action === "agent-pass" ? `run it on ${machine}` : `restart ${tunnel}`,
+      label: action === "agent-pass" ? `Sync ${machine} now` : `Restart ${tunnel}`,
       text: action === "agent-pass"
-        ? `Run an agent pass on <b>${esc(machine)}</b> now: it syncs the fleet file, repairs what drifted, and restarts what is down.`
+        ? `Sync <b>${esc(machine)}</b> now: its agent takes the newest fleet file, repairs anything that drifted, and restarts whatever is down. Normally this happens every two minutes on its own.`
         : `Restart <b>${esc(tunnel)}</b> on <b>${esc(machine)}</b>${hosts.length ? ` — a few seconds of downtime for <b>${esc(hosts.join(", "))}</b>` : ""}.`,
       go: () => relayMsg(machine, action, tunnel), after: () => { load(true); loadAccounts(); } });
   }
