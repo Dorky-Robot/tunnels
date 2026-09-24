@@ -1677,7 +1677,7 @@ fn token_cmd(cmd: TokenCmd, json: bool) -> Result<i32> {
             let mut c = ctx()?;
             announce("forget an API token here");
             let covers = c.config.remove_api_token(index)?;
-            println!("✓ forgot token {index}{} (it still works in Cloudflare — revoke it at dash.cloudflare.com/profile/api-tokens)", if covers.is_empty() { String::new() } else { format!(" — {covers}") });
+            println!("✓ forgot token {index}{} (only here: if Cloudflare still accepts it, revoke it at dash.cloudflare.com/profile/api-tokens)", if covers.is_empty() { String::new() } else { format!(" — {covers}") });
             Ok(0)
         }
     }
