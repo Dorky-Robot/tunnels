@@ -51,6 +51,7 @@ Create tokens at [dash.cloudflare.com/profile/api-tokens](https://dash.cloudflar
 
 ```bash
 tunnels token add <api-token>     # once per Cloudflare account; shows what the token can reach
+tunnels token refresh             # re-check and relabel every token on this Mac
 ```
 
 ## Getting started
@@ -208,6 +209,10 @@ tunnels cf undo <id> --yes       # put it back
   it needs `--not-undoable`; token changes need `--i-mean-tokens`.
 - **What `tunnels` owns is refused.** Tunnel ingress, tunnel tokens and tunnel CNAMEs go through
   `tunnels route` and `tunnels tunnel`, so the fleet file stays the truth.
+- **Any machine can use the mesh's tokens.** If this Mac has no token for the account, the call
+  goes over the tailnet to a peer's agent that has one. The token never leaves that machine; the
+  peer makes the call with the same guardrails and logs it, recording who asked. The fleet
+  file's `policy.remote_from` lists which machines may do this (unset means all of them).
 - **The web UI shows every machine's `cf` log** in one timeline.
 - **A 403 says which permission is missing.** The Tunnel and DNS permissions `tunnels` needs don't
   cover zone settings or Access.

@@ -109,6 +109,12 @@ Any machine in the fleet. It is a mesh: no machine is special, and each
 writes with the API tokens it holds. A machine without a token for an
 account simply cannot write there, and the error says which token to add.
 
+Built in 0.18.0: a machine with no token for an account sends the call to a
+peer's agent over the tailnet (`/api/cf-forward`). The token stays where it
+is, and the peer makes the call with the same guardrails and logs it with
+`requested_by`. `policy.remote_from` in the fleet file lists which machines
+may ask; the fleet sets it to every machine except doug-mini.
+
 ### Picking the token
 
 The account comes from the path (`{account:…}`, or the account that owns

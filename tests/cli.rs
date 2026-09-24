@@ -400,3 +400,68 @@ fn cf_token_changes_need_their_own_flag() {
     assert!(out.stdout.contains("--i-mean-tokens"), "{}", out.stdout);
     assert!(s.world().writes().is_empty());
 }
+
+#[test]
+fn token_refresh_labels_what_a_bare_token_reaches() {
+    let s = sandbox();
+    let out = s.run(&["token", "refresh"]);
+    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    assert!(out.stdout.contains("everyday.vet") && out.stdout.contains("felixflor.es"), "{}", out.stdout);
+    let covers = s.config()["cf_api_tokens"][0]["covers"].as_str().unwrap().to_string();
+    assert!(covers.contains("Vet account"), "{covers}");
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+/// Two machines on one fake Cloudflare: `b` holds the token and runs its
+/// agent; `a` holds none.
+fn two_machines(remote_from: Option<&str>) -> (Sandbox, Sandbox, std::process::Child) {
+    let port = free_port();
+    let fleet = FLEET
+        .replace("web_port = 9", &format!("web_port = {port}{}", remote_from.map(|r| format!("\nremote_from = {r}")).unwrap_or_default()))
+        .replace("[machines.dr1]", "[machines.a]\nhost = \"127.0.0.1\"\n[machines.dr1]");
+    let b = sandbox();
+    b.write_fleet(&fleet);
+    let mut agent_b = b.command(&["agent", "run"]);
+    agent_b.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    let child = agent_b.spawn().unwrap();
+    let a = Sandbox::new(World::default(), "a");
+    // a's fake Cloudflare is b's: the same world, seen without a token
+    let a = Sandbox { fake: Fake { world: b.fake.world.clone(), url: b.fake.url.clone() }, ..a };
+    a.write_config(json!({ "tunnels": [] }));
+    a.write_fleet(&fleet);
+    for _ in 0..50 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    (a, b, child)
+}
+
+#[test]
+fn cf_without_a_token_goes_through_a_peer_that_has_one() {
+    let (a, b, mut child) = two_machines(None);
+    let out = a.run(&["cf", "patch", "/zones/{zone:everyday.vet}/settings/ssl", "--data", r#"{"value":"strict"}"#, "--yes"]);
+    let _ = child.kill();
+    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    assert!(out.stderr.contains("made by dr1") || out.stderr.contains("made by dr2"), "says who made it: {}", out.stderr);
+    assert_eq!(b.world().ssl.get("z-vet").map(String::as_str), Some("strict"));
+    // logged on the machine that made it, saying who asked
+    let log = std::fs::read_dir(b.path("config/cf-log")).unwrap().next().unwrap().unwrap().path();
+    let rec: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(log).unwrap()).unwrap();
+    assert_eq!(rec["requested_by"], "a");
+    assert!(!a.path("config/cf-log").exists(), "nothing logged on the machine that only asked");
+}
+
+#[test]
+fn a_machine_off_the_allowlist_cannot_use_a_peers_token() {
+    let (a, b, mut child) = two_machines(Some(r#"["dr1", "dr2"]"#));
+    let out = a.run(&["cf", "patch", "/zones/{zone:everyday.vet}/settings/ssl", "--data", r#"{"value":"strict"}"#, "--yes"]);
+    let _ = child.kill();
+    assert_ne!(out.code, 0);
+    assert!(out.stderr.contains("not on policy.remote_from"), "{}", out.stderr);
+    assert!(b.world().ssl.get("z-vet").is_none(), "nothing changed");
+}

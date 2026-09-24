@@ -25,6 +25,24 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+/// "This machine cannot see that" — no token here reaches the account or zone.
+/// The one kind of failure worth asking a peer about; any other error (an
+/// ambiguous name, a typo) is the caller's to fix and is reported as is.
+#[derive(Debug)]
+pub struct NotHere(pub String);
+
+impl std::fmt::Display for NotHere {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotHere {}
+
+fn not_here(msg: String) -> anyhow::Error {
+    anyhow::Error::new(NotHere(msg))
+}
+
 /// Accounts, zones and which token reaches each, without listing tunnels,
 /// ingress or DNS — the few calls needed to resolve names and pick a token.
 pub fn directory(config: &Config) -> Snapshot {
@@ -103,10 +121,10 @@ fn resolve_zone(name: &str, dir: &Snapshot) -> Result<String> {
         .find(|z| z.name.eq_ignore_ascii_case(name))
         .map(|z| z.id.clone())
         .ok_or_else(|| {
-            anyhow!(
+            not_here(format!(
                 "no zone `{name}` reachable from this machine — it can see {}",
                 dir.zones.iter().map(|z| z.name.clone()).collect::<Vec<_>>().join(", ")
-            )
+            ))
         })
 }
 
@@ -126,7 +144,7 @@ fn resolve_tunnel(name: &str, fleet: &Fleet, dir: &Snapshot) -> Result<String> {
     }
     match hits.as_slice() {
         [(id, _)] => Ok(id.clone()),
-        [] => bail!("no tunnel `{name}` in the fleet or in any account this machine reaches"),
+        [] => Err(not_here(format!("no tunnel `{name}` in the fleet or in any account this machine reaches"))),
         _ => bail!(
             "`{name}` names {} tunnels — use a fleet alias or an id:\n  {}",
             hits.len(),
@@ -136,8 +154,8 @@ fn resolve_tunnel(name: &str, fleet: &Fleet, dir: &Snapshot) -> Result<String> {
 }
 
 fn resolve_record(host: &str, dir: &Snapshot) -> Result<String> {
-    let zone = dir.zone_for_host(host).ok_or_else(|| anyhow!("no zone reachable from here contains {host}"))?;
-    let client = dir.client_for_zone(&zone.id).ok_or_else(|| anyhow!("no token here reaches {}", zone.name))?;
+    let zone = dir.zone_for_host(host).ok_or_else(|| not_here(format!("no zone reachable from here contains {host}")))?;
+    let client = dir.client_for_zone(&zone.id).ok_or_else(|| not_here(format!("no token here reaches {}", zone.name)))?;
     let recs = client.dns_records_named(&zone.id, host).map_err(|e| anyhow!("looking up {host}: {e}"))?;
     match recs.as_slice() {
         [r] => Ok(r.id.clone()),
@@ -170,16 +188,16 @@ pub fn client_for(r: &Resolved, account_flag: Option<&str>, fleet: &Fleet, dir: 
     };
     match acct {
         Some(a) => dir.client_for_account(&a).ok_or_else(|| {
-            anyhow!(
+            not_here(format!(
                 "no API token on this machine reaches account {a}{} — `tunnels token add` one with the permission this call needs",
                 fleet.account_alias_for_id(&a).map(|x| format!(" ({x})")).unwrap_or_default()
-            )
+            ))
         }),
         None => {
             let toks = config.all_cf_api_tokens();
             match toks.as_slice() {
                 [t] => Ok(Client::new(t)),
-                [] => bail!("no API token on this machine — `tunnels token add`"),
+                [] => Err(not_here("no API token on this machine — `tunnels token add`".into())),
                 _ => bail!("this path names no account and there are {} tokens here — say which with --account <alias>", toks.len()),
             }
         }
@@ -310,10 +328,16 @@ pub struct Record {
     /// this record undid another
     #[serde(skip_serializing_if = "Option::is_none")]
     pub undoes: Option<String>,
+    /// the machine that asked for this change, when it was made on its behalf
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_by: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Outcome {
+    /// the machine that made the call, when this one had no token for it
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
     pub method: String,
     pub path: String,
     pub resolved_path: String,
@@ -384,6 +408,7 @@ pub fn plan_undo(method: &str, path: &str, body: Option<&Value>, before: Option<
     }
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Call<'a> {
     pub method: &'a str,
     pub path: &'a str,
@@ -393,6 +418,32 @@ pub struct Call<'a> {
     pub i_mean_tokens: bool,
     pub not_undoable: bool,
     pub undoes: Option<String>,
+    /// may this call go to a peer that holds the token, if this machine has none
+    #[serde(default)]
+    pub forward: bool,
+    /// set on the peer: the machine this call is made for
+    #[serde(default)]
+    pub requested_by: Option<String>,
+}
+
+/// Can this machine make this call itself? `Ok(true)` yes; `Ok(false)` only
+/// because no token here reaches it (a peer might); `Err` for anything a peer
+/// could not fix either.
+pub fn local_check(path: &str, account: Option<&str>, fleet: &Fleet, dir: &Snapshot, config: &Config) -> Result<bool> {
+    let r = match resolve(path, fleet, dir) {
+        Ok(r) => r,
+        Err(e) if e.downcast_ref::<NotHere>().is_some() => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    match client_for(&r, account, fleet, dir, config) {
+        Ok(_) => Ok(true),
+        Err(e) if e.downcast_ref::<NotHere>().is_some() => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+pub fn can_handle(path: &str, account: Option<&str>, fleet: &Fleet, dir: &Snapshot, config: &Config) -> bool {
+    matches!(local_check(path, account, fleet, dir, config), Ok(true))
 }
 
 /// Do one call: resolve, guard, record the before state, send (if allowed),
@@ -400,10 +451,15 @@ pub struct Call<'a> {
 pub fn call(c: Call, config: &Config, fleet: &Fleet, me: &str) -> Result<Outcome> {
     let method = c.method.to_ascii_uppercase();
     let dir = directory(config);
+    // a machine without the token asks a peer that has it; the token never moves
+    if c.forward && !local_check(c.path, c.account, fleet, &dir, config)? {
+        return forward(&c, fleet, me);
+    }
     let r = resolve(c.path, fleet, &dir)?;
     let token_path = is_token_path(&r.path);
     let conn_path = is_connector_token_path(&r.path);
     let mut out = Outcome {
+        via: None,
         method: method.clone(),
         path: c.path.to_string(),
         resolved_path: r.path.clone(),
@@ -505,6 +561,7 @@ pub fn call(c: Call, config: &Config, fleet: &Fleet, me: &str) -> Result<Outcome
         after: out.after.clone(),
         undo: out.undo.clone(),
         undoes: c.undoes.clone(),
+        requested_by: c.requested_by.clone(),
     };
     save(&rec)?;
     out.log_id = Some(rec.id);
@@ -535,6 +592,48 @@ pub fn permission_hint(path: &str) -> String {
     };
     format!(
         "the API token this machine uses for that account lacks {perm}. Add it at dash.cloudflare.com/profile/api-tokens (edit the token, or add a second one with `tunnels token add`)"
+    )
+}
+
+/// Send the call to the first peer that can make it. Each peer checks that
+/// the caller is who it says (by tailnet address) and on the fleet's
+/// `policy.remote_from` list, makes the call with its own token, and logs it.
+fn forward(c: &Call, fleet: &Fleet, me: &str) -> Result<Outcome> {
+    let port = fleet.policy.web_port;
+    let mut body = serde_json::to_value(c)?;
+    body["forward"] = Value::Bool(false);
+    body["requested_by"] = Value::String(me.to_string());
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(40)))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut refusals = Vec::new();
+    for (name, m) in fleet.machines.iter().filter(|(n, _)| n.as_str() != me) {
+        let Ok(mut resp) = agent
+            .post(&format!("http://{}:{port}/api/cf-forward", m.host))
+            .header("X-Tunnels", "1")
+            .send_json(&body)
+        else {
+            refusals.push(format!("{name}: not answering"));
+            continue;
+        };
+        let status = resp.status().as_u16();
+        let v: Value = resp.body_mut().read_json().unwrap_or(Value::Null);
+        match status {
+            200 => {
+                let mut out: Outcome = serde_json::from_value(v)?;
+                out.via = Some(name.clone());
+                return Ok(out);
+            }
+            409 => refusals.push(format!("{name}: no token for it")),
+            403 => refusals.push(format!("{name}: {}", v["error"].as_str().unwrap_or("refused"))),
+            _ => bail!("{name} could not make the call: {}", v["error"].as_str().unwrap_or("unknown error")),
+        }
+    }
+    bail!(
+        "no token on this machine reaches that account, and no peer could make the call for it:\n  {}",
+        refusals.join("\n  ")
     )
 }
 

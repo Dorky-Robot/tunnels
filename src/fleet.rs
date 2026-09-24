@@ -55,6 +55,10 @@ pub struct Policy {
     /// not declare. Off, those show up in `plan` and wait for a person.
     #[serde(default)]
     pub prune: bool,
+    /// machines allowed to make `tunnels cf` calls through another machine's
+    /// tokens; unset means every fleet machine
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_from: Option<Vec<String>>,
 }
 
 fn default_interval() -> u64 {
@@ -75,6 +79,7 @@ impl Default for Policy {
             failover_after: default_failover_after(),
             web_port: default_web_port(),
             prune: false,
+            remote_from: None,
         }
     }
 }
@@ -329,6 +334,11 @@ impl Fleet {
                 if !self.machines.contains_key(m) {
                     out.push(format!("tunnel `{alias}`: no machine called `{m}`"));
                 }
+            }
+        }
+        for m in self.policy.remote_from.iter().flatten() {
+            if !self.machines.contains_key(m) {
+                out.push(format!("policy.remote_from: no machine called `{m}`"));
             }
         }
         let mut hosts: BTreeMap<String, ()> = BTreeMap::new();

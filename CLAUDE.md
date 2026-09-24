@@ -56,7 +56,10 @@ the visual interface.
   `{account|zone|tunnel|record:name}` placeholders, picks the token, hides secrets in
   responses, and refuses writes to what `tunnels` owns (cfd_tunnel, tunnel CNAMEs).
   Writes are previews until `--yes`; each is logged to `cf-log/` with before, after and an
-  undo request. Plan: `docs/agent-operations.md`.
+  undo request. When no token here reaches the account (the `NotHere` error, and only that),
+  the call is forwarded to a peer agent's `/api/cf-forward`. The peer checks the caller is on
+  `policy.remote_from` and that the request comes from its tailnet address, then makes the call
+  and logs it with `requested_by`. Plan: `docs/agent-operations.md`.
 - **main.rs**: the clap CLI. The `SCOPES` table is the single source of truth for scopes, and
   tests hold every command's help text to it.
 

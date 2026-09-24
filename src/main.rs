@@ -289,6 +289,8 @@ enum TokenCmd {
     /// [this Mac only] Forget an API token, by its number in `token list`
     #[command(alias = "remove")]
     Rm { index: usize },
+    /// [this Mac; reads cloudflare] Find out again what each API token here reaches, and label it
+    Refresh,
 }
 
 #[derive(Args, Clone)]
@@ -398,6 +400,7 @@ const SCOPES: &[(&str, Scope)] = &[
     ("token add", Scope::LocalReadsCloudflare),
     ("token list", Scope::Local),
     ("token rm", Scope::Local),
+    ("token refresh", Scope::LocalReadsCloudflare),
     ("agent run", Scope::LocalAndCloudflare),
     ("agent once", Scope::LocalAndCloudflare),
     ("agent install", Scope::Local),
@@ -474,6 +477,7 @@ fn cmd_path(cmd: &Cmd) -> String {
                 TokenCmd::Add { .. } => "add",
                 TokenCmd::List => "list",
                 TokenCmd::Rm { .. } => "rm",
+                TokenCmd::Refresh => "refresh",
             }
         ),
         Cmd::Agent(a) => format!(
@@ -768,7 +772,25 @@ fn apply_hosts(c: &mut Ctx, hosts: &[String], yes: bool, prune: bool, json: bool
     let p = plan::plan(&fleet, &snap, None);
     let opts = Options { yes, prune, only_hosts: Some(hosts.to_vec()), no_local: true, ..Default::default() };
     let r = apply::apply(&p, &snap, &mut c.config, &opts);
-    let code = print_report(&r, json)?;
+    // a host whose account this Mac cannot reach is not "nothing to do": the
+    // agent that owns it does it, and was told a moment ago
+    let elsewhere: Vec<(String, String)> = hosts
+        .iter()
+        .filter_map(|h| {
+            let route = fleet.find_route(h)?;
+            let t = fleet.tunnels.get(route.active_tunnel())?;
+            let acct = fleet.accounts.get(&t.account)?;
+            let zone_acct = fleet.account_for_host(h).map(|(_, a)| a.id.clone())?;
+            let blind = snap.client_for_account(&acct.id).is_none() || snap.client_for_account(&zone_acct).is_none();
+            blind.then(|| (h.clone(), t.machine.clone().unwrap_or_else(|| "its machine".into())))
+        })
+        .collect();
+    if !json {
+        for (h, owner) in &elsewhere {
+            println!("  → this Mac has no token for {h}'s account; the agent on {owner} carries it out (told just now) — `tunnels route list` shows when it lands");
+        }
+    }
+    let code = if elsewhere.len() == hosts.len() && r.failed() == 0 { 0 } else { print_report(&r, json)? };
     if !json && r.held.iter().any(|(_, w)| w.contains("--yes")) {
         println!("\n  rerun with --yes to take it over — or pick another hostname");
     }
@@ -1701,27 +1723,36 @@ fn rotate_cmd(key: &str, json: bool) -> Result<i32> {
 
 fn token_cmd(cmd: TokenCmd, json: bool) -> Result<i32> {
     match cmd {
+        TokenCmd::Refresh => {
+            let mut c = ctx()?;
+            announce("relabel the API tokens here");
+            let tokens: Vec<String> = c.config.api_tokens().iter().map(|t| t.token.clone()).collect();
+            let mut rows = Vec::new();
+            for (i, t) in tokens.iter().enumerate() {
+                match reach_of(t) {
+                    Ok((covers, reach)) => {
+                        c.config.add_api_token(t.clone(), covers.clone(), reach)?;
+                        rows.push(serde_json::json!({ "index": i, "valid": true, "covers": covers }));
+                        if !json {
+                            println!("  {i}. {covers}");
+                        }
+                    }
+                    Err(e) => {
+                        rows.push(serde_json::json!({ "index": i, "valid": false, "error": format!("{e:#}") }));
+                        if !json {
+                            println!("  {i}. ✗ {e:#} — `tunnels token rm {i}` if it is dead");
+                        }
+                    }
+                }
+            }
+            if json {
+                print_json(&serde_json::json!({ "scope": Scope::LocalReadsCloudflare, "tokens": rows }))?;
+            }
+            Ok(0)
+        }
         TokenCmd::Add { token } => {
             let mut c = ctx()?;
-            let client = cf::Client::new(&token);
-            client.verify().context("Cloudflare does not accept this token")?;
-            let zones = client.zones().unwrap_or_default();
-            let mut reach: Vec<config::Reach> = Vec::new();
-            for z in &zones {
-                match reach.iter_mut().find(|r| r.account_id == z.account_id) {
-                    Some(r) => r.zones.push(z.name.clone()),
-                    None => reach.push(config::Reach { account_id: z.account_id.clone(), account_name: z.account_name.clone(), zones: vec![z.name.clone()] }),
-                }
-            }
-            for a in client.accounts().unwrap_or_default() {
-                if !reach.iter().any(|r| r.account_id == a.id) {
-                    reach.push(config::Reach { account_id: a.id, account_name: a.name, zones: vec![] });
-                }
-            }
-            if reach.is_empty() {
-                bail!("this token reaches no account and no zone — wrong Cloudflare account, or missing permissions");
-            }
-            let covers = reach.iter().map(|r| format!("{} ({})", r.account_name, r.zones.join(", "))).collect::<Vec<_>>().join(" · ");
+            let (covers, reach) = reach_of(&token)?;
             announce("keep an API token here");
             c.config.add_api_token(token, covers.clone(), reach)?;
             if json {
@@ -1763,6 +1794,34 @@ fn token_cmd(cmd: TokenCmd, json: bool) -> Result<i32> {
             Ok(0)
         }
     }
+}
+
+/// What a token reaches: its accounts, and the zones in each, as a label and
+/// as structure.
+fn reach_of(token: &str) -> Result<(String, Vec<config::Reach>)> {
+    let client = cf::Client::new(token);
+    client.verify().context("Cloudflare does not accept this token")?;
+    let zones = client.zones().unwrap_or_default();
+    let mut reach: Vec<config::Reach> = Vec::new();
+    for z in &zones {
+        match reach.iter_mut().find(|r| r.account_id == z.account_id) {
+            Some(r) => r.zones.push(z.name.clone()),
+            None => reach.push(config::Reach { account_id: z.account_id.clone(), account_name: z.account_name.clone(), zones: vec![z.name.clone()] }),
+        }
+    }
+    for a in client.accounts().unwrap_or_default() {
+        if !reach.iter().any(|r| r.account_id == a.id) {
+            reach.push(config::Reach { account_id: a.id, account_name: a.name, zones: vec![] });
+        }
+    }
+    if reach.is_empty() {
+        bail!("this token reaches no account and no zone — wrong Cloudflare account, or missing permissions");
+    }
+    for r in &mut reach {
+        r.zones.sort();
+    }
+    let covers = reach.iter().map(|r| format!("{} ({})", r.account_name, r.zones.join(", "))).collect::<Vec<_>>().join(" · ");
+    Ok((covers, reach))
 }
 
 // ---------------------------------------------------------------- agent / web / scan
@@ -1896,8 +1955,12 @@ fn cf_cmd(cmd: CfCmd, json: bool) -> Result<i32> {
                     if r.ok { "✓" } else { "✗" },
                     r.method,
                     r.path,
-                    if r.undo.is_some() { "" } else { "   (not undoable)" },
-                    r.undoes.as_ref().map(|u| format!("   (undid {u})")).unwrap_or_default()
+                    if !r.ok { "   (failed; nothing changed)" } else if r.undo.is_some() { "" } else { "   (not undoable)" },
+                    format!(
+                        "{}{}",
+                        r.undoes.as_ref().map(|u| format!("   (undid {u})")).unwrap_or_default(),
+                        r.requested_by.as_ref().map(|m| format!("   (for {m})")).unwrap_or_default()
+                    )
                 );
                 for d in api::diff(r.before.as_ref(), r.after.as_ref()) {
                     println!("        {d}");
@@ -1922,6 +1985,8 @@ fn cf_cmd(cmd: CfCmd, json: bool) -> Result<i32> {
                     i_mean_tokens: api::is_token_path(&u.path),
                     not_undoable: true,
                     undoes: Some(id.clone()),
+                    forward: false,
+                    requested_by: None,
                 },
                 &c.config,
                 &fleet,
@@ -1957,6 +2022,8 @@ fn cf_cmd(cmd: CfCmd, json: bool) -> Result<i32> {
             i_mean_tokens: a.i_mean_tokens,
             not_undoable: a.not_undoable,
             undoes: None,
+            forward: true,
+            requested_by: None,
         },
         &c.config,
         &fleet,
@@ -1973,6 +2040,9 @@ fn print_cf(out: &tunnels::api::Outcome, json: bool, scope: Scope) -> Result<i32
         v["scope"] = serde_json::to_value(scope)?;
         print_json(&v)?;
         return Ok(code);
+    }
+    if let Some(v) = &out.via {
+        eprintln!("  (no token here for that account — made by {v}, with its token, and logged there)");
     }
     for n in &out.notes {
         eprintln!("  {n}");
@@ -2029,7 +2099,13 @@ fn print_cf(out: &tunnels::api::Outcome, json: bool, scope: Scope) -> Result<i32
         }
     }
     if let Some(id) = &out.log_id {
-        println!("  logged as {id}{}", if out.undo.is_some() { format!(" — undo with: tunnels cf undo {id}") } else { " (cannot be undone)".into() });
+        let on = out.via.as_ref().map(|v| format!(" on {v}")).unwrap_or_default();
+        let undo = match (&out.undo, &out.via) {
+            (Some(_), Some(v)) => format!(" — undo with: ssh {v} tunnels cf undo {id}"),
+            (Some(_), None) => format!(" — undo with: tunnels cf undo {id}"),
+            (None, _) => " (cannot be undone)".into(),
+        };
+        println!("  logged{on} as {id}{undo}");
     }
     Ok(code)
 }

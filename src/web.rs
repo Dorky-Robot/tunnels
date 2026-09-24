@@ -215,6 +215,34 @@ fn handle(shared: Shared, mut req: Request) {
                 reply_err(req, 404, "no tunnel by that name runs here");
             }
         }
+        (Method::Post, "/api/cf-forward") => {
+            // a peer with no token for an account asks this machine to make a
+            // `tunnels cf` call with ours. The token stays here; the change is
+            // logged here, with who asked.
+            let remote = req.remote_addr().map(|a| a.ip());
+            let fleet = Fleet::load().ok().flatten().unwrap_or_default();
+            let config = Config::load().unwrap_or_default();
+            let me = { let (m, _) = &*shared; m.lock().unwrap().machine.clone() };
+            let call: crate::api::Call = match serde_json::from_str(&body) {
+                Ok(c) => c,
+                Err(e) => return reply_err(req, 400, &format!("not a call: {e}")),
+            };
+            let Some(from) = call.requested_by.clone() else {
+                return reply_err(req, 400, "who is asking? (requested_by)");
+            };
+            if let Err(why) = may_forward(&fleet, &from, remote) {
+                return reply_err(req, 403, &why);
+            }
+            let dir = crate::api::directory(&config);
+            if !crate::api::can_handle(call.path, call.account, &fleet, &dir, &config) {
+                return reply_err(req, 409, "no token here for that");
+            }
+            let c = crate::api::Call { forward: false, ..call };
+            match crate::api::call(c, &config, &fleet, &me) {
+                Ok(out) => reply_json(req, 200, &out),
+                Err(e) => reply_err(req, 400, &format!("{e:#}")),
+            }
+        }
         (Method::Post, "/api/notify") => {
             #[derive(Deserialize, Default)]
             struct N {
@@ -274,6 +302,29 @@ fn handle(shared: Shared, mut req: Request) {
             }
         }
         _ => reply_err(req, 404, "not found"),
+    }
+}
+
+/// May `from` use this machine's tokens? It must be a fleet machine on the
+/// `policy.remote_from` list, and the request must come from its tailnet
+/// address (or loopback), so one machine cannot claim to be another.
+fn may_forward(fleet: &Fleet, from: &str, remote: Option<std::net::IpAddr>) -> Result<(), String> {
+    let m = fleet.machines.get(from).ok_or_else(|| format!("`{from}` is not a machine in the fleet"))?;
+    if let Some(list) = &fleet.policy.remote_from {
+        if !list.iter().any(|x| x == from) {
+            return Err(format!("`{from}` is not on policy.remote_from"));
+        }
+    }
+    let Some(ip) = remote else { return Err("no remote address".into()) };
+    if ip.is_loopback() {
+        return Ok(());
+    }
+    use std::net::ToSocketAddrs;
+    let theirs: Vec<std::net::IpAddr> = (m.host.as_str(), 0).to_socket_addrs().map(|a| a.map(|x| x.ip()).collect()).unwrap_or_default();
+    if theirs.contains(&ip) {
+        Ok(())
+    } else {
+        Err(format!("this request did not come from {from}'s address"))
     }
 }
 

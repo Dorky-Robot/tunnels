@@ -322,6 +322,21 @@ impl Sandbox {
         std::fs::read_to_string(self.path("config/fleet.toml")).unwrap_or_default()
     }
 
+    pub fn command(&self, args: &[&str]) -> std::process::Command {
+        let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_tunnels"));
+        c.args(args)
+            .env("TUNNELS_CONFIG", self.path("config/config.json"))
+            .env("TUNNELS_FLEET", self.path("config/fleet.toml"))
+            .env("TUNNELS_CF_API", &self.fake.url)
+            .env("TUNNELS_MACHINE", &self.machine)
+            .env("TUNNELS_LAUNCH_AGENTS", self.path("LaunchAgents"))
+            .env("TUNNELS_LOG_DIR", self.path("logs"))
+            .env("TUNNELS_LAUNCHCTL", "/usr/bin/true")
+            .env_remove("SSH_CONNECTION")
+            .env_remove("SSH_TTY");
+        c
+    }
+
     pub fn run(&self, args: &[&str]) -> Out {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_tunnels"))
             .args(args)
