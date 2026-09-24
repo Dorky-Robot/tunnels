@@ -59,6 +59,24 @@ pub struct Policy {
     /// tokens; unset means every fleet machine
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_from: Option<Vec<String>>,
+    /// the web UI on the internet, behind Cloudflare Access
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web: Option<WebPolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct WebPolicy {
+    /// the hostname the UI is published at
+    pub public_host: String,
+    /// the Zero Trust team domain, `<team>.cloudflareaccess.com`
+    #[serde(default)]
+    pub team_domain: String,
+    /// the Access application's audience tag
+    #[serde(default)]
+    pub aud: String,
+    /// emails that may change things through the UI; everyone else Access lets in can only look
+    #[serde(default)]
+    pub admins: Vec<String>,
 }
 
 fn default_interval() -> u64 {
@@ -80,6 +98,7 @@ impl Default for Policy {
             web_port: default_web_port(),
             prune: false,
             remote_from: None,
+            web: None,
         }
     }
 }
@@ -377,7 +396,15 @@ impl Fleet {
                 out.push(format!("`{}`: service `{}` should be a URL like http://localhost:3000", r.host, r.service));
             }
             if local_port(&r.service) == Some(self.policy.web_port) {
-                out.push(format!("`{}` would publish the tunnels web UI (port {}) to the internet", r.host, self.policy.web_port));
+                // only as the public host declared in [policy.web], whose
+                // requests the agent checks for a valid Access token
+                let declared = self.policy.web.as_ref().map(|w| w.public_host.eq_ignore_ascii_case(&r.host)).unwrap_or(false);
+                if !declared {
+                    out.push(format!(
+                        "`{}` would publish the tunnels web UI (port {}) to the internet — only [policy.web] public_host may route there",
+                        r.host, self.policy.web_port
+                    ));
+                }
             }
             if self.account_for_host(&r.host).is_none() && !self.accounts.is_empty() {
                 out.push(format!("`{}` is in no zone of any account in this file", r.host));
@@ -632,6 +659,26 @@ service = "http://localhost:2283"
         let mut f = sample();
         f.find_route_mut("media.felixflor.es").unwrap().standby = Some("vet-standby".into());
         assert!(f.validate().iter().any(|p| p.contains("could never carry it")), "{:?}", f.validate());
+    }
+
+    #[test]
+    fn the_web_ui_may_be_routed_only_as_its_declared_public_host() {
+        let mut f = sample();
+        f.policy.web = Some(WebPolicy { public_host: "ui.felixflor.es".into(), ..Default::default() });
+        f.routes.push(Route {
+            host: "ui.felixflor.es".into(),
+            tunnel: "dr2-home".into(),
+            service: format!("http://localhost:{DEFAULT_WEB_PORT}"),
+            ..Default::default()
+        });
+        assert!(f.validate().is_empty(), "{:?}", f.validate());
+        f.routes.push(Route {
+            host: "sneaky.felixflor.es".into(),
+            tunnel: "dr2-home".into(),
+            service: format!("http://localhost:{DEFAULT_WEB_PORT}"),
+            ..Default::default()
+        });
+        assert!(f.validate().iter().any(|p| p.contains("sneaky")));
     }
 
     #[test]
