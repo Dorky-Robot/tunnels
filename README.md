@@ -181,6 +181,16 @@ standby does not share the primary's data.
 - promote and failback;
 - restart and logs for **any tunnel on any machine**, and an agent pass for any machine;
 - every agent's recent actions, and the `tunnels cf` changes made from every machine;
+- **Cloudflare accounts** (admins only): one card per account for the whole mesh. It shows which
+  machines hold its API token and which tunnels run in it, with three actions:
+  - **Rotate API token:** roll or create a new one in the Cloudflare dashboard and paste it. It is
+    checked, put on every machine you tick (by default the ones holding the old one), and the old
+    one is retired there. A token that also reaches another account is kept and named.
+  - **Rotate tunnel tokens:** every tunnel in the account gets a new secret, and each machine takes
+    its new token. You type the account's name to confirm, and the panel lists the hostnames that
+    blip.
+  - **Paste a new tunnel token:** a token refreshed in the dashboard is matched to its tunnel and
+    installed where that tunnel runs.
 - **tokens, per machine and grouped by Cloudflare account** (admins only; link straight to one
   with `#tokens=<machine>`). Each account shows its API tokens with the tunnels it runs, and warns
   when no working API token for that account is on the machine:

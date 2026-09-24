@@ -122,7 +122,7 @@ async function load(fresh) {
   } catch (e) {
     $("#app").innerHTML = `<div class="card lvl-error">${esc(e.message)}</div>`;
   } finally { $("#refresh").disabled = false; }
-  loadAgent(); loadPeers(); loadCfLog();
+  loadAgent(); loadPeers(); loadCfLog(); if (me.admin) { accounts.length ? renderAccounts() : loadAccounts(); }
 }
 
 async function loadAgent() {
@@ -257,9 +257,10 @@ function render() {
     `<div class="action"><span class="mono">·</span><div><b>${esc(n)}</b> <span class="mute">${esc(h)}</span> <span class="mute" data-health="${esc(n)}"></span></div>
      <div>${me.admin ? `<button data-relay="${esc(n)}|agent-pass|">agent pass</button>` : ""}</div></div>`).join("")}</div>`;
   if (me.admin) {
-    html += `<h2>Tokens</h2><div class="card">
-      <div class="row" id="tokmachines">${s.machines.map(([n]) => `<button data-tokm="${esc(n)}"${n === tokMachine ? ' class="primary"' : ""}>${esc(n)}</button>`).join(" ")}</div>
-      <div id="tokbody" style="margin-top:10px"><div class="mute">Pick a machine.</div></div></div>`;
+    html += `<h2>Cloudflare accounts</h2><div id="accounts"><div class="card mute">asking every machine what it holds…</div></div>`;
+    html += `<details class="card" id="permachine"${tokMachine ? " open" : ""}><summary>Per machine (details)</summary>
+      <div class="row" id="tokmachines" style="margin-top:10px">${s.machines.map(([n]) => `<button data-tokm="${esc(n)}"${n === tokMachine ? ' class="primary"' : ""}>${esc(n)}</button>`).join(" ")}</div>
+      <div id="tokbody" style="margin-top:10px"><div class="mute">Pick a machine.</div></div></details>`;
   }
   html += `<h2>Cloudflare changes <span class="mute" style="text-transform:none;letter-spacing:0">(tunnels cf, every machine)</span></h2>
     <div class="card"><div class="events" id="cflog"><div class="mute">loading…</div></div></div>`;
@@ -318,32 +319,34 @@ async function loadTokens(machine) {
 /// A confirmation on the page, right under the button that asked for it —
 /// never a browser dialog. `type` makes the person type a name first; `go`
 /// does the work and returns what to say; the answer stays in the panel.
-function ask(b, { text, type, danger, label, go, after }) {
+function ask(b, { text, type, danger, label, go, after, fields, valid }) {
   document.querySelectorAll(".ask").forEach(x => x.remove());
   const tr = b.closest("tr");
   const box = document.createElement(tr ? "tr" : "div");
   box.className = "ask";
-  const inner = `<div class="askbox${danger ? " danger" : ""}"><div>${text}</div>
+  const inner = `<div class="askbox${danger ? " danger" : ""}"><div>${text}</div>${fields || ""}
     ${type ? `<input class="asktype" placeholder="type ${esc(type)} to confirm" autocomplete="off" spellcheck="false">` : ""}
-    <div class="toolbar"><button class="${danger ? "danger" : "primary"} askgo"${type ? " disabled" : ""}>${esc(label || "confirm")}</button><button class="askno">cancel</button></div>
+    <div class="toolbar"><button class="${danger ? "danger" : "primary"} askgo"${type || valid ? " disabled" : ""}>${esc(label || "confirm")}</button><button class="askno">cancel</button></div>
     <div class="askresult"></div></div>`;
   if (tr) { box.innerHTML = `<td colspan="9">${inner}</td>`; tr.after(box); }
   else { box.innerHTML = inner; (b.closest(".toolbar, .action, .row") || b.parentElement).after(box); }
   const goBtn = box.querySelector(".askgo"), input = box.querySelector(".asktype"), out = box.querySelector(".askresult");
-  if (input) { input.focus(); input.addEventListener("input", () => { goBtn.disabled = input.value.trim() !== type; }); }
+  const check = () => { goBtn.disabled = (input && input.value.trim() !== type) || (valid && !valid(box)); };
+  box.addEventListener("input", check); box.addEventListener("change", check);
+  (box.querySelector("input:not([type=checkbox])") || input || goBtn).focus();
   box.querySelector(".askno").addEventListener("click", ev => { ev.stopPropagation(); box.remove(); });
   goBtn.addEventListener("click", async ev => {
     ev.stopPropagation();
     goBtn.disabled = true; box.querySelector(".askno").disabled = true; if (input) input.disabled = true;
     out.className = "askresult mute"; out.textContent = "working…";
     try {
-      const msg = await go();
+      const msg = await go(box);
       out.className = "askresult"; out.innerHTML = `<span class="lvl-info">✓</span> ${esc(msg)}`;
       box.querySelector(".askno").textContent = "close"; box.querySelector(".askno").disabled = false;
       if (after) setTimeout(after, 1500);
     } catch (err) {
       out.className = "askresult lvl-error"; out.textContent = "✗ " + err.message;
-      goBtn.disabled = !!type && input.value.trim() !== type; box.querySelector(".askno").disabled = false; if (input) input.disabled = false;
+      box.querySelector(".askno").disabled = false; if (input) input.disabled = false; check();
     }
   });
 }
@@ -358,6 +361,53 @@ function servedBy(alias) {
   const t = state && state.tunnels.find(x => x.alias === alias);
   return t ? t.routes.filter(r => r.active).map(r => r.host) : [];
 }
+
+let accounts = [];
+
+// asking every machine and checking every token with Cloudflare takes a
+// few seconds, so the answer is kept and redrawn from; fetched again only
+// on first load, after a rotation, or on "re-check accounts"
+async function loadAccounts() {
+  const el = $("#accounts"); if (!el) return;
+  if (!accounts.length) el.innerHTML = `<div class="card mute">asking every machine what it holds…</div>`;
+  try {
+    const r = await fetch("/api/accounts"); const v = await r.json();
+    if (!r.ok) throw new Error(v.error || r.statusText);
+    accounts = v;
+  } catch (e) { el.innerHTML = `<div class="card lvl-error">${esc(e.message)}</div>`; return; }
+  renderAccounts();
+}
+
+function renderAccounts() {
+  const el = $("#accounts"); if (!el) return;
+  el.innerHTML = accounts.map((a, i) => {
+    // one line per distinct API token: where it is, whether it works
+    const byTok = {};
+    a.holders.forEach(([m, t]) => { (byTok[t.id] = byTok[t.id] || { t, on: [] }).on.push(m); });
+    const toks = Object.values(byTok).map(({ t, on }) => `<tr><td class="mono">${esc(t.hint)}</td>
+        <td>on ${on.map(esc).join(", ")}</td><td>${t.valid ? `<span class="tag good">works</span>` : `<span class="tag bad">rejected by Cloudflare</span>`}</td></tr>`).join("");
+    const tun = a.fleet_tunnels.map(([alias, runsOn]) => {
+      const copies = a.tunnels.filter(([, c]) => c.alias === alias);
+      const here = copies.find(([m]) => m === runsOn);
+      const cur = here ? here[1].current : null;
+      const extra = copies.filter(([m]) => m !== runsOn).map(([m]) => m);
+      return `<tr><td><b>${esc(alias)}</b></td><td>runs on ${esc(runsOn || "no fleet machine")}${extra.length ? ` <span class="tag warn">copy also on ${esc(extra.join(", "))}</span>` : ""}</td>
+        <td>${cur === true ? `<span class="tag good">current</span>` : cur === false ? `<span class="tag bad">stale</span>` : `<span class="tag">?</span>`}</td></tr>`;
+    }).join("");
+    const missing = a.without.filter(m => !a.holders.some(([h, t]) => h === m && t.valid));
+    return `<div class="card" data-acct="${i}">
+      <div class="row"><span class="alias">${esc(a.alias || a.name)}</span><span class="mute">${esc(a.name)} · ${esc(a.zones.join(", "))}</span></div>
+      <div class="mute" style="margin-top:8px">API token — lets machines manage routes and DNS in this account</div>
+      <table>${toks || `<tr><td class="mute">no machine holds one</td></tr>`}
+        ${missing.length ? `<tr><td class="mute" colspan="3">no working token on ${missing.map(esc).join(", ")}</td></tr>` : ""}</table>
+      <div class="mute" style="margin-top:10px">Tunnel tokens — let each tunnel run</div>
+      <table>${tun || `<tr><td class="mute">no tunnels in the fleet</td></tr>`}</table>
+      <div class="toolbar"><button data-acctapi="${i}">rotate API token</button><button data-accttun="${i}" class="danger">rotate tunnel tokens</button><button data-acctcon="${i}">paste a new tunnel token</button></div>
+      ${a.unknown.length ? `<div class="mute">not answering: ${a.unknown.map(esc).join(", ")}</div>` : ""}</div>`;
+  }).join("") + `<div class="toolbar" style="margin-bottom:10px"><button data-acctreload="1">re-check accounts</button></div>`;
+}
+
+const lines = r => r.results.map(x => `${x.ok ? "✓" : "✗"} ${x.machine || x.tunnel}${x.tunnel && x.machine ? ` on ${x.machine}` : ""}: ${x.message}`).join("\n");
 
 async function tokenAction(action, tunnel, arg, doneMsg) {
   try { toast("✓ " + (await relayMsg(tokMachine, action, tunnel, arg) || doneMsg), 7000); }
@@ -377,6 +427,44 @@ document.addEventListener("click", async e => {
   if (b.id === "refresh") return load(true);
   if (b.id === "logclose") { $("#logbox").style.display = "none"; return; }
   if (b.dataset.tokm) return loadTokens(b.dataset.tokm);
+  if (b.dataset.acctreload) return loadAccounts();
+  if (b.dataset.acctapi) {
+    const a = accounts[+b.dataset.acctapi], name = a.alias || a.name;
+    const holders = [...new Set(a.holders.map(([m]) => m))];
+    const all = (state ? state.machines.map(([n]) => n) : holders);
+    return ask(b, { label: "put it on the machines, retire the old one",
+      text: `<b>Rotate the ${esc(name)} API token.</b> In Cloudflare: My Profile → API Tokens → the token for ${esc(name)} → <i>Roll</i>
+        (same permissions; the old value stops working at once, so paste the new one right away) — or create a new token with the same permissions. Paste it here:`,
+      fields: `<input class="acctok" type="password" placeholder="the new API token" autocomplete="off" style="width:100%;max-width:520px">
+        <div style="margin-top:8px">Put it on: ${all.map(m => `<label style="margin-right:10px;white-space:nowrap"><input type="checkbox" class="acctm" value="${esc(m)}"${holders.includes(m) ? " checked" : ""}> ${esc(m)}</label>`).join("")}</div>`,
+      valid: box => box.querySelector(".acctok").value.trim().length > 20 && box.querySelectorAll(".acctm:checked").length > 0,
+      go: async box => {
+        const token = box.querySelector(".acctok").value.trim(); box.querySelector(".acctok").value = "";
+        const machines = [...box.querySelectorAll(".acctm:checked")].map(x => x.value);
+        const r = await post("/api/account/rotate-api", { account_id: a.account_id, token, machines });
+        return lines(r) + "\n\nIf you created a new token rather than rolling one, delete the old one in Cloudflare now.";
+      }, after: loadAccounts });
+  }
+  if (b.dataset.accttun) {
+    const a = accounts[+b.dataset.accttun], name = a.alias || a.name;
+    const hosts = a.fleet_tunnels.flatMap(([alias]) => servedBy(alias));
+    return ask(b, { danger: true, type: name, label: `rotate every ${name} tunnel`,
+      text: `<b>Rotate every tunnel in ${esc(name)}</b> (${a.fleet_tunnels.map(([t]) => esc(t)).join(", ")}): each gets a new secret, every old tunnel token stops working,
+        and each machine takes its new one and restarts the tunnel — a few seconds of downtime each for <b>${esc(hosts.join(", ") || "their hostnames")}</b>.`,
+      go: async () => lines(await post("/api/account/rotate-tunnels", { account_id: a.account_id })), after: loadAccounts });
+  }
+  if (b.dataset.acctcon) {
+    const a = accounts[+b.dataset.acctcon], name = a.alias || a.name;
+    return ask(b, { label: "put it where the tunnel runs",
+      text: `<b>Use a tunnel token refreshed in Cloudflare</b> (Zero Trust → Networks → Tunnels → a ${esc(name)} tunnel → refresh token). Paste it: this works out which tunnel it is for and restarts it with the new token on the machine(s) running it.`,
+      fields: `<input class="acccon" type="password" placeholder="eyJ…" autocomplete="off" style="width:100%;max-width:520px">`,
+      valid: box => box.querySelector(".acccon").value.trim().startsWith("eyJ"),
+      go: async box => {
+        const token = box.querySelector(".acccon").value.trim(); box.querySelector(".acccon").value = "";
+        const r = await post("/api/account/connector", { token });
+        return (r.tunnel ? `${r.tunnel}:\n` : "") + lines(r);
+      }, after: loadAccounts });
+  }
   if (b.dataset.tokadd) {
     const t = $("#toknew").value.trim(); if (!t) return toast("paste a token first");
     b.disabled = true; $("#toknew").value = "";

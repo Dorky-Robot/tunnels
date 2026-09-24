@@ -62,7 +62,13 @@ an agent on every machine. There is no TUI. The web UI, served by every agent on
   identified by a sha256 fingerprint; connector tokens carry whether they still match
   Cloudflare. It also holds add/remove/refresh and `refetch_connector`. The UI reaches them
   through `/api/mesh-tokens` and the relay actions `token-add|token-rm|token-refresh|connector-refetch|tunnel-rotate`
-  (rotate runs the CLI's `tunnel rotate` on the target machine).
+  (rotate runs the CLI's `tunnel rotate` on the target machine). Account-wide:
+  `tokens::by_account` folds every machine's view into one card per account (`/api/accounts`).
+  `/api/account/rotate-api` runs `token-replace` on each chosen machine: it adds the new token,
+  then retires old ones that reach only that account and keeps shared ones.
+  `/api/account/rotate-tunnels` runs `tunnel-rotate` on each owner, and `/api/account/connector`
+  runs `connector-set` wherever that tunnel's token is held. Connector tokens are refused
+  wherever an API token is expected. `web::run_on` runs any action here or through the relay.
 - **sync.rs**: fleet replication. The file is served at `/api/fleet` and the newest `serial`
   wins. `notify` wakes the peers.
 - **status.rs**: the shared view model used by `tunnels status` and the web UI.

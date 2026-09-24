@@ -259,6 +259,104 @@ fn handle(shared: Shared, mut req: Request) {
                 Err(e) => reply_err(req, 502, &format!("{machine} is not answering: {e}")),
             }
         }
+        (Method::Get, "/api/accounts") => {
+            if !who.admin {
+                return reply_err(req, 403, "tokens are for admins");
+            }
+            let fleet = Fleet::load().ok().flatten().unwrap_or_default();
+            let views = all_views(&shared);
+            reply_json(req, 200, &crate::tokens::by_account(&views, &fleet));
+        }
+        (Method::Post, "/api/account/rotate-api") => {
+            #[derive(Deserialize)]
+            struct B {
+                account_id: String,
+                token: String,
+                #[serde(default)]
+                machines: Vec<String>,
+            }
+            let Ok(b) = serde_json::from_str::<B>(&body) else { return reply_err(req, 400, "want {account_id, token, machines}") };
+            // check the new token here first, before any machine is touched
+            if crate::config::decode_token(b.token.trim()).is_ok() {
+                return reply_err(req, 400, "that is a tunnel (connector) token, not an API token — use \"paste a new tunnel token\"");
+            }
+            match crate::tokens::reach_of(b.token.trim()) {
+                Ok((covers, reach)) if reach.iter().any(|r| r.account_id == b.account_id) => {
+                    let _ = covers;
+                }
+                Ok((covers, _)) => return reply_err(req, 400, &format!("that token does not reach this account — it reaches {covers}")),
+                Err(e) => return reply_err(req, 400, &format!("{e:#}")),
+            }
+            if b.machines.is_empty() {
+                return reply_err(req, 400, "no machines chosen");
+            }
+            let arg = serde_json::json!({ "token": b.token.trim(), "account_id": b.account_id }).to_string();
+            let results: Vec<serde_json::Value> = b
+                .machines
+                .iter()
+                .map(|m| match run_on(&shared, m, "token-replace", "", &arg, &who.who) {
+                    Ok(msg) => serde_json::json!({ "machine": m, "ok": true, "message": msg }),
+                    Err(e) => serde_json::json!({ "machine": m, "ok": false, "message": format!("{e:#}") }),
+                })
+                .collect();
+            reply_json(req, 200, &serde_json::json!({ "results": results }))
+        }
+        (Method::Post, "/api/account/rotate-tunnels") => {
+            #[derive(Deserialize)]
+            struct B {
+                account_id: String,
+            }
+            let Ok(b) = serde_json::from_str::<B>(&body) else { return reply_err(req, 400, "want {account_id}") };
+            let fleet = Fleet::load().ok().flatten().unwrap_or_default();
+            let Some(alias) = fleet.account_alias_for_id(&b.account_id).cloned() else { return reply_err(req, 404, "no such account in the fleet") };
+            let results: Vec<serde_json::Value> = fleet
+                .tunnels
+                .iter()
+                .filter(|(_, t)| t.account == alias && !t.destroy)
+                .map(|(a, t)| match &t.machine {
+                    None => serde_json::json!({ "tunnel": a, "ok": false, "message": "no fleet machine runs it — rotate it with the CLI where it runs" }),
+                    Some(m) => match run_on(&shared, m, "tunnel-rotate", a, "", &who.who) {
+                        Ok(msg) => serde_json::json!({ "tunnel": a, "machine": m, "ok": true, "message": msg }),
+                        Err(e) => serde_json::json!({ "tunnel": a, "machine": m, "ok": false, "message": format!("{e:#}") }),
+                    },
+                })
+                .collect();
+            reply_json(req, 200, &serde_json::json!({ "results": results }))
+        }
+        (Method::Post, "/api/account/connector") => {
+            #[derive(Deserialize)]
+            struct B {
+                token: String,
+            }
+            let Ok(b) = serde_json::from_str::<B>(&body) else { return reply_err(req, 400, "want {token}") };
+            let Ok(p) = crate::config::decode_token(b.token.trim()) else {
+                return reply_err(req, 400, "that is not a connector (tunnel) token — they start with eyJ");
+            };
+            let fleet = Fleet::load().ok().flatten().unwrap_or_default();
+            // every machine holding a copy, plus the one the fleet runs it on
+            let views = all_views(&shared);
+            let mut targets: Vec<String> = views
+                .iter()
+                .filter(|(_, v)| v.as_ref().map(|v| v.connectors.iter().any(|c| c.tunnel_id.as_deref() == Some(p.tunnel_id.as_str()))).unwrap_or(false))
+                .map(|(m, _)| m.clone())
+                .collect();
+            if let Some(m) = fleet.find_tunnel(&p.tunnel_id).and_then(|(_, d)| d.machine.clone()) {
+                if !targets.contains(&m) {
+                    targets.push(m);
+                }
+            }
+            if targets.is_empty() {
+                return reply_err(req, 404, &format!("no machine runs tunnel {}", &p.tunnel_id[..8]));
+            }
+            let results: Vec<serde_json::Value> = targets
+                .iter()
+                .map(|m| match run_on(&shared, m, "connector-set", "", b.token.trim(), &who.who) {
+                    Ok(msg) => serde_json::json!({ "machine": m, "ok": true, "message": msg }),
+                    Err(e) => serde_json::json!({ "machine": m, "ok": false, "message": format!("{e:#}") }),
+                })
+                .collect();
+            reply_json(req, 200, &serde_json::json!({ "tunnel": fleet.alias_for_id(&p.tunnel_id), "results": results }))
+        }
         (Method::Get, "/api/mesh-logs") => {
             let q = |k: &str| query.split('&').find_map(|kv| kv.strip_prefix(&format!("{k}="))).unwrap_or("").replace("%20", " ");
             let (machine, tunnel) = (q("machine"), q("tunnel"));
@@ -555,6 +653,64 @@ fn handle(shared: Shared, mut req: Request) {
     }
 }
 
+/// Run a machine action on `machine`: here, or relayed over the tailnet to
+/// its agent, which checks the relay came from an allowlisted peer.
+fn run_on(shared: &Shared, machine: &str, action: &str, tunnel: &str, arg: &str, actor: &str) -> Result<String> {
+    let fleet = Fleet::load().ok().flatten().unwrap_or_default();
+    let me = { let (m, _) = &**shared; m.lock().unwrap().machine.clone() };
+    if machine == me {
+        return exec_local(shared, action, tunnel, arg, actor);
+    }
+    let m = fleet.machines.get(machine).ok_or_else(|| anyhow!("no machine {machine}"))?;
+    let a: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(60)))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut resp = a
+        .post(&format!("http://{}:{}/api/relay-exec", m.host, fleet.policy.web_port))
+        .header("X-Tunnels", "1")
+        .send_json(serde_json::json!({ "action": action, "tunnel": tunnel, "arg": arg, "requested_by": me, "actor": actor }))
+        .map_err(|e| anyhow!("{machine} is not answering: {e}"))?;
+    let code = resp.status().as_u16();
+    let v: serde_json::Value = resp.body_mut().read_json().unwrap_or(serde_json::Value::Null);
+    if code == 200 {
+        Ok(v["message"].as_str().unwrap_or("done").to_string())
+    } else {
+        Err(anyhow!("{}", v["error"].as_str().unwrap_or("failed")))
+    }
+}
+
+/// Every machine's token view, fetched in parallel; None for one that did not answer.
+fn all_views(shared: &Shared) -> Vec<(String, Option<crate::tokens::MachineTokens>)> {
+    let fleet = Fleet::load().ok().flatten().unwrap_or_default();
+    let me = { let (m, _) = &**shared; m.lock().unwrap().machine.clone() };
+    let port = fleet.policy.web_port;
+    let handles: Vec<_> = fleet
+        .machines
+        .iter()
+        .map(|(n, m)| {
+            let (n, h, me, fleet) = (n.clone(), m.host.clone(), me.clone(), fleet.clone());
+            std::thread::spawn(move || {
+                if n == me {
+                    let config = Config::load().unwrap_or_default();
+                    return (n.clone(), Some(crate::tokens::view(&config, &fleet, &me)));
+                }
+                let a: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(std::time::Duration::from_secs(40))).build().into();
+                let v = a
+                    .get(&format!("http://{h}:{port}/api/tokens"))
+                    .call()
+                    .ok()
+                    .and_then(|mut r| r.body_mut().read_json::<serde_json::Value>().ok())
+                    .and_then(|v| serde_json::from_value::<crate::tokens::MachineTokensIn>(v).ok())
+                    .map(Into::into);
+                (n, v)
+            })
+        })
+        .collect();
+    handles.into_iter().filter_map(|h| h.join().ok()).collect()
+}
+
 /// A tunnel on this Mac by local name or fleet alias.
 fn local_tunnel(key: &str) -> Option<crate::config::Tunnel> {
     let config = Config::load().ok()?;
@@ -595,6 +751,22 @@ fn exec_local(shared: &Shared, action: &str, tunnel: &str, arg: &str, actor: &st
             let rs = crate::tokens::refresh(&mut config);
             let bad = rs.iter().filter(|(_, r)| r.is_err()).count();
             format!("re-checked {} API token(s) here; {bad} rejected by Cloudflare", rs.len())
+        }
+        "token-replace" => {
+            #[derive(Deserialize)]
+            struct A {
+                token: String,
+                account_id: String,
+            }
+            let a: A = serde_json::from_str(arg).map_err(|_| anyhow!("token-replace wants {{token, account_id}}"))?;
+            let mut config = Config::load()?;
+            crate::tokens::replace(&mut config, &a.token, &a.account_id)?.0
+        }
+        "connector-set" => {
+            let mut config = Config::load()?;
+            let fleet = Fleet::load()?.unwrap_or_default();
+            let me = { let (m, _) = &**shared; m.lock().unwrap().machine.clone() };
+            crate::tokens::set_connector(&mut config, &fleet, &me, arg)?
         }
         "connector-refetch" => {
             let mut config = Config::load()?;

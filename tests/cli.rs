@@ -683,3 +683,66 @@ fn a_stale_connector_token_is_refetched_and_a_tunnel_rotated_from_the_page() {
     assert_ne!(secret, "s1");
     assert_eq!(stored(&w.s), token_for("acct-home", HOME, &secret));
 }
+
+// ------------------------------------------------------------------ accounts: rotate from one card
+
+#[test]
+fn the_accounts_view_shows_where_each_accounts_tokens_are_without_the_tokens() {
+    let w = published_ui();
+    let c = sign_in(&w, "felix@example.com");
+    let r = public(&w, "GET", "/api/accounts", Some(&c), "tunnels.felixflor.es", None);
+    assert_eq!(r.code, 200, "{}", r.body);
+    assert!(!r.body.contains("good-token") && !r.body.contains("eyJ"), "a token leaked: {}", r.body);
+    let v: Vec<serde_json::Value> = serde_json::from_str(&r.body).unwrap();
+    let home = v.iter().find(|a| a["alias"] == "home").unwrap();
+    assert!(home["holders"].as_array().unwrap().iter().any(|h| h[0] == "dr2"), "{home}");
+    assert!(home["fleet_tunnels"].as_array().unwrap().iter().any(|t| t[0] == "dr2-home"), "{home}");
+    let guest = sign_in(&w, "guest@example.com");
+    assert_eq!(public(&w, "GET", "/api/accounts", Some(&guest), "tunnels.felixflor.es", None).code, 403);
+    assert_eq!(public(&w, "POST", "/api/account/rotate-api", Some(&guest), "tunnels.felixflor.es", Some(json!({ "account_id": "acct-home", "token": "x", "machines": ["dr2"] }))).code, 403);
+}
+
+#[test]
+fn rotating_an_accounts_api_token_puts_the_new_one_on_each_machine() {
+    let w = published_ui();
+    let c = sign_in(&w, "felix@example.com");
+    let r = public(&w, "POST", "/api/account/rotate-api", Some(&c), "tunnels.felixflor.es", Some(json!({ "account_id": "acct-home", "token": "rolled-token-value", "machines": ["dr2"] })));
+    assert_eq!(r.code, 200, "{}", r.body);
+    assert!(!r.body.contains("rolled-token-value"), "the token came back: {}", r.body);
+    let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+    assert_eq!(v["results"][0]["ok"], true, "{v}");
+    let toks: Vec<String> = w.s.config()["cf_api_tokens"].as_array().unwrap().iter().map(|t| t["token"].as_str().unwrap().to_string()).collect();
+    assert!(toks.contains(&"rolled-token-value".to_string()));
+    // the old token also reaches the vet account here, so it is kept, and said so
+    assert!(toks.contains(&"good-token".to_string()));
+    assert!(v["results"][0]["message"].as_str().unwrap().contains("also reach another account"), "{v}");
+    // a connector token pasted into the API box is refused before any machine is touched
+    let r = public(&w, "POST", "/api/account/rotate-api", Some(&c), "tunnels.felixflor.es", Some(json!({ "account_id": "acct-home", "token": token_for("acct-home", HOME, "s0"), "machines": ["dr2"] })));
+    assert_eq!(r.code, 400, "{}", r.body);
+}
+
+#[test]
+fn rotating_an_accounts_tunnels_and_pasting_a_refreshed_tunnel_token() {
+    let w = published_ui();
+    let c = sign_in(&w, "felix@example.com");
+    let r = public(&w, "POST", "/api/account/rotate-tunnels", Some(&c), "tunnels.felixflor.es", Some(json!({ "account_id": "acct-home" })));
+    assert_eq!(r.code, 200, "{}", r.body);
+    let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+    let res = v["results"].as_array().unwrap();
+    assert_eq!(res.len(), 1, "one tunnel in the home account: {v}");
+    assert_eq!(res[0]["tunnel"], "dr2-home");
+    assert_eq!(res[0]["ok"], true, "{v}");
+    let secret = w.s.world().tunnel(HOME).secret.clone();
+    assert_ne!(secret, "s0");
+    let stored = |s: &Sandbox| s.config()["tunnels"].as_array().unwrap().iter().find(|t| t["name"] == "DorkyRobot2").unwrap()["token"].as_str().unwrap().to_string();
+    assert_eq!(stored(&w.s), token_for("acct-home", HOME, &secret));
+    // refreshed in the dashboard: paste it, and it lands where the tunnel runs
+    let fresh = token_for("acct-home", HOME, "from-the-dashboard");
+    let r = public(&w, "POST", "/api/account/connector", Some(&c), "tunnels.felixflor.es", Some(json!({ "token": fresh })));
+    assert_eq!(r.code, 200, "{}", r.body);
+    assert!(r.body.contains("dr2-home"), "{}", r.body);
+    assert_eq!(stored(&w.s), fresh);
+    // an API token pasted in the tunnel box is refused
+    let r = public(&w, "POST", "/api/account/connector", Some(&c), "tunnels.felixflor.es", Some(json!({ "token": "cfut_not_a_connector" })));
+    assert_eq!(r.code, 400);
+}

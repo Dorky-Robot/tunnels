@@ -20,7 +20,7 @@ use crate::launchd;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct ApiTokenView {
     /// a fingerprint, for naming this token in a removal
     pub id: String,
@@ -31,7 +31,7 @@ pub struct ApiTokenView {
     pub valid: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct ConnectorView {
     /// the name in this machine's config and LaunchAgent label
     pub name: String,
@@ -47,14 +47,14 @@ pub struct ConnectorView {
     /// token here can ask
     pub current: Option<bool>,
     /// the fleet runs this tunnel on some other machine
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runs_elsewhere: Option<String>,
 }
 
 /// One Cloudflare account on one machine: the API tokens that reach it and
 /// the tunnels in it. Tokens and tunnels belong to accounts, so this is how
 /// they are read — "can this machine manage its tunnels in that account?"
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct AccountGroup {
     pub account_id: String,
     /// the fleet's alias for it, if the fleet knows it
@@ -68,7 +68,7 @@ pub struct AccountGroup {
     pub manageable: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct MachineTokens {
     pub machine: String,
     pub api_tokens: Vec<ApiTokenView>,
@@ -277,6 +277,167 @@ pub fn refetch_connector(config: &mut Config, fleet: &Fleet, key: &str) -> Resul
         launchd::restart(&t.name, &fresh)?;
     }
     Ok(format!("{}: took the current connector token and restarted it", t.name))
+}
+
+/// Replace this machine's API token for one account with a new one: add
+/// it, check it reaches the account, then retire every other token here
+/// that reaches only that account. A token that also reaches another
+/// account is kept (retiring it would cut this machine off from the other
+/// one) and named, so a person can decide. Returns what happened and the
+/// hints of the tokens retired, which still need deleting in Cloudflare.
+pub fn replace(config: &mut Config, token: &str, account_id: &str) -> Result<(String, Vec<String>)> {
+    let token = token.trim();
+    if config::decode_token(token).is_ok() {
+        bail!("that is a tunnel (connector) token, not an API token — use \"paste a new tunnel token\"");
+    }
+    let (covers, reach) = reach_of(token)?;
+    if !reach.iter().any(|r| r.account_id == account_id) {
+        bail!("the new token does not reach this account — it reaches {covers}");
+    }
+    let new_id = fingerprint(token);
+    config.add_api_token(token.to_string(), covers.clone(), reach)?;
+    // the old tokens for this account, decided once; removal is by
+    // fingerprint, so the list shifting under it does not matter
+    // a token kept before reach was recorded has none on file: ask what it
+    // reaches, or an old token for this account would be neither retired
+    // nor kept, just silently left behind
+    let old: Vec<(String, String, bool)> = config
+        .api_tokens()
+        .iter()
+        .filter(|t| fingerprint(&t.token) != new_id)
+        .filter_map(|t| {
+            let reach = if t.reach.is_empty() { reach_of(&t.token).map(|(_, r)| r).unwrap_or_default() } else { t.reach.clone() };
+            reach.iter().any(|r| r.account_id == account_id).then(|| {
+                (fingerprint(&t.token), t.hint(), reach.iter().all(|r| r.account_id == account_id))
+            })
+        })
+        .collect();
+    let (mut retired, mut kept) = (Vec::new(), Vec::new());
+    for (id, hint, only_this) in old {
+        if only_this {
+            remove(config, &id)?;
+            retired.push(hint);
+        } else {
+            kept.push(hint);
+        }
+    }
+    let mut msg = format!("new API token in place ({covers})");
+    if !retired.is_empty() {
+        msg.push_str(&format!("; retired {} old token(s) here: {}", retired.len(), retired.join(", ")));
+    }
+    if !kept.is_empty() {
+        msg.push_str(&format!("; kept {} that also reach another account: {}", kept.len(), kept.join(", ")));
+    }
+    Ok((msg, retired))
+}
+
+/// Install a connector token that was refreshed in the Cloudflare
+/// dashboard: find the tunnel it is for and restart it on this machine.
+pub fn set_connector(config: &mut Config, fleet: &Fleet, me: &str, token: &str) -> Result<String> {
+    let token = token.trim();
+    let payload = config::decode_token(token).map_err(|_| anyhow!("that is not a connector (tunnel) token — they start with eyJ"))?;
+    let id = payload.tunnel_id;
+    let name = match config.tunnel_by_id(&id) {
+        Some(t) => t.name.clone(),
+        None => {
+            let (alias, decl) = fleet.find_tunnel(&id).ok_or_else(|| anyhow!("tunnel {} is not in the fleet and does not run here", &id[..8]))?;
+            if decl.machine.as_deref() != Some(me) {
+                bail!("{alias} does not run on this machine");
+            }
+            alias.clone()
+        }
+    };
+    config.upsert_tunnel(&name, token)?;
+    launchd::write_token_file(token)?;
+    if launchd::is_loaded_name(&name) && launchd::plist_runs_token(&name, token) && !launchd::plist_has_inline_token(&name) {
+        launchd::kickstart(&name)?;
+    } else {
+        launchd::restart(&name, token)?;
+    }
+    Ok(format!("{name}: took the new connector token and restarted"))
+}
+
+/// Where one Cloudflare account's tokens are, across the whole mesh.
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountSummary {
+    pub account_id: String,
+    pub alias: Option<String>,
+    pub name: String,
+    pub zones: Vec<String>,
+    /// (machine, token) for every API token reaching this account
+    pub holders: Vec<(String, ApiTokenView)>,
+    /// machines that answered and hold no working token for it
+    pub without: Vec<String>,
+    /// (machine, tunnel) for every tunnel of this account a machine holds
+    pub tunnels: Vec<(String, ConnectorView)>,
+    /// the fleet's tunnels in this account, with the machine that runs each
+    pub fleet_tunnels: Vec<(String, Option<String>)>,
+    /// machines that did not answer
+    pub unknown: Vec<String>,
+}
+
+/// A peer's view as it arrives over the wire.
+pub type MachineTokensIn = MachineTokens;
+
+/// Fold every machine's view into one summary per account.
+pub fn by_account(views: &[(String, Option<MachineTokens>)], fleet: &Fleet) -> Vec<AccountSummary> {
+    let mut out: Vec<AccountSummary> = Vec::new();
+    let mut ids: Vec<(String, String)> = fleet.accounts.values().map(|a| (a.id.clone(), a.name.clone())).collect();
+    for (_, v) in views.iter() {
+        for g in v.iter().flat_map(|v| v.accounts.iter()) {
+            if !ids.iter().any(|(i, _)| *i == g.account_id) {
+                ids.push((g.account_id.clone(), g.name.clone()));
+            }
+        }
+    }
+    for (id, name) in ids {
+        let alias = fleet.account_alias_for_id(&id).cloned();
+        let fa = alias.as_ref().and_then(|a| fleet.accounts.get(a));
+        let mut s = AccountSummary {
+            account_id: id.clone(),
+            name: if name.is_empty() { fa.map(|a| a.name.clone()).unwrap_or_default() } else { name },
+            zones: fa.map(|a| a.zones.clone()).unwrap_or_default(),
+            alias: alias.clone(),
+            holders: Vec::new(),
+            without: Vec::new(),
+            tunnels: Vec::new(),
+            fleet_tunnels: fleet
+                .tunnels
+                .iter()
+                .filter(|(_, t)| alias.as_deref() == Some(t.account.as_str()) && !t.destroy)
+                .map(|(a, t)| (a.clone(), t.machine.clone()))
+                .collect(),
+            unknown: Vec::new(),
+        };
+        for (m, v) in views {
+            let Some(v) = v else {
+                s.unknown.push(m.clone());
+                continue;
+            };
+            match v.accounts.iter().find(|g| g.account_id == id) {
+                Some(g) => {
+                    for t in &g.api_tokens {
+                        s.holders.push((m.clone(), t.clone()));
+                    }
+                    for c in &g.connectors {
+                        s.tunnels.push((m.clone(), c.clone()));
+                    }
+                    if !g.manageable {
+                        s.without.push(m.clone());
+                    }
+                }
+                None => s.without.push(m.clone()),
+            }
+            if s.zones.is_empty() {
+                if let Some(g) = v.accounts.iter().find(|g| g.account_id == id) {
+                    s.zones = g.zones.clone();
+                }
+            }
+        }
+        out.push(s);
+    }
+    out.sort_by(|a, b| a.alias.clone().unwrap_or(a.name.clone()).cmp(&b.alias.clone().unwrap_or(b.name.clone())));
+    out
 }
 
 #[cfg(test)]
