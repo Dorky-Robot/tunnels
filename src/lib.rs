@@ -11,6 +11,7 @@
 //! `apply` acts. The CLI, the agent and the web UI are three front doors to
 //! the same three steps, so they cannot disagree.
 
+pub mod access;
 pub mod agent;
 pub mod api;
 pub mod apply;
