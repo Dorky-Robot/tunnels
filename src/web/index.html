@@ -65,6 +65,7 @@
   <h1>tunnels</h1>
   <span class="meta" id="meta">loading…</span>
   <span class="spacer"></span>
+  <span class="tag" id="whoami"></span>
   <div class="peers" id="peers"></div>
   <button id="refresh">Refresh</button>
 </header>
@@ -76,6 +77,7 @@
 const $ = (s, el = document) => el.querySelector(s);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 let state = null;
+let me = { who: "tailnet", admin: true, via_cloudflare: false };
 
 function toast(msg, ms = 4000) {
   const t = $("#toast"); t.textContent = msg; t.style.display = "block";
@@ -93,6 +95,13 @@ function reportText(r) {
   const lines = (r.done || []).map(o => `${o.ok ? "✓" : "✗"} ${o.summary} — ${o.detail}`);
   (r.held || []).forEach(([s, why]) => lines.push(`· held: ${s} (${why})`));
   return lines.join("\n") || "nothing to do";
+}
+
+async function whoami() {
+  try { me = await (await fetch("/api/whoami")).json(); } catch { }
+  const el = $("#whoami");
+  el.textContent = me.via_cloudflare ? `${me.who} · ${me.admin ? "admin" : "can look, not change"}` : "on the tailnet · admin";
+  el.className = "tag " + (me.admin ? "good" : "");
 }
 
 async function load(fresh) {
@@ -133,6 +142,8 @@ async function loadCfLog() {
 async function loadPeers() {
   try {
     const v = await (await fetch("/api/peers")).json();
+    v.forEach(p => { const el = document.querySelector(`[data-health="${CSS.escape(p.machine)}"]`);
+      if (el) el.textContent = p.health ? `v${p.health.version} · serial ${p.health.serial} · last pass ${p.health.last_tick ? p.health.last_tick.at : "—"}` : "not answering"; });
     $("#peers").innerHTML = v.map(p => {
       const h = p.health; const ok = !!h;
       const title = ok ? `v${h.version} · fleet serial ${h.serial ?? "—"}` : "not answering";
@@ -192,7 +203,7 @@ function render() {
         <div>${tags.map(t => `<span class="tag ${t === "takeover" || t === "destroy" ? "bad" : t === "prune" ? "warn" : ""}">${esc(t)}</span>`).join(" ")}</div></div>`;
     }).join("");
     const nPrune = actions.filter(a => a.prune).length, nGuard = actions.filter(a => a.guarded && !a.destroy).length;
-    html += `<div class="toolbar">
+    if (me.admin) html += `<div class="toolbar">
       <button class="primary" data-apply='{}'>Apply safe changes</button>
       ${nPrune ? `<button data-apply='{"prune":true}' data-confirm="Also remove ${nPrune} thing(s) the fleet file does not mention?">…and prune (${nPrune})</button>` : ""}
       ${nGuard ? `<button class="danger" data-apply='{"prune":false,"yes":true}' data-confirm="Take ${nGuard} hostname(s) from tunnels that are serving them right now?">…and take over (${nGuard})</button>` : ""}
@@ -215,12 +226,14 @@ function render() {
           ${t.alias && t.cf_name && t.cf_name !== t.alias ? `<span class="mute">Cloudflare: ${esc(t.cf_name)}</span>` : ""}
           <span class="spacer" style="flex:1"></span>
           <span class="mute">${t.state === "up" ? `${t.connectors}× ${esc(t.colos.join(", "))}` : esc(t.state)}${t.versions.length ? ` · cloudflared ${esc(t.versions.join(", "))}` : ""}</span>
-          ${t.here ? `<button data-logs="${esc(t.here.name)}">logs</button>` : ""}
+          ${t.machine && t.alias ? `<button data-mlogs="${esc(t.machine)}|${esc(t.alias)}">logs</button>` : ""}
+          ${t.machine && t.alias && me.admin ? `<button data-relay="${esc(t.machine)}|tunnel-restart|${esc(t.alias)}">restart</button>` : ""}
         </div>
         ${t.note ? `<div class="mute" style="margin-top:4px">${esc(t.note)}</div>` : ""}
         ${t.routes.length ? `<table>${t.routes.map(r => {
           const sb = r.role === "primary" ? standbyRoutes.get(r.host) : null;
-          const btn = r.role === "primary" && sb && r.active ? `<button data-promote="${esc(r.host)}">promote standby</button>`
+          const btn = !me.admin ? ""
+                    : r.role === "primary" && sb && r.active ? `<button data-promote="${esc(r.host)}">promote standby</button>`
                     : r.role === "standby" && r.active ? `<button data-failback="${esc(r.host)}">fail back</button>` : "";
           return `<tr>
             <td><a href="https://${esc(r.host)}" target="_blank" rel="noopener">${esc(r.host)}</a></td>
@@ -232,6 +245,9 @@ function render() {
     }
   }
 
+  html += `<h2>Machines</h2><div class="card" id="machines">${s.machines.map(([n, h]) =>
+    `<div class="action"><span class="mono">·</span><div><b>${esc(n)}</b> <span class="mute">${esc(h)}</span> <span class="mute" data-health="${esc(n)}"></span></div>
+     <div>${me.admin ? `<button data-relay="${esc(n)}|agent-pass|">agent pass</button>` : ""}</div></div>`).join("")}</div>`;
   html += `<h2>Cloudflare changes <span class="mute" style="text-transform:none;letter-spacing:0">(tunnels cf, every machine)</span></h2>
     <div class="card"><div class="events" id="cflog"><div class="mute">loading…</div></div></div>`;
   html += `<h2>Agent</h2><div class="card"><div class="mute" id="agent-meta"></div><div class="events" id="events" style="margin-top:8px"></div>
@@ -253,6 +269,24 @@ document.addEventListener("click", async e => {
   const b = e.target.closest("button"); if (!b) return;
   if (b.id === "refresh") return load(true);
   if (b.id === "logclose") { $("#logbox").style.display = "none"; return; }
+  if (b.dataset.mlogs) {
+    const [machine, tunnel] = b.dataset.mlogs.split("|");
+    const t = await (await fetch(`/api/mesh-logs?machine=${encodeURIComponent(machine)}&tunnel=${encodeURIComponent(tunnel)}`)).text();
+    $("#logtitle").textContent = `logs: ${tunnel} on ${machine}`;
+    $("#logtext").textContent = t || "(empty)";
+    $("#logbox").style.display = "block"; $("#logbox").scrollIntoView({ behavior: "smooth" });
+    return;
+  }
+  if (b.dataset.relay) {
+    const [machine, action, tunnel] = b.dataset.relay.split("|");
+    const what = action === "agent-pass" ? `run an agent pass on ${machine}` : `restart ${tunnel} on ${machine}`;
+    if (!confirm(`${what[0].toUpperCase()}${what.slice(1)}?`)) return;
+    b.disabled = true;
+    try { const r = await post("/api/relay", { machine, action, tunnel }); toast("✓ " + r.message); }
+    catch (err) { toast("✗ " + err.message, 8000); }
+    b.disabled = false; setTimeout(() => load(true), 4000);
+    return;
+  }
   if (b.dataset.logs) {
     const name = b.dataset.logs;
     const t = await (await fetch("/api/logs?tunnel=" + encodeURIComponent(name))).text();
@@ -279,7 +313,7 @@ document.addEventListener("click", async e => {
   } catch (err) { toast("✗ " + err.message, 8000); b.disabled = false; }
 });
 
-load(false);
+whoami().then(() => load(false));
 setInterval(() => { loadAgent(); loadPeers(); }, 15000);
 setInterval(() => load(false), 60000);
 </script>
