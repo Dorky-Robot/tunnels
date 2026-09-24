@@ -125,7 +125,15 @@ pub fn run() -> Result<()> {
     loop {
         if let (Some((p0, t0)), Some((p1, t1))) = (&exe, exe_identity()) {
             if *p0 != p1 || *t0 != t1 {
-                eprintln!("{} the tunnels binary changed; exiting so launchd starts the new one", util::now_rfc3339());
+                // Become the new binary in place, same pid, rather than exit
+                // and wait for launchd: on doug-mini launchd deferred the
+                // respawn ("pended nondemand spawn = inefficient") and the
+                // agent stayed down after an upgrade.
+                eprintln!("{} the tunnels binary changed; switching to it", util::now_rfc3339());
+                use std::os::unix::process::CommandExt;
+                let argv0 = std::env::args().next().unwrap_or_else(|| "tunnels".into());
+                let err = std::process::Command::new(&argv0).args(std::env::args().skip(1)).exec();
+                eprintln!("{} could not run the new binary ({err}); exiting so launchd starts it", util::now_rfc3339());
                 std::process::exit(0);
             }
         }
