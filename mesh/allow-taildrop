@@ -1,0 +1,56 @@
+#!/bin/sh
+# Let Claude agents run `tailscale file cp` without asking, on every mesh machine.
+#
+#   sh mesh/allow-taildrop               every machine in mesh/machines
+#   sh mesh/allow-taildrop dr1 mini      just these (names, hosts or aliases)
+#
+# Adds three rules to permissions.allow in each ~/.claude/settings.json and
+# leaves everything else in the file as it was; a machine that has them
+# already is left alone. The old file is kept as settings.json.bak.<stamp>.
+#
+# Run by a person, not by install.sh: Claude's auto mode refuses to let an
+# agent grant agents a permission, so this is the one step a person takes.
+# Why Taildrop at all: mesh/claude-global.md.
+set -eu
+here=$(cd "$(dirname "$0")" && pwd)
+ME=$(hostname -s)
+rows() { grep -v '^[[:space:]]*#' "$here/machines" | awk 'NF'; }
+row_for() { rows | awk -v m="$1" '{ if ($1 == m || $2 == m) { print; exit } for (i = 8; i <= NF; i++) if ($i == m) { print; exit } }'; }
+
+# The part that runs on each machine. osascript, not jq or python: it is on
+# every Mac with nothing installed. It prints the file with the rules added,
+# or nothing if they are all there.
+merge=$(cat <<'SH'
+set -eu
+cs=$HOME/.claude/settings.json
+mkdir -p "$HOME/.claude"; [ -s "$cs" ] || echo '{}' > "$cs"
+merged=$(/usr/bin/osascript -l JavaScript - "$cs" <<'JS'
+ObjC.import('Foundation');
+function run(argv) {
+  var s = JSON.parse($.NSString.stringWithContentsOfFileEncodingError(argv[0], $.NSUTF8StringEncoding, null).js || '{}');
+  var want = ['Bash(tailscale file cp *)', 'Bash(/opt/homebrew/bin/tailscale file cp *)', 'Bash(/usr/local/bin/tailscale file cp *)'];
+  s.permissions = s.permissions || {};
+  var a = s.permissions.allow = s.permissions.allow || [];
+  var added = want.filter(function (r) { return a.indexOf(r) < 0; });
+  added.forEach(function (r) { a.push(r); });
+  return added.length ? JSON.stringify(s, null, 2) : '';
+}
+JS
+) || { echo "settings.json is not JSON osascript can read; left as it was"; exit 1; }
+[ -n "$merged" ] || { echo "already allowed"; exit 0; }
+cp "$cs" "$cs.bak.$(date +%Y%m%d-%H%M%S)"
+printf '%s\n' "$merged" > "$cs.new" && mv "$cs.new" "$cs"
+echo "allowed"
+SH
+)
+
+if [ $# -eq 0 ]; then set -- $(rows | awk '{print $1}'); fi
+fail=0
+for m in "$@"; do
+  r=$(row_for "$m"); [ -n "$r" ] || { echo "$m: not in mesh/machines"; fail=1; continue; }
+  name=$(echo "$r" | awk '{print $1}') host=$(echo "$r" | awk '{print $2}')
+  if [ "$host" = "$ME" ]; then out=$(sh -c "$merge" 2>&1) || fail=1
+  else out=$(printf '%s\n' "$merge" | ssh -o BatchMode=yes -o ConnectTimeout=15 "$name" sh -s 2>&1) || fail=1; fi
+  echo "$name: $out"
+done
+exit $fail
