@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.dorkyrobot.taildrop-inbox</string>
+  <!-- IDENTICAL on every machine in the mesh. Taildrop is how agents move
+       files between boxes: `tailscale file cp` can only reach our own
+       tailnet, so nothing sent that way can leave it. Files wait in
+       tailscaled until someone gets them; this gets them, as they arrive,
+       into ~/Projects/inbox. A same-named file gets a number, never
+       overwrites. Brew's tailscale is in /opt/homebrew on Apple silicon and
+       /usr/local on Intel (mac2019). -->
+  <key>ProgramArguments</key><array>
+    <string>/bin/sh</string><string>-c</string>
+    <string>PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; mkdir -p "$HOME/Projects/inbox"; exec tailscale file get --loop --conflict=rename "$HOME/Projects/inbox"</string>
+  </array>
+  <!-- the loop dies with tailscaled; come back when it does -->
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardErrorPath</key><string>/tmp/taildrop-inbox.log</string>
+</dict></plist>

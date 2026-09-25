@@ -22,6 +22,7 @@
 #                                       and brings back one that was booted out. With a
 #                                       tunnels too old to have an agent, the old
 #                                       tunnel-watchdog.sh does that last part instead.
+#   com.dorkyrobot.taildrop-inbox       files sent by `tailscale file cp` land in ~/Projects/inbox
 #
 # What it does NOT do, because it cannot be done from one machine:
 #   - make this machine's mesh key or GitHub key (docs/remote-access.md,
@@ -163,6 +164,15 @@ else
     launchctl bootstrap "gui/$(id -u)" "$P"
   fi
   keeper="watchdog $(shasum -a 256 "$HOME/.local/bin/tunnel-watchdog.sh" | cut -c1-12)"
+fi
+
+# Taildrop inbox: files sent with `tailscale file cp` land in ~/Projects/inbox.
+# Not a tunnel, so bootout + bootstrap here cannot cut the ssh we came in on.
+P="$HOME/Library/LaunchAgents/com.dorkyrobot.taildrop-inbox.plist"
+if ! cmp -s "$here/com.dorkyrobot.taildrop-inbox.plist" "$P" || ! launchctl print "gui/$(id -u)/com.dorkyrobot.taildrop-inbox" >/dev/null 2>&1; then
+  launchctl bootout "gui/$(id -u)/com.dorkyrobot.taildrop-inbox" 2>/dev/null || true
+  cp "$here/com.dorkyrobot.taildrop-inbox.plist" "$P"
+  launchctl bootstrap "gui/$(id -u)" "$P"
 fi
 
 h() { shasum -a 256 "$1" | cut -c1-12; }
