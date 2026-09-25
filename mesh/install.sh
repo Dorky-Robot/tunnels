@@ -23,6 +23,7 @@
 #                                       tunnels too old to have an agent, the old
 #                                       tunnel-watchdog.sh does that last part instead.
 #   com.dorkyrobot.taildrop-inbox       files sent by `tailscale file cp` land in ~/Projects/inbox
+#   ~/.claude/CLAUDE.md                 the mesh block: mesh/claude-global.md
 #
 # What it does NOT do, because it cannot be done from one machine:
 #   - make this machine's mesh key or GitHub key (docs/remote-access.md,
@@ -174,6 +175,24 @@ if ! cmp -s "$here/com.dorkyrobot.taildrop-inbox.plist" "$P" || ! launchctl prin
   cp "$here/com.dorkyrobot.taildrop-inbox.plist" "$P"
   launchctl bootstrap "gui/$(id -u)" "$P"
 fi
+
+# ---- 6. Claude: Taildrop is how agents move files --------------------------
+# mesh/claude-global.md goes between markers at the end of ~/.claude/CLAUDE.md;
+# the rest of the file is left as it was. (Not mesh/claude.md: on a Mac that
+# is also mesh/CLAUDE.md, and Claude would load it as this directory's own.)
+# The permission that lets agents run `tailscale file cp` without asking is
+# added by a person, not by this script: agents may not grant themselves one.
+C=$HOME/.claude; mkdir -p "$C"
+cm=$C/CLAUDE.md; [ -f "$cm" ] || : > "$cm"
+cbegin='<!-- >>> mesh — managed by tunnels/mesh/install.sh; edit mesh/claude-global.md, not this >>> -->'
+cend='<!-- <<< mesh <<< -->'
+{
+  awk -v b="$cbegin" -v e="$cend" '$0 == b { skip = 1; next } $0 == e { skip = 0; next } !skip' "$cm" \
+    | awk '{ l[NR] = $0 } NF { n = NR } END { for (i = 1; i <= n; i++) print l[i] }'
+  printf '\n%s\n' "$cbegin"; cat "$here/claude-global.md"; echo "$cend"
+} > "$cm.new"
+if cmp -s "$cm.new" "$cm"; then rm -f "$cm.new"
+else cp "$cm" "$C/CLAUDE.md.bak.$stamp"; mv "$cm.new" "$cm"; echo "· ~/.claude/CLAUDE.md: mesh block"; fi
 
 h() { shasum -a 256 "$1" | cut -c1-12; }
 printf '%s  mesh.conf %s  known_hosts %s  github.conf %s  %s\n' "$H" \
