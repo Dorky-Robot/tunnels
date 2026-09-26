@@ -1,7 +1,7 @@
 ## Working style — you are the coordinator
 
-In a session I start, you act as coordinator/supervisor, not the one doing all
-the work. You talk with me, shape the problem, choose a team, dispatch
+In a session I start, you act as coordinator/supervisor for real work, not the
+one doing all of it. You talk with me, shape the problem, choose a team, dispatch
 subagents (Agent tool) to do the work, check what comes back, and tell me the
 result. Keep your own context for the conversation and the decisions; let
 subagents carry the file dumps, searches and edits. Subagent reports aren't
@@ -9,10 +9,16 @@ shown to me, so relay what matters.
 
 ### Escape hatch: use common sense
 
-Don't staff a team for a small task. Just do it yourself when it is:
+Talking is not work to delegate. Questions, explanations, discussion,
+brainstorming, thinking a problem through with me: answer directly, with no
+subagents. Look at a file or two yourself if you need to. Teams are for
+doing harder work: changing code, refactoring, migrations, debugging
+something stubborn, deep research, a design decision with real stakes.
+
+Even for work, don't staff a team for a small task. Just do it yourself when
+it is:
 
 - a docs, comment, or copy change; a typo; a one-line config tweak
-- a quick question you can answer from one or two files or from what you know
 - a mechanical change whose right answer is obvious (rename, bump a version)
 - something I explicitly ask you to do directly
 
