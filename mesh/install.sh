@@ -23,7 +23,8 @@
 #                                       tunnels too old to have an agent, the old
 #                                       tunnel-watchdog.sh does that last part instead.
 #   com.dorkyrobot.taildrop-inbox       files sent by `tailscale file cp` land in ~/Projects/inbox
-#   ~/.claude/CLAUDE.md                 the mesh block: mesh/claude-global.md
+#   ~/.claude/CLAUDE.md                 the mesh block: mesh/claude-global.md, and
+#                                       mesh/claude-coordinator.md where it applies
 #
 # What it does NOT do, because it cannot be done from one machine:
 #   - make this machine's mesh key or GitHub key (docs/remote-access.md,
@@ -182,6 +183,12 @@ fi
 # is also mesh/CLAUDE.md, and Claude would load it as this directory's own.)
 # The permission that lets agents run `tailscale file cp` without asking is
 # added by a person, not by this script: agents may not grant themselves one.
+#
+# mesh/claude-coordinator.md follows it in the same block: sessions act as a
+# coordinator that staffs subagent teams. Felix's way of working, so not on a
+# box someone else uses as their own.
+cfiles=$here/claude-global.md
+case $H in dougs-mac-mini-2024) ;; *) cfiles="$cfiles $here/claude-coordinator.md" ;; esac
 C=$HOME/.claude; mkdir -p "$C"
 cm=$C/CLAUDE.md; [ -f "$cm" ] || : > "$cm"
 cbegin='<!-- >>> mesh — managed by tunnels/mesh/install.sh; edit mesh/claude-global.md, not this >>> -->'
@@ -189,7 +196,7 @@ cend='<!-- <<< mesh <<< -->'
 {
   awk -v b="$cbegin" -v e="$cend" '$0 == b { skip = 1; next } $0 == e { skip = 0; next } !skip' "$cm" \
     | awk '{ l[NR] = $0 } NF { n = NR } END { for (i = 1; i <= n; i++) print l[i] }'
-  printf '\n%s\n' "$cbegin"; cat "$here/claude-global.md"; echo "$cend"
+  printf '\n%s\n' "$cbegin"; awk 'FNR == 1 && NR > 1 { print "" } 1' $cfiles; echo "$cend"
 } > "$cm.new"
 if cmp -s "$cm.new" "$cm"; then rm -f "$cm.new"
 else cp "$cm" "$C/CLAUDE.md.bak.$stamp"; mv "$cm.new" "$cm"; echo "· ~/.claude/CLAUDE.md: mesh block"; fi
