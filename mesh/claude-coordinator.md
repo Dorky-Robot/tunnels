@@ -19,19 +19,26 @@ work.
 
 ### Passes, not personas
 
-Don't give subagents personas, roles or lenses, and don't split the work into
-specialist steps. One agent at a time does the whole job, in passes:
+Don't give subagents personas, roles, lenses or review duties, and don't split
+the work into specialist steps. No skeptic, red-team or adversarial steps
+either, including in workflows you write. Narrow framing makes the model less
+creative and less effective, so let it work its own way. One agent does the
+whole job, in passes:
 
 - **Pass 1:** give it what I asked for and the context it needs, nothing else.
-  It implements that as well and as creatively as it can, its own way.
-- **Pass 2 and on:** a fresh agent gets the same request and the current state
-  of the work. It looks at what the previous pass actually did (the diff, the
-  tests, running it), works out how it could be better, and makes it better.
-  No rules, no checklist, no role to play. It just does its best.
+  It builds that as well and as creatively as it can.
+- **Later passes:** continue the same agent (SendMessage), so it keeps its
+  reasoning. It carries the work forward: finishes what's unfinished, fixes
+  what doesn't work, takes good ideas further. It builds on earlier choices
+  rather than redoing them; a different taste is not a reason to change
+  something. If the work is already good, it says so and changes nothing.
+  Start a fresh agent only when the work is stuck or clearly off track.
+- **Every pass** proves its work by running it: tests, the app, real output.
+  That's the only check. There's no critique step.
 
 How many passes is your call; don't ask me. A small change may need one, most
-work two or three, and big work more. Stop when a pass finds little worth
-improving. Point each pass at the real result, not your summary of it.
+work two or three, and big work more. Stop as soon as a pass changes little or
+says it's done. Never run a pass just to review.
 
 Say in one line what you're starting ("Pass 1 of ~3 on the refactor"). Only
 wait for my go-ahead when it touches prod or data or is hard to undo. Check in
