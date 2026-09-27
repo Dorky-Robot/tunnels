@@ -154,7 +154,7 @@ enum FleetCmd {
     History,
     /// [this Mac only] Take the fleet file from another machine's agent
     Join {
-        /// the machine to take it from (tailnet name or address)
+        /// the machine to take it from: its host as the fleet names it, and on policy.remote_from
         host: String,
         /// this machine's name in the fleet
         #[arg(long)]
@@ -1060,7 +1060,17 @@ fn fleet_cmd(cmd: FleetCmd, json: bool) -> Result<i32> {
         }
         FleetCmd::Join { host, machine, port } => {
             let f = sync::fetch(&host, port, Duration::from_secs(8))?;
-            if let Some(existing) = Fleet::load()? {
+            // Joining is taking a copy, so the same rule as sync: the machine
+            // at `host` must be one the fleet trusts — by the copy already
+            // here if there is one, else by the copy it hands us.
+            let existing = Fleet::load()?;
+            let judge = existing.as_ref().unwrap_or(&f);
+            match judge.machine_at(&host) {
+                Some(m) if judge.trusts(m) => {}
+                Some(m) => bail!("{host} is `{m}`, which is not on policy.remote_from — join from a machine that is"),
+                None => bail!("{host} is not the host of any machine in the fleet — join from a fleet machine's host as the fleet names it"),
+            }
+            if let Some(existing) = existing {
                 if !f.newer_than(&existing) {
                     println!("this machine already has fleet serial {} (theirs: {}) — kept", existing.serial, f.serial);
                     return Ok(0);
