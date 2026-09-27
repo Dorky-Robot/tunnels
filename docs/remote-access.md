@@ -287,6 +287,10 @@ account by the alias in its remote: `git@github.com-nerdnest:org/repo.git`.
    them, and it gets its GitHub key.
 6. Run the matrix in the next section from each one.
 
+A machine the mesh should reach but that should reach nothing (a laptop that
+travels, someone else's Mac) gets `mesh/keys/<name>.none`, saying why, in
+place of its `.pub`: its key goes into no machine's `authorized_keys`.
+
 Taking one out is the reverse: delete its line, its `keys/` and `hostkeys/`
 files, build, commit, install everywhere, and delete its key on GitHub.
 
