@@ -150,3 +150,39 @@ pub fn notify(fleet: &Fleet, me: &str) {
         .header("X-Tunnels", "1")
         .send_json(serde_json::json!({}));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fleet::tests::sample;
+
+    fn later(f: &Fleet, serial: u64, remote_from: Option<Vec<&str>>) -> Fleet {
+        let mut g = f.clone();
+        g.serial = serial;
+        g.policy.remote_from = remote_from.map(|l| l.into_iter().map(String::from).collect());
+        g
+    }
+
+    #[test]
+    fn only_trusted_hosts_are_asked_and_only_their_copies_taken() {
+        let mut current = sample();
+        current.machines.insert("sara".into(), crate::fleet::Machine { host: "saras-mac".into(), ..Default::default() });
+        current.policy.remote_from = Some(vec!["dr1".into(), "dr2".into()]);
+        assert_eq!(trusted_hosts(&current, "dr2"), vec!["dorkyrobot1"]);
+        assert_eq!(trusted_hosts(&current, "sara"), vec!["dorkyrobot1", "dorkyrobot2"], "off the list, it still follows");
+
+        let trusted = later(&current, 9, Some(vec!["dr1", "dr2"]));
+        let hers = later(&current, 20, Some(vec!["dr1", "dr2", "sara"]));
+        let unknown = later(&current, 30, None);
+        let got = pick(&current, vec![("saras-mac".into(), hers), ("dorkyrobot1".into(), trusted), ("elsewhere".into(), unknown)]);
+        assert_eq!(got.map(|(h, f)| (h, f.serial)), Some(("dorkyrobot1".into(), 9)));
+    }
+
+    #[test]
+    fn with_no_list_every_fleet_machine_is_a_source_as_before() {
+        let current = sample();
+        assert_eq!(trusted_hosts(&current, "dr2"), vec!["dorkyrobot1"]);
+        let got = pick(&current, vec![("dorkyrobot1".into(), later(&current, 4, None)), ("not-in-the-fleet".into(), later(&current, 8, None))]);
+        assert_eq!(got.map(|(_, f)| f.serial), Some(4), "a host the fleet does not name is nobody");
+    }
+}

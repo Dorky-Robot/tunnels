@@ -746,3 +746,146 @@ fn rotating_an_accounts_tunnels_and_pasting_a_refreshed_tunnel_token() {
     let r = public(&w, "POST", "/api/account/connector", Some(&c), "tunnels.felixflor.es", Some(json!({ "token": "cfut_not_a_connector" })));
     assert_eq!(r.code, 400);
 }
+
+// ------------------------------------------------------------------ whose fleet copy is taken
+
+/// Peers that serve a fleet copy at `/api/fleet`, one copy per host name
+/// they are dialed by (the `Host` header): "127.0.0.1" is dr1 and dr2, the
+/// trusted machines, and "localhost" is sara, who is not on remote_from.
+/// Listens on both loopbacks, since "localhost" may resolve to either.
+struct Peers {
+    port: u16,
+}
+
+impl Peers {
+    fn serve(copies: impl FnOnce(u16) -> Vec<(&'static str, String)>) -> Peers {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = v4.local_addr().unwrap().port();
+        let v6 = std::net::TcpListener::bind(("::1", port)).ok();
+        let copies: std::sync::Arc<Vec<(String, String)>> = std::sync::Arc::new(copies(port).into_iter().map(|(h, t)| (h.to_string(), t)).collect());
+        for l in std::iter::once(v4).chain(v6) {
+            let copies = copies.clone();
+            std::thread::spawn(move || {
+                for s in l.incoming().flatten() {
+                    let mut r = BufReader::new(s.try_clone().unwrap());
+                    let mut line = String::new();
+                    let _ = r.read_line(&mut line);
+                    let (mut host, mut len) = (String::new(), 0usize);
+                    loop {
+                        let mut h = String::new();
+                        if r.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+                            break;
+                        }
+                        let lower = h.to_ascii_lowercase();
+                        if let Some(v) = lower.strip_prefix("host:") {
+                            let v = v.trim();
+                            host = v.rsplit_once(':').map(|(a, _)| a.to_string()).unwrap_or(v.to_string());
+                            host = host.trim_matches(|c| c == '[' || c == ']').to_string();
+                        }
+                        if let Some(v) = lower.strip_prefix("content-length:") {
+                            len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut body = vec![0; len];
+                    let _ = r.read_exact(&mut body);
+                    let copy = copies.iter().find(|(h, _)| *h == host).map(|(_, t)| t.clone());
+                    let (status, text) = match (line.starts_with("GET /api/fleet"), copy) {
+                        (true, Some(t)) => ("200 OK", t),
+                        (true, None) => ("404 Not Found", String::new()),
+                        _ => ("200 OK", "{}".to_string()),
+                    };
+                    let mut s = s;
+                    let _ = write!(s, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}", text.len());
+                }
+            });
+        }
+        Peers { port }
+    }
+}
+
+/// The fleet every test here starts from, and later versions of it.
+fn trust_fleet(port: u16, serial: u64, remote_from: &str, note: &str) -> String {
+    FLEET
+        .replace("serial = 1", &format!("serial = {serial}"))
+        .replace("web_port = 9", &format!("web_port = {port}\nremote_from = {remote_from}"))
+        .replace("[machines.dr2]", "[machines.sara]\nhost = \"localhost\"\n[machines.dr2]")
+        .replace("service = \"http://localhost:2283\"", &format!("service = \"http://localhost:2283\"\nnote = \"{note}\""))
+}
+
+const TRUSTED: &str = r#"["dr1", "dr2"]"#;
+
+fn receiver(machine: &str, port: u16) -> Sandbox {
+    let s = Sandbox::new(World::default(), machine);
+    s.write_config(json!({ "tunnels": [] }));
+    s.write_fleet(&trust_fleet(port, 1, TRUSTED, "as it was"));
+    s
+}
+
+#[test]
+fn a_trusted_peers_newer_fleet_is_taken() {
+    let p = Peers::serve(|port| vec![("127.0.0.1", trust_fleet(port, 5, TRUSTED, "from dr1"))]);
+    let s = receiver("dr2", p.port);
+    let out = s.run(&["fleet", "sync"]);
+    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    assert!(out.stdout.contains("took fleet serial 5"), "{}", out.stdout);
+    assert!(s.fleet().contains("from dr1"));
+}
+
+#[test]
+fn an_untrusted_peers_newer_fleet_is_refused() {
+    let p = Peers::serve(|port| {
+        vec![("127.0.0.1", trust_fleet(port, 1, TRUSTED, "as it was")), ("localhost", trust_fleet(port, 9, TRUSTED, "from sara"))]
+    });
+    let s = receiver("dr2", p.port);
+    let out = s.run(&["fleet", "sync"]);
+    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    assert!(!s.fleet().contains("from sara"), "sara's copy was taken: {}", out.stdout);
+    // nor by naming sara's host outright
+    let out = s.run(&["fleet", "join", "localhost", "--port", &p.port.to_string()]);
+    assert_ne!(out.code, 0);
+    assert!(out.stderr.contains("not on policy.remote_from"), "{}", out.stderr);
+    assert!(!s.fleet().contains("from sara"));
+}
+
+#[test]
+fn a_fleet_that_puts_its_own_sender_on_remote_from_is_refused() {
+    let p = Peers::serve(|port| vec![("localhost", trust_fleet(port, 9, r#"["dr1", "dr2", "sara"]"#, "from sara"))]);
+    let s = receiver("dr2", p.port);
+    let out = s.run(&["fleet", "sync"]);
+    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    assert!(out.stdout.contains("newest it can find"), "{}", out.stdout);
+    let out = s.run(&["fleet", "join", "localhost", "--port", &p.port.to_string()]);
+    assert_ne!(out.code, 0, "judged by the list already here, not the one it brings");
+    assert!(!s.fleet().contains("from sara"));
+    assert!(!s.fleet().contains("\"sara\"]"));
+}
+
+#[test]
+fn a_machine_off_the_list_follows_the_trusted_ones_but_cannot_edit() {
+    let p = Peers::serve(|port| vec![("127.0.0.1", trust_fleet(port, 5, TRUSTED, "from dr1"))]);
+    let s = receiver("sara", p.port);
+    let out = s.run(&["fleet", "sync"]);
+    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    assert!(out.stdout.contains("took fleet serial 5"), "{}", out.stdout);
+    assert!(s.fleet().contains("from dr1"));
+    // its own edit is refused rather than kept, so it never runs ahead of them
+    let before = s.fleet();
+    let out = s.run(&["route", "rm", "media.felixflor.es", "--no-apply"]);
+    assert_ne!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    assert!(out.stderr.contains("not on policy.remote_from"), "{}", out.stderr);
+    assert_eq!(s.fleet(), before);
+}
+
+#[test]
+fn a_first_join_needs_a_machine_the_copy_itself_trusts() {
+    let p = Peers::serve(|port| vec![("127.0.0.1", trust_fleet(port, 5, TRUSTED, "from dr1")), ("localhost", trust_fleet(port, 5, TRUSTED, "from sara"))]);
+    let s = Sandbox::new(World::default(), "newbox");
+    s.write_config(json!({ "tunnels": [] }));
+    let out = s.run(&["fleet", "join", "localhost", "--port", &p.port.to_string()]);
+    assert_ne!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    assert_eq!(s.fleet(), "");
+    let out = s.run(&["fleet", "join", "127.0.0.1", "--port", &p.port.to_string()]);
+    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    assert!(s.fleet().contains("from dr1"));
+}
