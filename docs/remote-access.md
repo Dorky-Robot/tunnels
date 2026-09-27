@@ -290,6 +290,12 @@ account by the alias in its remote: `git@github.com-nerdnest:org/repo.git`.
 A machine the mesh should reach but that should reach nothing (a laptop that
 travels, someone else's Mac) gets `mesh/keys/<name>.none`, saying why, in
 place of its `.pub`: its key goes into no machine's `authorized_keys`.
+Its tunnels agent is kept off `[policy] remote_from` in the fleet file, the
+same way: it takes the fleet from the machines on that list, nobody takes
+the fleet from it, and `tunnels` refuses to edit the fleet there. Add it to
+`[machines.<name>]` from a machine on the list (`tunnels fleet edit`), then
+`tunnels fleet join <host of a listed machine>` on it; any route or tunnel of
+its own is set from a listed machine with `--machine <name>`.
 
 Taking one out is the reverse: delete its line, its `keys/` and `hostkeys/`
 files, build, commit, install everywhere, and delete its key on GitHub.

@@ -54,7 +54,12 @@ rotate got here.
 - `tunnels status | plan | apply | doctor`, with `--json`. Scope is shown on
   every command.
 - The fleet file, replicated between agents over the tailnet; all six
-  machines on 0.16.6.
+  machines on 0.16.6. A copy is taken only from a machine on
+  `policy.remote_from`, judged by the copy the receiver already holds, so a
+  machine off the list (doug-mini, sara) follows the fleet but never
+  publishes it, and may not edit it: its route and tunnel changes are made
+  from a machine on the list with `--machine <name>`. Unset, the list trusts
+  every machine; empty, the fleet is invalid.
 - Guardrails: live takeovers need `--yes`, removing what the file doesn't
   mention needs `--prune`, destroying a tunnel needs `--allow-destroy`, and a
   failed DNS step rolls back its ingress change.
@@ -115,7 +120,8 @@ Built in 0.18.0: a machine with no token for an account sends the call to a
 peer's agent over the tailnet (`/api/cf-forward`). The token stays where it
 is, and the peer makes the call with the same guardrails and logs it with
 `requested_by`. `policy.remote_from` in the fleet file lists which machines
-may ask; the fleet sets it to every machine except doug-mini.
+may ask; the fleet sets it to every machine except doug-mini and sara. The
+same list decides whose fleet copies the others take.
 
 ### Picking the token
 

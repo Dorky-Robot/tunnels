@@ -70,7 +70,11 @@ an agent on every machine. There is no TUI. The web UI, served by every agent on
   runs `connector-set` wherever that tunnel's token is held. Connector tokens are refused
   wherever an API token is expected. `web::run_on` runs any action here or through the relay.
 - **sync.rs**: fleet replication. The file is served at `/api/fleet` and the newest `serial`
-  wins. `notify` wakes the peers.
+  wins, but only among machines on `policy.remote_from` as the receiver's own copy lists them
+  (`Fleet::trusts`; unset trusts all, empty is invalid). The sender is the host we dialed,
+  mapped to its machine (`Fleet::machine_at`). `notify` wakes the peers and names no host to
+  pull from. `fleet join` applies the same rule. A machine off the list follows but never
+  publishes, never merges, and `Fleet::edit` refuses there.
 - **status.rs**: the shared view model used by `tunnels status` and the web UI.
 - **scope.rs**: `Scope` for every command. `cf::Client::new` panics if the current command
   declared `Local`.
