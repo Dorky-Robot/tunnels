@@ -58,7 +58,8 @@ rotate got here.
   `policy.remote_from`, judged by the copy the receiver already holds, so a
   machine off the list (doug-mini, sara) follows the fleet but never
   publishes it, and may not edit it: its route and tunnel changes are made
-  from a machine on the list with `--machine <name>`. Unset, the list trusts
+  from a machine on the list (`tunnel adopt|create|assign --machine <name>`,
+  `route add`). Unset, the list trusts
   every machine; empty, the fleet is invalid.
 - Guardrails: live takeovers need `--yes`, removing what the file doesn't
   mention needs `--prune`, destroying a tunnel needs `--allow-destroy`, and a

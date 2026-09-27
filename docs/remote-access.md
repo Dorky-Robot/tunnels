@@ -295,7 +295,8 @@ same way: it takes the fleet from the machines on that list, nobody takes
 the fleet from it, and `tunnels` refuses to edit the fleet there. Add it to
 `[machines.<name>]` from a machine on the list (`tunnels fleet edit`), then
 `tunnels fleet join <host of a listed machine>` on it; any route or tunnel of
-its own is set from a listed machine with `--machine <name>`.
+its own is set from a listed machine (`tunnels tunnel adopt|create|assign
+… --machine <name>`, then `tunnels route add` there).
 
 Taking one out is the reverse: delete its line, its `keys/` and `hostkeys/`
 files, build, commit, install everywhere, and delete its key on GitHub.
