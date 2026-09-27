@@ -36,3 +36,7 @@ dorkyrobot1  dorkyrobot1          felixflores  100.116.247.16  ssh-dorkyrobot1.f
 # Its tunnel (DorkyRobot2) and ssh-dorkyrobot2.felixflor.es are in the same
 # Cloudflare account, so `tunnels route add` could write both ingress and DNS.
 dorkyrobot2  dorkyrobot2          dorkyrobot2  100.97.227.67   ssh-dorkyrobot2.felixflor.es       5906  felixflores  dr2
+# Sara's laptop, under her own login. No cloudflared on it (yet), so tailnet
+# and LAN are its only ways in, and it sleeps: unreachable is often just shut.
+# Host keys were read over the tailnet and matched by fingerprint from mac2024.
+sara         saras-mac            sarameiggs   100.68.208.6    -                                  5907  -
