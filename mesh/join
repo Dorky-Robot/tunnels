@@ -1,0 +1,54 @@
+#!/bin/sh
+# First contact for a new mesh machine: run it ON the new machine, at its own
+# screen, as the login the mesh will use.
+#
+#   sh join <name> <host>        e.g. sh join sara saras-mac
+#
+# It names the machine <host> (computer name, `hostname -s`, tailnet name),
+# turns on Remote Login, makes ~/.ssh/id_mesh_ed25519, and Taildrops the public
+# halves (its mesh key, its host keys, its login) to dorkyrobot2, where they go
+# into mesh/keys, mesh/hostkeys and mesh/machines. Nothing private leaves.
+#
+# It refuses on a machine that already has a mesh key: on 2026-09-26 join steps
+# meant for a new Mac were typed into dorkyrobot2, ssh-keygen replaced its key,
+# and every machine refused it (84f8f).
+set -eu
+name=${1:-} host=${2:-}
+[ -n "$name" ] && [ -n "$host" ] || { sed -n '2,6p' "$0"; exit 2; }
+die() { echo "join: $*" >&2; exit 1; }
+
+key=$HOME/.ssh/id_mesh_ed25519
+[ ! -e "$key" ] || die "this machine ($(hostname -s)) already has a mesh key — it is in the mesh; run this on the new machine"
+ts=$(command -v tailscale || echo /Applications/Tailscale.app/Contents/MacOS/Tailscale)
+[ -x "$ts" ] || die "no tailscale here; install it and sign in first"
+"$ts" status >/dev/null 2>&1 || die "tailscale is not up; sign in first"
+
+echo "join: naming this machine $host (asks for your password)"
+sudo scutil --set ComputerName "$host"
+sudo scutil --set LocalHostName "$host"
+sudo scutil --set HostName "$host"
+"$ts" set --hostname="$host"
+
+if ! sudo systemsetup -setremotelogin on >/dev/null 2>&1; then
+  echo "join: turn on Remote Login yourself: System Settings > General > Sharing > Remote Login"
+  open "x-apple.systempreferences:com.apple.Sharing-Settings.extension"
+fi
+
+# macOS makes the host keys when Remote Login first starts
+while [ ! -r /etc/ssh/ssh_host_ed25519_key.pub ]; do echo "join: waiting for Remote Login to be on…"; sleep 5; done
+
+mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+ssh-keygen -q -t ed25519 -N "" -C "mesh:$host" -f "$key"
+
+out=/tmp/join-$name.txt
+{
+  echo "name $name"
+  echo "host $host"
+  echo "user $(id -un)"
+  echo "ip $("$ts" ip -4)"
+  echo "key $(cat "$key.pub")"
+  cat /etc/ssh/ssh_host_ed25519_key.pub /etc/ssh/ssh_host_rsa_key.pub | sed 's/^/hostkey /'
+} >"$out"
+cat "$out"
+"$ts" file cp "$out" dorkyrobot2:
+echo "join: sent to dorkyrobot2. Leave this Mac awake and online while the mesh learns it."

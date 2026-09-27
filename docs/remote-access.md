@@ -270,7 +270,10 @@ account by the alias in its remote: `git@github.com-nerdnest:org/repo.git`.
 
 ### Adding a machine
 
-1. On the new machine: `ssh-keygen -t ed25519 -N "" -C "mesh:$(hostname -s)" -f ~/.ssh/id_mesh_ed25519`
+1. On the new machine, at its screen: `sh join <name> <host>` (`mesh/join`).
+   It names the box, turns on Remote Login, makes `~/.ssh/id_mesh_ed25519`
+   and Taildrops the public halves to dorkyrobot2. It refuses where a mesh
+   key already exists, so it cannot break a machine already in the mesh.
 2. Copy that `.pub` into `mesh/keys/<name>.pub`, and its host keys —
    `cat /etc/ssh/ssh_host_ed25519_key.pub /etc/ssh/ssh_host_rsa_key.pub` —
    into `mesh/hostkeys/<name>`. **Read them from the machine itself** over a
