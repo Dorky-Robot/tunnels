@@ -810,10 +810,8 @@ fn exec_local(shared: &Shared, action: &str, tunnel: &str, arg: &str, actor: &st
 /// address (or loopback), so one machine cannot claim to be another.
 fn may_forward(fleet: &Fleet, from: &str, remote: Option<std::net::IpAddr>) -> Result<(), String> {
     let m = fleet.machines.get(from).ok_or_else(|| format!("`{from}` is not a machine in the fleet"))?;
-    if let Some(list) = &fleet.policy.remote_from {
-        if !list.iter().any(|x| x == from) {
-            return Err(format!("`{from}` is not on policy.remote_from"));
-        }
+    if !fleet.trusts(from) {
+        return Err(format!("`{from}` is not on policy.remote_from"));
     }
     let Some(ip) = remote else { return Err("no remote address".into()) };
     if ip.is_loopback() {
