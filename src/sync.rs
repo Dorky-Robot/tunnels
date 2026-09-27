@@ -34,22 +34,30 @@ pub fn fetch(host: &str, port: u16, timeout: Duration) -> Result<Fleet> {
     Ok(f)
 }
 
-/// The newest copy among the peers (every machine in `fleet` but `me`, plus
-/// any `extra` hosts), if one is newer than `fleet`.
-pub fn newest_from_peers(fleet: &Fleet, me: &str, extra: &[String], timeout: Duration) -> Option<(String, Fleet)> {
-    let port = fleet.policy.web_port;
-    let mut hosts: Vec<String> = fleet
+/// The hosts a copy may be taken from: the machines on `policy.remote_from`,
+/// by the list in the copy we already hold, so a new copy cannot put its own
+/// sender on it. A machine off the list still takes from these; nobody takes
+/// from it (a laptop that travels should not re-point the mesh's hostnames).
+/// No list at all means every machine in the fleet, as before there was one.
+pub fn trusted_hosts(fleet: &Fleet, me: &str) -> Vec<String> {
+    fleet
         .machines
         .iter()
         .filter(|(name, _)| name.as_str() != me)
+        .filter(|(name, _)| fleet.policy.remote_from.as_ref().is_none_or(|l| l.iter().any(|t| t == *name)))
         .map(|(_, m)| m.host.clone())
         .filter(|h| !h.is_empty())
-        .collect();
-    for h in extra {
-        if !hosts.contains(h) {
-            hosts.push(h.clone());
-        }
-    }
+        .collect()
+}
+
+/// The newest copy among the trusted peers, if one is newer than `fleet`.
+/// `extra` hosts (a peer's `/api/notify` naming itself) only hurry a pull:
+/// one that is not a trusted peer is ignored, or any tailnet machine could
+/// hand us its copy by saying where to find it.
+pub fn newest_from_peers(fleet: &Fleet, me: &str, extra: &[String], timeout: Duration) -> Option<(String, Fleet)> {
+    let port = fleet.policy.web_port;
+    let hosts = trusted_hosts(fleet, me);
+    let _ = extra;
     let handles: Vec<_> = hosts
         .into_iter()
         .map(|h| std::thread::spawn(move || (h.clone(), fetch(&h, port, timeout))))

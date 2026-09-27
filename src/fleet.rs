@@ -55,8 +55,11 @@ pub struct Policy {
     /// not declare. Off, those show up in `plan` and wait for a person.
     #[serde(default)]
     pub prune: bool,
-    /// machines allowed to make `tunnels cf` calls through another machine's
-    /// tokens; unset means every fleet machine
+    /// the machines the rest of the fleet trusts: they may make `tunnels cf`
+    /// calls through another machine's tokens, and theirs are the only copies
+    /// of this file that other machines take (see `Fleet::trusts`). Unset
+    /// means every machine, as before the list existed; empty is refused by
+    /// `validate`, because it would leave nobody able to change the fleet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_from: Option<Vec<String>>,
     /// the web UI on the internet, behind Cloudflare Access
@@ -355,6 +358,9 @@ impl Fleet {
                 }
             }
         }
+        if self.policy.remote_from.as_ref().is_some_and(|l| l.is_empty()) {
+            out.push("policy.remote_from is empty: no machine could change the fleet any more; list the trusted machines, or remove the key to trust all of them".into());
+        }
         for m in self.policy.remote_from.iter().flatten() {
             if !self.machines.contains_key(m) {
                 out.push(format!("policy.remote_from: no machine called `{m}`"));
@@ -486,6 +492,23 @@ impl Fleet {
 
     pub fn find_route_mut(&mut self, host: &str) -> Option<&mut Route> {
         self.routes.iter_mut().find(|r| r.host.eq_ignore_ascii_case(host))
+    }
+
+    /// Does this fleet trust `machine`: may it change the fleet, and will
+    /// other machines take its copy? Unset `remote_from` trusts everyone,
+    /// which is how every fleet worked before the list existed.
+    pub fn trusts(&self, machine: &str) -> bool {
+        match &self.policy.remote_from {
+            None => true,
+            Some(list) => list.iter().any(|m| m == machine),
+        }
+    }
+
+    /// The machine whose agent is reached at `host`, matched on the host
+    /// alone (any case) — the name a copy was fetched from, never a name the
+    /// sender gave itself.
+    pub fn machine_at(&self, host: &str) -> Option<&String> {
+        self.machines.iter().find(|(_, m)| !m.host.is_empty() && m.host.eq_ignore_ascii_case(host)).map(|(n, _)| n)
     }
 
     /// A machine by its fleet name or its host, any case.
@@ -737,6 +760,25 @@ service = "http://localhost:2283"
         f.rename_tunnel("vet-standby", "vet-warm").unwrap();
         assert_eq!(f.find_route("admin.everyday.vet").unwrap().standby.as_deref(), Some("vet-warm"));
         assert!(f.validate().is_empty());
+    }
+
+    #[test]
+    fn trust_is_the_remote_from_list_and_everyone_when_it_is_unset() {
+        let mut f = sample();
+        assert!(f.trusts("dr1") && f.trusts("anyone"), "unset trusts every machine, as before");
+        f.policy.remote_from = Some(vec!["dr1".into()]);
+        assert!(f.trusts("dr1"));
+        assert!(!f.trusts("dr2"));
+        f.policy.remote_from = Some(vec![]);
+        assert!(f.validate().iter().any(|p| p.contains("remote_from is empty")), "an empty list would freeze the fleet");
+    }
+
+    #[test]
+    fn a_machine_is_identified_by_the_host_it_was_reached_at() {
+        let f = sample();
+        assert_eq!(f.machine_at("DorkyRobot1").map(String::as_str), Some("dr1"));
+        assert_eq!(f.machine_at("dr1"), None, "a name is not a host");
+        assert_eq!(f.machine_at("saras-mac"), None);
     }
 
     #[test]
