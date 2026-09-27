@@ -313,8 +313,25 @@ impl Fleet {
     /// serial, check it, write it. Reading first means two edits in a row
     /// from different processes compose instead of the second erasing the
     /// first — the lesson of the config file, applied here too.
+    ///
+    /// A machine the fleet does not trust may not edit it at all. Its edit
+    /// could never spread (nobody takes its copy), and kept locally it would
+    /// carry a serial the trusted copies have not reached, so it would stop
+    /// following them until they caught up. Refusing is simpler and leaves
+    /// it a pure follower. A machine with no fleet yet may write one: that
+    /// is how the first machine starts a fleet.
     pub fn edit(machine: &str, change: impl FnOnce(&mut Fleet) -> Result<()>) -> Result<Fleet> {
-        let mut f = Self::load()?.unwrap_or_default();
+        let current = Self::load()?;
+        if let Some(c) = &current {
+            if !c.trusts(machine) {
+                bail!(
+                    "`{machine}` is not on policy.remote_from, so it follows the fleet but does not change it; \
+                     make this change on a machine that is ({})",
+                    c.policy.remote_from.iter().flatten().cloned().collect::<Vec<_>>().join(", ")
+                );
+            }
+        }
+        let mut f = current.unwrap_or_default();
         change(&mut f)?;
         f.serial += 1;
         f.updated_at = util::now_rfc3339();
