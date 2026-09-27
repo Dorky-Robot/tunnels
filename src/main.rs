@@ -628,7 +628,7 @@ fn ctx() -> Result<Ctx> {
 /// Before changing the fleet file, take the newest copy the peers have, so
 /// this edit builds on it rather than racing it.
 fn pull_first(me: &str) {
-    match sync::pull(me, &[], Duration::from_secs(3)) {
+    match sync::pull(me, Duration::from_secs(3)) {
         Ok(Some((host, serial))) => eprintln!("  (took fleet serial {serial} from {host} first)"),
         _ => {}
     }
@@ -1076,7 +1076,7 @@ fn fleet_cmd(cmd: FleetCmd, json: bool) -> Result<i32> {
         }
         FleetCmd::Sync => {
             let c = ctx()?;
-            match sync::pull(&c.me, &[], Duration::from_secs(5))? {
+            match sync::pull(&c.me, Duration::from_secs(5))? {
                 Some((h, s)) => println!("✓ took fleet serial {s} from {h}"),
                 None => println!("this machine's copy is the newest it can find"),
             }

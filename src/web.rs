@@ -581,13 +581,9 @@ fn handle(shared: Shared, mut req: Request) {
             }
         }
         (Method::Post, "/api/notify") => {
-            #[derive(Deserialize, Default)]
-            struct N {
-                #[serde(default)]
-                from: Option<String>,
-            }
-            let n: N = serde_json::from_str(&body).unwrap_or_default();
-            agent::wake(&shared, n.from.filter(|h| !h.is_empty()));
+            // a peer's `from` is ignored: a notify hurries a pass, it never
+            // names where the fleet is taken from (sync::trusted_hosts)
+            agent::wake(&shared);
             reply_json(req, 200, &serde_json::json!({ "ok": true }));
         }
         (Method::Post, "/api/apply") => {
@@ -620,7 +616,7 @@ fn handle(shared: Shared, mut req: Request) {
                         }
                     }
                     invalidate();
-                    agent::wake(&shared, None);
+                    agent::wake(&shared);
                     reply_json(req, 200, &r)
                 }
                 Err(e) => reply_err(req, 500, &format!("{e:#}")),
@@ -643,7 +639,7 @@ fn handle(shared: Shared, mut req: Request) {
                         m.lock().unwrap().event("admin", format!("{}: {} {}", who.who, if promote { "promoted" } else { "failed back" }, h.host));
                     }
                     invalidate();
-                    agent::wake(&shared, None);
+                    agent::wake(&shared);
                     reply_json(req, 200, &r)
                 }
                 Err(e) => reply_err(req, 400, &format!("{e:#}")),
@@ -799,7 +795,7 @@ fn exec_local(shared: &Shared, action: &str, tunnel: &str, arg: &str, actor: &st
             }
         }
         "agent-pass" => {
-            agent::wake(shared, None);
+            agent::wake(shared);
             "agent pass started".to_string()
         }
         a => return Err(anyhow!("unknown action `{a}`")),

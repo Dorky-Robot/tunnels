@@ -6,8 +6,10 @@
 //! week catches up from whichever peer is awake. No central server, no
 //! GitHub, nothing outside the mesh that has to be up.
 //!
-//! Trust boundary: the tailnet. Agents only answer tailnet and loopback
-//! addresses, and a copy is only adopted if it parses and validates.
+//! Trust boundary: the tailnet, and then `policy.remote_from`. Agents only
+//! answer tailnet and loopback addresses; a copy is only taken from a
+//! machine the copy we already hold trusts, and only if it parses and
+//! validates. A machine off the list follows but is never followed.
 
 use crate::fleet::Fleet;
 use anyhow::{Context, Result, anyhow};
@@ -34,44 +36,51 @@ pub fn fetch(host: &str, port: u16, timeout: Duration) -> Result<Fleet> {
     Ok(f)
 }
 
-/// The hosts a copy may be taken from: the machines on `policy.remote_from`,
-/// by the list in the copy we already hold, so a new copy cannot put its own
-/// sender on it. A machine off the list still takes from these; nobody takes
-/// from it (a laptop that travels should not re-point the mesh's hostnames).
-/// No list at all means every machine in the fleet, as before there was one.
+/// The hosts a copy may be taken from: the machines the copy we already
+/// hold trusts (`Fleet::trusts`, i.e. `policy.remote_from`). Judging by our
+/// own copy means a new copy cannot put its sender on the list and so admit
+/// itself. A machine off the list still takes from these; nobody takes from
+/// it (a laptop that travels should not re-point the mesh's hostnames).
+///
+/// A copy's sender is the host we dialed, named in our own fleet — the same
+/// host-to-machine identity `/api/cf-forward` checks the other way round.
+/// Nothing the sender says about itself counts, and `/api/notify` only
+/// hurries a pass: it no longer names hosts to pull from, or any tailnet
+/// machine could have its copy taken by pointing us at itself.
 pub fn trusted_hosts(fleet: &Fleet, me: &str) -> Vec<String> {
     fleet
         .machines
         .iter()
-        .filter(|(name, _)| name.as_str() != me)
-        .filter(|(name, _)| fleet.policy.remote_from.as_ref().is_none_or(|l| l.iter().any(|t| t == *name)))
+        .filter(|(name, _)| name.as_str() != me && fleet.trusts(name))
         .map(|(_, m)| m.host.clone())
         .filter(|h| !h.is_empty())
         .collect()
 }
 
-/// The newest copy among the trusted peers, if one is newer than `fleet`.
-/// `extra` hosts (a peer's `/api/notify` naming itself) only hurry a pull:
-/// one that is not a trusted peer is ignored, or any tailnet machine could
-/// hand us its copy by saying where to find it.
-pub fn newest_from_peers(fleet: &Fleet, me: &str, extra: &[String], timeout: Duration) -> Option<(String, Fleet)> {
-    let port = fleet.policy.web_port;
-    let hosts = trusted_hosts(fleet, me);
-    let _ = extra;
-    let handles: Vec<_> = hosts
-        .into_iter()
-        .map(|h| std::thread::spawn(move || (h.clone(), fetch(&h, port, timeout))))
-        .collect();
+/// Of the copies fetched, the newest one from a trusted host that is newer
+/// than `current`. Pure, so the rule is tested without a network.
+pub fn pick(current: &Fleet, fetched: Vec<(String, Fleet)>) -> Option<(String, Fleet)> {
     let mut best: Option<(String, Fleet)> = None;
-    for h in handles {
-        let Ok((host, Ok(f))) = h.join() else { continue };
-        let beats_current = f.newer_than(fleet);
+    for (host, f) in fetched {
+        let trusted = current.machine_at(&host).is_some_and(|m| current.trusts(m));
+        let beats_current = f.newer_than(current);
         let beats_best = best.as_ref().map(|(_, b)| f.newer_than(b)).unwrap_or(true);
-        if beats_current && beats_best {
+        if trusted && beats_current && beats_best {
             best = Some((host, f));
         }
     }
     best
+}
+
+/// The newest copy among the trusted peers, if one is newer than `fleet`.
+pub fn newest_from_peers(fleet: &Fleet, me: &str, timeout: Duration) -> Option<(String, Fleet)> {
+    let port = fleet.policy.web_port;
+    let handles: Vec<_> = trusted_hosts(fleet, me)
+        .into_iter()
+        .map(|h| std::thread::spawn(move || (h.clone(), fetch(&h, port, timeout))))
+        .collect();
+    let fetched = handles.into_iter().filter_map(|h| h.join().ok()).filter_map(|(h, r)| r.ok().map(|f| (h, f))).collect();
+    pick(fleet, fetched)
 }
 
 /// Bring this machine's copy up to date. Returns where a newer copy came from.
@@ -82,11 +91,15 @@ pub fn newest_from_peers(fleet: &Fleet, me: &str, extra: &[String], timeout: Dur
 /// from the fleet. So when the copy being taken has the *same* serial as
 /// ours, the two are merged instead: everything ours has that theirs lacks
 /// is added, and the result is a new serial that every machine then takes.
-pub fn pull(me: &str, extra: &[String], timeout: Duration) -> Result<Option<(String, u64)>> {
+///
+/// Only a machine the fleet trusts merges: a merge is an edit, and a machine
+/// off `remote_from` does not edit the fleet (see `Fleet::edit`); it takes
+/// theirs.
+pub fn pull(me: &str, timeout: Duration) -> Result<Option<(String, u64)>> {
     let Some(current) = Fleet::load()? else { return Ok(None) };
-    match newest_from_peers(&current, me, extra, timeout) {
+    match newest_from_peers(&current, me, timeout) {
         Some((host, f)) => {
-            if f.serial == current.serial {
+            if f.serial == current.serial && current.trusts(me) {
                 let mut merged = f.clone();
                 let added = merged.absorb(&current);
                 if !added.is_empty() {

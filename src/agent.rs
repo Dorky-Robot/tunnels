@@ -55,8 +55,6 @@ pub struct State {
     pub started_at: String,
     pub last_tick: Option<Tick>,
     pub events: VecDeque<Event>,
-    /// hosts that told us they have a newer fleet copy
-    pub pull_from: Vec<String>,
     pub wake: bool,
     /// per local tunnel: passes in a row it has looked unhealthy, and when it
     /// was last restarted
@@ -75,14 +73,12 @@ impl State {
     }
 }
 
-pub fn wake(shared: &Shared, from: Option<String>) {
+/// Run a pass now. A peer's notify only hurries the pull; where the copy
+/// comes from is still the trusted peers (`sync::trusted_hosts`), never a
+/// host the notify names.
+pub fn wake(shared: &Shared) {
     let (m, cv) = &**shared;
     let mut s = m.lock().unwrap();
-    if let Some(h) = from {
-        if !s.pull_from.contains(&h) {
-            s.pull_from.push(h);
-        }
-    }
     s.wake = true;
     cv.notify_all();
 }
@@ -165,14 +161,13 @@ pub fn run() -> Result<()> {
 fn tick(shared: &Shared) -> Result<Tick> {
     let (m, _) = &**shared;
     let mut config = Config::load()?;
-    let extra: Vec<String> = std::mem::take(&mut m.lock().unwrap().pull_from);
     let existing = Fleet::load()?;
     let me = fleet::this_machine(&config, existing.as_ref());
     m.lock().unwrap().machine = me.clone();
 
     // 1. the newest fleet file anyone has
     if existing.is_some() {
-        match sync::pull(&me, &extra, Duration::from_secs(4)) {
+        match sync::pull(&me, Duration::from_secs(4)) {
             Ok(Some((host, serial))) => m.lock().unwrap().event("sync", format!("took fleet serial {serial} from {host}")),
             Ok(None) => {}
             Err(e) => m.lock().unwrap().event("error", format!("syncing the fleet file: {e:#}")),
