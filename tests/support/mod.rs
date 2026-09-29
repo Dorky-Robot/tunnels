@@ -370,12 +370,19 @@ impl Sandbox {
             .env("TUNNELS_LAUNCH_AGENTS", self.path("LaunchAgents"))
             .env("TUNNELS_LOG_DIR", self.path("logs"))
             .env("TUNNELS_LAUNCHCTL", "/usr/bin/true")
+            .env("TUNNELS_LAUNCH_DAEMONS", self.path("LaunchDaemons"))
+            .env("TUNNELS_SUDO", "/usr/bin/false")
             .env_remove("SSH_CONNECTION")
             .env_remove("SSH_TTY");
         c
     }
 
     pub fn run(&self, args: &[&str]) -> Out {
+        self.run_env(args, &[])
+    }
+
+    /// `run`, with some of the stand-ins (launchctl, sudo) swapped.
+    pub fn run_env(&self, args: &[&str], env: &[(&str, String)]) -> Out {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_tunnels"))
             .args(args)
             .env("TUNNELS_CONFIG", self.path("config/config.json"))
@@ -385,8 +392,11 @@ impl Sandbox {
             .env("TUNNELS_LAUNCH_AGENTS", self.path("LaunchAgents"))
             .env("TUNNELS_LOG_DIR", self.path("logs"))
             .env("TUNNELS_LAUNCHCTL", "/usr/bin/true")
+            .env("TUNNELS_LAUNCH_DAEMONS", self.path("LaunchDaemons"))
+            .env("TUNNELS_SUDO", "/usr/bin/false")
             .env_remove("SSH_CONNECTION")
             .env_remove("SSH_TTY")
+            .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
             .stdin(std::process::Stdio::null())
             .output()
             .unwrap();
