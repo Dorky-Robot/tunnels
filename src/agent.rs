@@ -322,7 +322,9 @@ fn failover(fleet: &Fleet, snap: &observe::Snapshot, me: &str, shared: &Shared) 
     let mut to_promote = Vec::new();
     for r in &fleet.routes {
         let Some(sb) = &r.standby else { continue };
-        if fleet.machine_of(sb) != Some(me) || r.on_standby() {
+        // a cold standby has nothing listening until its runbook starts it,
+        // so failing over to it automatically would only trade down for 502
+        if fleet.machine_of(sb) != Some(me) || r.on_standby() || fleet.cold_standby_of(r).is_some() {
             m.lock().unwrap().down_since.remove(&r.host);
             continue;
         }
