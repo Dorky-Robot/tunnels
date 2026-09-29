@@ -25,11 +25,34 @@
 # update`, for fourteen hours. Loaded, so the check above passed it. launchd
 # had simply never tried; one `launchctl kickstart` each brought them up.
 set -eu
+# A tunnel can also be a root LaunchDaemon under the same label (doug-mini,
+# 2026-09-29, so it is up at boot with nobody logged in). Then that copy is
+# the tunnel: a LaunchAgent left beside it is a leftover, never loaded again.
+DAEMONS=${WATCHDOG_DAEMONS:-/Library/LaunchDaemons}
 if [ "$(id -u)" -eq 0 ]; then
+  LOG=${WATCHDOG_LOG:-/var/log/tunnel-watchdog.log}
+  # System cloudflared daemons first, since they need no login and neither
+  # does this. KeepAlive covers a crash; nothing covers one booted out.
+  if [ "${WATCHDOG_DRY:-}" != 1 ]; then
+    for plist in "$DAEMONS"/com.cloudflare.cloudflared*.plist; do
+      [ -f "$plist" ] || continue
+      label=$(basename "$plist" .plist)
+      if ! st=$(launchctl print "system/$label" 2>/dev/null); then
+        echo "$(date -u +%FT%TZ) system/$label: not loaded — bootstrapping" >>"$LOG"
+        launchctl bootstrap system "$plist" >/dev/null 2>&1 \
+          && echo "$(date -u +%FT%TZ) system/$label: back" >>"$LOG" \
+          || echo "$(date -u +%FT%TZ) system/$label: bootstrap refused" >>"$LOG"
+      elif ! printf '%s\n' "$st" | grep -q '^	state = running' \
+        && [ "$(plutil -extract KeepAlive raw -o - "$plist" 2>/dev/null || true)" = true ]; then
+        echo "$(date -u +%FT%TZ) system/$label: loaded, not running — kickstarting" >>"$LOG"
+        launchctl kickstart "system/$label" >/dev/null 2>&1 \
+          || echo "$(date -u +%FT%TZ) system/$label: kickstart refused" >>"$LOG"
+      fi
+    done
+  fi
   who_=$(stat -f %Su /dev/console)
   case "$who_" in root|loginwindow|_mbsetupuser) exit 0 ;; esac
   HOME=$(dscl . -read "/Users/$who_" NFSHomeDirectory | sed 's/^NFSHomeDirectory: //')
-  LOG=/var/log/tunnel-watchdog.log
 else
   LOG="$HOME/Library/Logs/tunnel-watchdog.log"
 fi
@@ -49,6 +72,7 @@ DOMAIN="gui/$UID_"
 AGENTS="$HOME/Library/LaunchAgents"
 for label in "$@"; do
   plist="$AGENTS/$label.plist"
+  [ -f "$DAEMONS/$label.plist" ] && continue    # the system daemon runs it
   [ -f "$plist" ] || { echo "$(date -u +%FT%TZ) $label: no plist at $plist"; continue; }
   if launchctl print "$DOMAIN/$label" >/dev/null 2>&1; then
     continue                     # loaded; the pass below starts it if it must
@@ -68,6 +92,7 @@ done
 for plist in "$AGENTS"/*.plist; do
   [ -f "$plist" ] || continue
   label=$(basename "$plist" .plist)
+  [ -f "$DAEMONS/$label.plist" ] && continue    # the system daemon runs it
   st=$(launchctl print "$DOMAIN/$label" 2>/dev/null) || continue   # not loaded: not ours to load
   printf '%s\n' "$st" | grep -q '^	state = running' && continue
   runs=$(printf '%s\n' "$st" | sed -n 's/^	runs = //p')
