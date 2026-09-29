@@ -109,7 +109,10 @@ bootstrap could run.
 - Restart loaded jobs with `launchctl kickstart -k` (`launchd::kickstart`).
 - When a plist has to change, `launchd::restart` detaches both halves whenever
   `SSH_CONNECTION`/`SSH_TTY` is set.
-- The agent reloads booted-out jobs; this replaces `scripts/tunnel-watchdog.sh`.
+- The agent reloads booted-out jobs. It is a user agent, though, and the macOS 27 upgrade
+  (2026-09-23) left every user agent loaded at `runs = 0`, the agent included, so
+  `scripts/tunnel-watchdog.sh` stays: as a root LaunchDaemon (`mesh/*.daemon.plist`) it
+  starts them again. `tunnels agent install` removes only the user-agent copy.
 - Connector tokens live in `~/.config/tunnels/tokens/<id>` (0600) and plists use `--token-file`,
   so a token change needs only a kickstart.
 
