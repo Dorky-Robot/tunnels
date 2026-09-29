@@ -171,6 +171,18 @@ fleet file (`active = "standby"`), so a primary that comes back does not pull th
 its own; failing back is always your decision. Use `manual` (the default) for anything whose
 standby does not share the primary's data.
 
+A standby whose apps must not run until failover is **cold**. Say so on the standby tunnel:
+
+```toml
+[tunnels.vet-standby]
+standby_mode = "cold"                        # nothing listens here until the runbook starts it
+promote_with = "on mac2024: sh failover.sh dorkyrobot2"
+```
+
+Then `tunnels promote` and the UI refuse to move its routes and print `promote_with` instead,
+the agent never fails over to it automatically, and nothing reports its empty ports as broken.
+`failback` still works.
+
 ## The web UI
 
 `tunnels web` prints the address. The UI shows:
