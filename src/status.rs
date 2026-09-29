@@ -24,6 +24,10 @@ pub struct RouteRow {
     pub note: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failover: Option<String>,
+    /// the route's standby is cold: what promotes it (possibly empty),
+    /// since `tunnels promote` will not
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cold_standby: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -129,6 +133,7 @@ pub fn build(fleet: &Fleet, snap: &Snapshot, local: Option<&LocalObs>, plan: Pla
                 dns_target,
                 note: r.note.clone(),
                 failover: r.failover.map(|f| format!("{f:?}").to_lowercase()),
+                cold_standby: fleet.cold_standby_of(r).map(|(_, t)| t.promote_with.clone()),
             });
         }
         if let Some(o) = obs {
@@ -146,6 +151,7 @@ pub fn build(fleet: &Fleet, snap: &Snapshot, local: Option<&LocalObs>, plan: Pla
                     dns_target,
                     note: String::new(),
                     failover: None,
+                    cold_standby: None,
                 });
             }
         }
@@ -175,7 +181,7 @@ pub fn build(fleet: &Fleet, snap: &Snapshot, local: Option<&LocalObs>, plan: Pla
             .into_iter()
             .map(|(host, service)| {
                 let (dns, dns_target) = dns_state(fleet, snap, &host, &o.tunnel.id);
-                RouteRow { host, service, role: "undeclared".into(), active: false, dns, dns_target, note: String::new(), failover: None }
+                RouteRow { host, service, role: "undeclared".into(), active: false, dns, dns_target, note: String::new(), failover: None, cold_standby: None }
             })
             .collect();
         rows.push(TunnelRow {

@@ -233,7 +233,8 @@ function dnsTag(r) {
 
 function roleTag(r) {
   if (r.role === "primary") return r.active ? "" : st("info", "traffic on standby");
-  if (r.role === "standby") return r.active ? st("warn", "serving from here (standby)") : `<span class="mute">standby</span>`;
+  if (r.role === "standby") return r.active ? st("warn", "serving from here (standby)")
+    : r.cold_standby != null ? `<span class="mute" title="nothing listens here until its runbook starts the apps">cold standby</span>` : `<span class="mute">standby</span>`;
   return st("warn", "not in the fleet file");
 }
 
@@ -373,16 +374,19 @@ const curTag = x => x === true ? `<span class="tag good">current</span>` : x ===
 function tunnelBlock(t, m, acct, admin) {
   const name = t.alias || t.cf_name;
   const held = acct && m ? acct.tunnels.find(([h, c]) => h === m && c.alias === t.alias) : null;
-  const standby = new Set(); state.tunnels.forEach(x => x.routes.forEach(r => { if (r.role === "standby") standby.add(r.host); }));
+  // a cold standby is promoted by its runbook, never by a DNS flip from here
+  const standby = new Set(); state.tunnels.forEach(x => x.routes.forEach(r => { if (r.role === "standby" && r.cold_standby == null) standby.add(r.host); }));
   const canFailOver = t.routes.filter(r => r.role === "primary" && r.active && standby.has(r.host));
   const canFailBack = t.routes.filter(r => r.role === "standby" && r.active);
+  const runbooks = [...new Set(t.routes.filter(r => r.role === "primary" && r.active && r.cold_standby != null).map(r => r.cold_standby || "its runbook"))];
   const health = t.state === "up" ? st("ok", `Up · ${t.connectors} connection${t.connectors === 1 ? "" : "s"}`, t.colos.join(", ") + (t.versions.length ? ` · cloudflared ${t.versions.join(", ")}` : ""))
     : t.state === "down" ? st("bad", "Down — no connections") : st("warn", t.state === "missing" ? "Missing in Cloudflare" : "Unknown");
   const btns = !m || !t.alias ? "" : `<span class="tun-acts">
     <button class="text" data-mlogs="${esc(m)}|${esc(t.alias)}">Logs</button>
     ${admin ? `<button class="text" data-relay="${esc(m)}|tunnel-restart|${esc(t.alias)}">Restart</button>` : ""}
     ${admin && canFailOver.length ? `<button class="text" data-failover="${esc(t.alias)}">Fail over to standby…</button>` : ""}
-    ${admin && canFailBack.length ? `<button class="text" data-failbackt="${esc(t.alias)}">Fail back…</button>` : ""}</span>`;
+    ${admin && canFailBack.length ? `<button class="text" data-failbackt="${esc(t.alias)}">Fail back…</button>` : ""}
+    ${runbooks.length ? `<span class="mute">cold standby, promote with: ${esc(runbooks.join("; "))}</span>` : ""}</span>`;
   // where this tunnel's hostnames can fail over to, or which primary it stands in for
   const pairs = [...new Set(state.tunnels.filter(x => x !== t).flatMap(x => x.routes
     .filter(r => t.routes.some(q => q.host === r.host) && (canFailOver.length ? r.role === "standby" : r.role === "primary"))
@@ -554,7 +558,7 @@ document.addEventListener("click", async e => {
   if (b.dataset.failover || b.dataset.failbackt) {
     const alias = b.dataset.failover || b.dataset.failbackt, over = !!b.dataset.failover;
     const t = state.tunnels.find(x => x.alias === alias);
-    const standby = new Set(); state.tunnels.forEach(x => x.routes.forEach(r => { if (r.role === "standby") standby.add(r.host); }));
+    const standby = new Set(); state.tunnels.forEach(x => x.routes.forEach(r => { if (r.role === "standby" && r.cold_standby == null) standby.add(r.host); }));
     const hosts = over ? t.routes.filter(r => r.role === "primary" && r.active && standby.has(r.host)).map(r => r.host)
                        : t.routes.filter(r => r.role === "standby" && r.active).map(r => r.host);
     return ask(b, { danger: true, label: over ? "Fail over the ticked ones" : "Fail back the ticked ones",
