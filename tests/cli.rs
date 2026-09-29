@@ -278,6 +278,24 @@ fn promote_and_failback_move_dns_and_record_it_in_the_fleet() {
 }
 
 #[test]
+fn promote_refuses_a_cold_standby_and_names_its_runbook() {
+    // the everyday.vet standby is cold on purpose: a DNS flip alone would
+    // send production names to ports nothing listens on
+    let s = sandbox();
+    let cold = FLEET.replace(
+        "machine = \"dr2\"\n[tunnels.dr2-home]",
+        "machine = \"dr2\"\nstandby_mode = \"cold\"\npromote_with = \"on mac2024: sh failover.sh dorkyrobot2\"\n[tunnels.dr2-home]",
+    );
+    assert_ne!(cold, FLEET);
+    s.write_fleet(&cold);
+    let out = s.run(&["promote", "admin.everyday.vet"]);
+    assert_ne!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    assert!(out.stderr.contains("sh failover.sh dorkyrobot2"), "{}", out.stderr);
+    assert_eq!(s.world().cname("admin.everyday.vet").as_deref(), Some(format!("{PROD}.cfargotunnel.com").as_str()), "DNS untouched");
+    assert!(!s.fleet().contains("active ="));
+}
+
+#[test]
 fn import_writes_down_what_exists_and_skips_what_does_not_agree() {
     let s = sandbox();
     std::fs::remove_file(s.path("config/fleet.toml")).unwrap();

@@ -872,6 +872,11 @@ pub fn switch(host: &str, promote: bool) -> Result<apply::Report> {
     if r.standby.is_none() {
         return Err(anyhow!("{host} has no standby"));
     }
+    if promote {
+        if let Some(why) = fleet.promote_refusal(r) {
+            return Err(anyhow!(why));
+        }
+    }
     let f = Fleet::edit(&me, |f| {
         let r = f.find_route_mut(host).unwrap();
         r.active = if promote { Some("standby".into()) } else { None };
