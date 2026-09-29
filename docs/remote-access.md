@@ -166,6 +166,12 @@ shows `runs` climbing every five minutes, and `/var/log/tunnel-watchdog.log`
 says what it did (it is silent when all is well). To make it run now:
 `sudo launchctl kickstart system/com.dorkyrobot.tunnel-watchdog`.
 
+As root, it also looks after cloudflared tunnels that run as system daemons
+(`/Library/LaunchDaemons/com.cloudflare.cloudflared*.plist`), even with
+nobody logged in. It bootstraps one that was booted out and kickstarts one
+that is loaded but not running. It never loads a LaunchAgent whose label has
+such a daemon; that agent is a leftover.
+
 install.sh never touches the daemon copy: after the script changes, re-run
 the `install` line for it; the next run picks it up. Where the agent is too
 old to exist, install.sh still puts the watchdog in as a user agent that
@@ -189,6 +195,9 @@ untested backdoor is a rumour.
    the LAN path and the tailnet path fail differently rather than together.
 3. Reboot it and confirm it comes back **without anyone logging in**. If it
    does not, the tunnel is still a user agent and that is the thing to fix.
+   doug-mini's tunnel is a root LaunchDaemon for exactly this reason
+   (2026-09-29), with the same label as the old agent. tunnels manages it in
+   the `system` domain.
 
 ## The mesh, set up identically
 

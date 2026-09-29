@@ -115,6 +115,11 @@ bootstrap could run.
   starts them again. `tunnels agent install` removes only the user-agent copy.
 - Connector tokens live in `~/.config/tunnels/tokens/<id>` (0600) and plists use `--token-file`,
   so a token change needs only a kickstart.
+- A tunnel can run as a root LaunchDaemon (`/Library/LaunchDaemons/<label>.plist`, same label),
+  so it is up at boot without a login (doug-mini). That copy wins: `launchd.rs` reads it through
+  `launchctl print system/<label>`, never writes a LaunchAgent beside it, and acts through
+  `sudo -n`. A refusal names the exact commands to run. A new token goes file to file into the
+  daemon's root-owned `--token-file`.
 
 ## Build, test, release
 
