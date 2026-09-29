@@ -129,7 +129,10 @@ cargo build --release
 ```
 
 Release: bump `Cargo.toml`, tag `vX.Y.Z`, and push the tag. `.github/workflows/release.yml`
-builds both architectures and updates `dorky-robot/homebrew-tap`.
+builds both architectures, signs them with the Developer ID and notarizes them
+(`scripts/release/`), and updates `dorky-robot/homebrew-tap`. Without the signing secrets a tag
+release fails on purpose: an unsigned binary gets a new firewall identity at every `brew upgrade`
+and the agent drops off the tailnet. README "Releases" has the secrets, rotation, and checks.
 
 `mesh/` is the one source for the mesh ssh config (three paths per machine: tailnet, `-lan`,
 `cloudflare-`). Push it to every machine with `sh mesh/install.sh`, which also runs

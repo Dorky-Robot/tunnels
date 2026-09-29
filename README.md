@@ -323,6 +323,99 @@ boots out a job it isn't about to load again, and it detaches restarts made over
 `docs/remote-access.md` describes the incident behind these rules and the three independent ways
 into each machine.
 
+## Releases
+
+Bump `Cargo.toml`, tag `vX.Y.Z`, push the tag. `.github/workflows/release.yml` builds both
+architectures, signs and notarizes each binary, publishes the tarballs, and updates the formula in
+`dorky-robot/homebrew-tap`.
+
+### Why releases are signed
+
+The macOS application firewall identifies an unsigned (or ad-hoc signed) binary by its path, and
+every `brew upgrade` installs to a new Cellar path. After the 0.24.0 → 0.25.0 upgrade the old
+allow rules stopped matching, the firewall silently dropped tailnet connections to the agent on
+`:7630` on every machine, and fleet sync, health checks and `fleet join` all stopped until someone
+clicked Allow at each screen. The x86_64 build was worse: the linker ad-hoc signs only arm64, so
+the Intel binary was not signed at all.
+
+A binary signed with our Developer ID and notarized by Apple has the same identity in every version
+(identifier `com.dorkyrobot.tunnels` plus our team ID), and "automatically allow downloaded signed
+software" (on by default) lets it through without a rule, even on a machine that has never run it.
+
+The release job fails when the signing secrets are missing or notarization is not `Accepted`. It
+never ships an unsigned binary. Signing happens before packaging, so the formula's sha256 is the
+signed tarball's.
+
+Two notes:
+
+- A bare CLI binary can't be stapled (`stapler` takes only apps, pkgs and dmgs). Apple keeps the
+  ticket, and macOS looks it up online the first time it assesses the binary.
+- Homebrew re-signs a binary ad-hoc if it has to rewrite its load commands, which would throw our
+  signature away. It only does that for rpaths and non-system dylibs, so `sign.sh` refuses a
+  binary that has either.
+
+### Secrets
+
+Set on `Dorky-Robot/tunnels` (Settings › Secrets › Actions):
+
+| Secret | What it is |
+|--------|------------|
+| `MACOS_CERT_P12_BASE64` | base64 of a `.p12` holding the *Developer ID Application* certificate and its private key |
+| `MACOS_CERT_P12_PASSWORD` | that `.p12`'s password |
+| `APPLE_API_KEY_P8_BASE64` | base64 of the App Store Connect API key (`AuthKey_<id>.p8`, Developer role) |
+| `APPLE_API_KEY_ID` | that key's Key ID |
+| `APPLE_API_ISSUER_ID` | the Issuer ID shown above the key list in App Store Connect › Users and Access › Integrations |
+
+```bash
+openssl x509 -inform der -in developerID_application.cer -out cert.pem
+openssl pkcs12 -export -legacy -inkey developer-id.key -in cert.pem -out tunnels.p12   # LibreSSL: drop -legacy
+base64 -i tunnels.p12 | gh secret set MACOS_CERT_P12_BASE64 -R Dorky-Robot/tunnels
+gh secret set MACOS_CERT_P12_PASSWORD -R Dorky-Robot/tunnels
+base64 -i AuthKey_XXXXXXXXXX.p8 | gh secret set APPLE_API_KEY_P8_BASE64 -R Dorky-Robot/tunnels
+gh secret set APPLE_API_KEY_ID -R Dorky-Robot/tunnels
+gh secret set APPLE_API_ISSUER_ID -R Dorky-Robot/tunnels
+```
+
+(`-legacy` because `security import` on older macOS can't read OpenSSL 3's default p12 encryption.)
+
+The workflow imports the `.p12` into a throwaway keychain (`scripts/release/keychain.sh`), finds
+the one *Developer ID Application* identity in it by name (`sign.sh`), signs with the hardened
+runtime and a secure timestamp, checks the result, sends it to `notarytool` (`notarize.sh`, which
+prints Apple's log either way), and deletes the keychain.
+
+### Rotating
+
+A Developer ID Application certificate lasts five years. Before it expires, make a new CSR, create
+a new certificate in the Apple Developer portal, build a new `.p12`, and replace the two
+`MACOS_CERT_*` secrets. Nothing in the repo changes, because the identity is looked up by name.
+The team ID stays the same, so the new signature satisfies the same requirement and the firewall
+keeps trusting it. Binaries already released stay valid after the old certificate expires,
+because each carries a secure timestamp. Only a *revoked* certificate invalidates them, and then
+you need a new release.
+
+The API key does not expire. If it leaks, revoke it in App Store Connect, make a new one, and
+replace the three `APPLE_API_*` secrets.
+
+### Checking an installed binary
+
+```bash
+b=$(readlink -f "$(which tunnels)")
+codesign -dvv "$b"        # Identifier=com.dorkyrobot.tunnels, Authority=Developer ID Application: …,
+                          # TeamIdentifier=<ours>, flags=0x10000(runtime); never Signature=adhoc
+codesign --verify --strict --verbose=2 "$b"
+spctl -a -vv -t install "$b"                                   # accepted, source=Notarized Developer ID
+codesign --verify --check-notarization -R=notarized "$b"       # exit 0 once Apple has the ticket
+/usr/libexec/ApplicationFirewall/socketfilterfw --getallowsigned   # downloaded signed software ENABLED
+```
+
+`spctl --assess --type execute` rejects any bare CLI binary, notarized or not, with "the code is
+valid but does not seem to be an app". That is expected. Its `origin=` line still names the
+signer.
+
+To rehearse the signing steps without the real certificate, make a self-signed code-signing
+`.p12`, run `keychain.sh setup`, then `SIGN_ALLOW_UNTRUSTED=1 KEYCHAIN=… scripts/release/sign.sh
+<binary>`, and finish with `keychain.sh cleanup`. Never set `SIGN_ALLOW_UNTRUSTED` in the workflow.
+
 ## License
 
 Licensed under either of:
