@@ -89,7 +89,7 @@
   .routes .svc { color: var(--mute); }
   /* status: icon + text + color, never color alone (Carbon status indicators) */
   .status { display: inline-flex; gap: 4px; align-items: baseline; font-size: 13px; white-space: nowrap; }
-  .status.ok { color: var(--up); } .status.bad { color: var(--down); } .status.warn { color: var(--warn); } .status.info { color: var(--mute); }
+  .status.ok { color: var(--up); } .status.bad { color: var(--down); } .status.warn { color: var(--warn); } .status.info, .status.unknown { color: var(--mute); }
   /* quiet buttons for routine actions; one visible emphasis level per row (Material 3, Atlassian) */
   button.text { border-color: transparent; background: transparent; color: var(--accent); padding: 4px 8px; }
   button.text:hover { border-color: var(--line); }
@@ -218,7 +218,7 @@ function ago(iso) {
 
 /// A status as icon + text + color (never color alone).
 function st(kind, text, title) {
-  const icon = { ok: "✓", bad: "✗", warn: "▲", info: "·" }[kind] || "·";
+  const icon = { ok: "✓", bad: "✗", warn: "▲", info: "·", unknown: "?" }[kind] || "·";
   return `<span class="status ${kind}"${title ? ` title="${esc(title)}"` : ""}>${icon} ${esc(text)}</span>`;
 }
 
@@ -411,7 +411,9 @@ function machineIssues(m) {
     const dns = t.routes.filter(r => r.active && (r.dns === "missing" || r.dns === "elsewhere")).length;
     if (dns) out.push(`${dns} DNS problem${dns > 1 ? "s" : ""}`);
   }
+  if (accounts.some(a => a.unknown.includes(m))) out.push("agent not answering — tokens can't be checked");
   for (const a of accounts) {
+    if (a.unknown.includes(m)) continue;   // unknown is not missing
     a.holders.filter(([h, t]) => h === m && !t.valid).forEach(() => out.push(`${a.alias || a.name} API token rejected`));
     a.tunnels.filter(([h, c]) => h === m && c.current === false && !c.runs_elsewhere).forEach(([, c]) => out.push(`${c.alias || c.name} token out of date`));
     const runsHere = state.tunnels.some(t => t.machine === m && t.account === (a.alias || a.name));
@@ -420,31 +422,54 @@ function machineIssues(m) {
   return out;
 }
 
-/// The machine's tokens, per account, with the actions that change them —
-/// kept apart from the routine tunnel actions above.
-function tokensSection(m, aliases, acctOf) {
-  const rows = aliases.map(alias => {
-    const acct = acctOf(alias); if (!acct) return "";
-    const ai = accounts.indexOf(acct);
-    const toks = acct.holders.filter(([h]) => h === m).map(([, t]) => t);
-    const tuns = state.tunnels.filter(t => t.machine === m && t.account === alias && t.alias);
-    const copies = acct.tunnels.filter(([h, c]) => h === m && c.runs_elsewhere).map(([, c]) => c);
-    const tokText = toks.length ? toks.map(t => `<span class="mono">${esc(t.hint)}</span> ${t.valid ? st("ok", "works") : st("bad", "rejected by Cloudflare")}`).join(" · ") : st("info", "none on this machine");
-    return `<div class="dz-row"><div class="grow"><b>${esc(alias)}</b> API token · ${tokText}</div>
-        <button data-rowapi="${ai}|${esc(m)}">${toks.length ? "Rotate API token…" : "Add API token…"}</button></div>`
-      + tuns.map(t => {
-          const c = acct.tunnels.find(([h, x]) => h === m && x.alias === t.alias);
-          const inPlist = c && !c[1].token_file;
-          return `<div class="dz-row"><div class="grow"><b>${esc(t.alias)}</b> tunnel token ·
-              ${c ? (c[1].current === false ? st("bad", "out of date") : c[1].current ? st("ok", "current") : st("info", "can't check here")) : st("info", "checking")}
-              ${inPlist ? `<span class="mute" title="The token is written inside this tunnel's launch file; the next restart moves it to a locked token file.">· kept in the launch file</span>` : ""}</div>
-            <button data-rowcon="${ai}|${esc(m)}|${esc(t.alias)}|${esc(t.id)}">Paste new tunnel token…</button>
-            <button class="danger" data-rowtun="${ai}|${esc(m)}|${esc(t.alias)}">Rotate tunnel…</button></div>`;
-        }).join("")
-      + copies.map(c => `<div class="dz-row"><div class="grow mute">${esc(c.alias || c.name)} — a copy of its tunnel token is stored here; it runs on ${esc(c.runs_elsewhere)}</div></div>`).join("");
-  }).join("");
-  return `<details class="dz" data-dz="${esc(m)}"${openDZ.has(m) ? " open" : ""}><summary><span class="chev">›</span> Tokens &amp; rotation</summary>
-    ${accounts.length ? rows : `<div class="dz-row mute">${accountsError ? esc(accountsError) : "checking tokens on every machine…"}</div>`}</details>`;
+/// One Cloudflare account's tokens on one machine, as the pair they are:
+/// the API token (what the machine may change in that account) and the
+/// tunnel token(s) (what lets that account's tunnels run here). Placed in
+/// the account's own section of the machine card, apart from the routine
+/// tunnel buttons above it.
+function acctTokens(m, alias, acct) {
+  const key = `${m}|${alias}`;
+  if (!acct) {
+    return `<div class="dz"><div class="dz-row mute">${accountsError ? esc(accountsError) : `checking ${esc(alias)} tokens on ${esc(m)}…`}</div></div>`;
+  }
+  const ai = accounts.indexOf(acct);
+  const unknown = acct.unknown.includes(m);
+  const toks = acct.holders.filter(([h]) => h === m).map(([, t]) => t);
+  const tuns = state.tunnels.filter(t => t.machine === m && t.account === alias && t.alias);
+  const copies = acct.tunnels.filter(([h, c]) => h === m && c.runs_elsewhere).map(([, c]) => c);
+  const unk = st("unknown", `unknown — ${m} isn't answering`);
+  const apiState = unknown ? unk
+    : toks.length ? toks.map(t => `<span class="mono">${esc(t.hint)}</span> ${t.valid ? st("ok", "works") : st("bad", "rejected by Cloudflare")}`).join(" · ")
+    : st(tuns.length ? "warn" : "info", "none on this machine");
+  const tunState = t => {
+    if (unknown) return unk;
+    const c = acct.tunnels.find(([h, x]) => h === m && x.alias === t.alias);
+    if (!c) return st("info", "checking");
+    return c[1].current === false ? st("bad", "out of date") : c[1].current ? st("ok", "current") : st("info", "can't check — no API token here");
+  };
+  // the one-line summary, readable while the panel is folded
+  const apiShort = unknown ? "unknown" : !toks.length ? "none" : toks.every(t => t.valid) ? "✓" : "✗ rejected";
+  const tunShort = tuns.map(t => {
+    if (unknown) return "unknown";
+    const c = acct.tunnels.find(([h, x]) => h === m && x.alias === t.alias);
+    return !c ? "…" : c[1].current === false ? "✗ out of date" : c[1].current ? "✓" : "?";
+  });
+  const bad = /✗/.test(apiShort + tunShort.join("")) || (apiShort === "none" && tuns.length);
+  const sum = `API token ${apiShort}${tuns.length ? ` · tunnel token${tuns.length > 1 ? "s" : ""} ${tunShort.join(", ")}` : ""}`;
+  return `<details class="dz" data-dz="${esc(key)}"${openDZ.has(key) ? " open" : ""}>
+    <summary><span class="chev">›</span> ${esc(alias)} tokens on ${esc(m)} · <span class="${bad ? "lvl-warn" : ""}">${esc(sum)}</span></summary>
+    <div class="dz-row"><div class="grow"><b>API token</b> <span class="mute">— lets ${esc(m)} change routes and DNS in ${esc(alias)}</span><br>${apiState}</div>
+      ${unknown ? "" : `<button data-rowapi="${ai}|${esc(m)}">${toks.length ? "Rotate API token…" : "Add API token…"}</button>`}</div>
+    ${tuns.map(t => {
+      const c = acct.tunnels.find(([h, x]) => h === m && x.alias === t.alias);
+      const inPlist = c && !c[1].token_file;
+      return `<div class="dz-row"><div class="grow"><b>Tunnel token · ${esc(t.alias)}</b> <span class="mute">— lets ${esc(m)} run this tunnel</span><br>${tunState(t)}
+          ${inPlist ? `<span class="mute" title="The token is written inside this tunnel's launch file; the next restart moves it to a locked token file.">· kept in the launch file</span>` : ""}</div>
+        ${unknown ? "" : `<button data-rowcon="${ai}|${esc(m)}|${esc(t.alias)}|${esc(t.id)}">Paste new tunnel token…</button>
+        <button class="danger" data-rowtun="${ai}|${esc(m)}|${esc(t.alias)}">Rotate tunnel…</button>`}</div>`;
+    }).join("")}
+    ${copies.map(c => `<div class="dz-row"><div class="grow mute">${esc(c.alias || c.name)} — a copy of its tunnel token is stored here; it runs on ${esc(c.runs_elsewhere)}</div></div>`).join("")}
+  </details>`;
 }
 
 /// A card per machine, collapsed to a summary line when all is well
@@ -469,14 +494,25 @@ function renderMachines() {
       const here = tuns.filter(t => t.account === alias);
       if (!here.length) return "";
       return `<div class="acct"><div class="acct-h">${esc(alias)} <span class="acct-name">${esc(acct ? acct.name : "")}</span></div>
-        ${here.map(t => tunnelBlock(t, m, acct, me.admin)).join("")}</div>`;
+        ${here.map(t => tunnelBlock(t, m, acct, me.admin)).join("")}
+        ${me.admin ? acctTokens(m, alias, acct) : ""}</div>`;
     }).join("");
+    // accounts with no tunnel on this machine: just the API token, if any, in one quiet line each
+    const others = me.admin ? aliases.filter(alias => !tuns.some(t => t.account === alias)).map(alias => {
+      const acct = acctOf(alias); if (!acct) return "";
+      const ai = accounts.indexOf(acct);
+      if (acct.unknown.includes(m)) return `<div class="dz-row"><div class="grow"><b>${esc(alias)}</b> <span class="mute">— no tunnels here · API token unknown (${esc(m)} isn't answering)</span></div></div>`;
+      const toks = acct.holders.filter(([h]) => h === m).map(([, t]) => t);
+      return `<div class="dz-row"><div class="grow"><b>${esc(alias)}</b> <span class="mute">— no tunnels here · API token:</span>
+          ${toks.length ? toks.map(t => `<span class="mono">${esc(t.hint)}</span> ${t.valid ? st("ok", "works") : st("bad", "rejected")}`).join(" · ") : `<span class="mute">none</span>`}</div>
+        <button class="text" data-rowapi="${ai}|${esc(m)}">${toks.length ? "Rotate API token…" : "Add API token…"}</button></div>`;
+    }).join("") : "";
     return `<details class="card mcard" id="m-${esc(m)}" data-m="${esc(m)}"${openMachines.has(m) ? " open" : ""}>
       <summary><span class="chev">›</span><span class="mname">${esc(m)}</span><span class="msum">${summary}</span>
         <span style="flex:1"></span><span class="msum" data-health="${esc(m)}"></span>
         ${me.admin ? `<button class="text" data-relay="${esc(m)}|agent-pass|">Sync now</button>` : ""}</summary>
       <div class="mbody">${blocks || `<div class="mute" style="margin-top:16px">no tunnels on this machine</div>`}
-        ${me.admin ? tokensSection(m, aliases, acctOf) : ""}</div>
+        ${others ? `<div class="acct"><div class="acct-h">Other accounts</div>${others}</div>` : ""}</div>
     </details>`;
   }).join("") + (me.admin ? `<div class="toolbar" style="margin-bottom:10px"><button class="text" data-acctreload="1">Re-check tokens</button></div>` : "");
 }

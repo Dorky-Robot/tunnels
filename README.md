@@ -182,8 +182,11 @@ standby does not share the primary's data.
 - restart and logs for **any tunnel on any machine**, and an agent pass for any machine;
 - every agent's recent actions, and the `tunnels cf` changes made from every machine;
 - **one card per machine**, and inside it each Cloudflare account:
-  - that machine's API token for the account (whether Cloudflare accepts it), with **rotate** (or
-    **add**) for admins. Paste a rolled or new token; it is checked, put on that machine (tick
+  - that account's **token pair on that machine**, folded to one line ("felixflor tokens on mini ·
+    API token ✓ · tunnel token ✓"): the API token (what the machine may change in the account)
+    and the tunnel token for each of the account's tunnels there (what lets them run). When a
+    machine's agent isn't answering, both say "unknown", never "none". The API token has
+    **rotate** (or **add**) for admins. Paste a rolled or new token; it is checked, put on that machine (tick
     others to give them the same one), and the old token for the account is retired there.
   - the tunnels the machine runs in that account, each with its state, whether its tunnel token
     is current, **logs**, **restart**, **rotate tunnel** (you type its name) and **paste tunnel
