@@ -36,8 +36,10 @@ fi
 # Given no labels, watch every cloudflared agent this user has. That keeps
 # the script *and* its plist identical on every machine in the mesh, and a
 # tunnel added next month is watched without anybody remembering to add it.
+# The tunnels agent is watched too: it reloads booted-out tunnels, but
+# nothing reloads it, and on 2026-09-23 it was stranded with the rest.
 if [ "$#" -eq 0 ]; then
-  set -- $(ls "$HOME/Library/LaunchAgents" 2>/dev/null | sed -n 's/^\(com\.cloudflare\.cloudflared-.*\)\.plist$/\1/p')
+  set -- $(ls "$HOME/Library/LaunchAgents" 2>/dev/null | sed -En 's/^(com\.cloudflare\.cloudflared-.*|com\.dorkyrobot\.tunnels-agent)\.plist$/\1/p')
 fi
 # it writes its own log, so the plist needs no per-user paths
 exec >>"$LOG" 2>&1
