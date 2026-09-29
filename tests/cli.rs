@@ -907,3 +907,101 @@ fn a_first_join_needs_a_machine_the_copy_itself_trusts() {
     assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
     assert!(s.fleet().contains("from dr1"));
 }
+
+/// A tunnel moved to a root LaunchDaemon (doug-mini, so it is up at boot
+/// with nobody logged in): the sandbox's LaunchDaemons dir gets its plist,
+/// pointing --token-file at a file standing in for root's, and a
+/// launchctl stand-in that reports it running in the system domain.
+fn daemon_sandbox() -> (Sandbox, Vec<(&'static str, String)>) {
+    let s = sandbox();
+    let label = "com.cloudflare.cloudflared-DorkyRobot2";
+    std::fs::create_dir_all(s.path("LaunchDaemons")).unwrap();
+    std::fs::create_dir_all(s.path("root")).unwrap();
+    let root_token = s.path("root/DorkyRobot2.token");
+    std::fs::write(&root_token, token_for("acct-home", HOME, "s0")).unwrap();
+    std::fs::write(
+        s.path(&format!("LaunchDaemons/{label}.plist")),
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>{label}</string>
+<key>ProgramArguments</key><array><string>/opt/homebrew/bin/cloudflared</string><string>tunnel</string><string>run</string><string>--token-file</string><string>{}</string></array>
+<key>StandardErrorPath</key><string>{}</string>
+</dict></plist>"#,
+            root_token.display(),
+            s.path("root/cf.err.log").display()
+        ),
+    )
+    .unwrap();
+    let log = s.path("calls.log");
+    let script = |name: &str, body: String| {
+        let p = s.path(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}")).unwrap();
+        std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        p.to_string_lossy().to_string()
+    };
+    let launchctl = script(
+        "fake-launchctl",
+        format!(
+            "echo \"launchctl $*\" >> {log}\n[ \"$1\" = print ] && [ \"$2\" = system/{label} ] && printf '\\tstate = running\\n\\tpid = 4242\\n'\nexit 0\n",
+            log = log.display()
+        ),
+    );
+    let sudo = script(
+        "fake-sudo",
+        format!(
+            "[ \"$1\" = -n ] || exit 1\nshift\necho \"sudo $*\" >> {log}\ncase \"$1\" in */install) shift 7; cp \"$1\" \"$2\" ;; *) exec \"$@\" ;; esac\n",
+            log = log.display()
+        ),
+    );
+    (s, vec![("TUNNELS_LAUNCHCTL", launchctl), ("TUNNELS_SUDO", sudo)])
+}
+
+#[test]
+fn a_tunnel_run_by_a_system_daemon_is_seen_there_and_never_given_a_launchagent_beside_it() {
+    let (s, env) = daemon_sandbox();
+    let out = s.run_env(&["tunnel", "list", "--json"], &env[..1]);
+    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+    let t = v.to_string();
+    assert!(t.contains("system/com.cloudflare.cloudflared-DorkyRobot2"), "{t}");
+    assert!(t.contains("\"running\""), "{t}");
+    // start is a no-op for a loaded daemon, and writes no LaunchAgent
+    let out = s.run_env(&["tunnel", "start", "DorkyRobot2"], &env[..1]);
+    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    assert!(!s.path("LaunchAgents/com.cloudflare.cloudflared-DorkyRobot2.plist").exists());
+}
+
+#[test]
+fn rotating_a_daemons_tunnel_without_root_says_exactly_what_to_run() {
+    let (s, env) = daemon_sandbox();
+    // launchctl stand-in only; sudo stays the harness's /usr/bin/false
+    let out = s.run_env(&["tunnel", "rotate", "dr2-home"], &env[..1]);
+    assert_ne!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    let user_file = s.path(&format!("config/tokens/{HOME}"));
+    let root_file = s.path("root/DorkyRobot2.token");
+    assert!(out.stderr.contains(&format!("sudo install -o root -g wheel -m 600 {} {}", user_file.display(), root_file.display())), "{}", out.stderr);
+    assert!(out.stderr.contains("sudo launchctl kickstart -k system/com.cloudflare.cloudflared-DorkyRobot2"), "{}", out.stderr);
+    let secret = s.world().tunnel(HOME).secret.clone();
+    let fresh = token_for("acct-home", HOME, &secret);
+    assert!(!out.stderr.contains(&fresh) && !out.stdout.contains(&fresh), "the token is never printed");
+    assert_eq!(std::fs::read_to_string(&user_file).unwrap(), fresh, "this user's copy has the new token");
+    assert!(!s.path("LaunchAgents/com.cloudflare.cloudflared-DorkyRobot2.plist").exists(), "no LaunchAgent beside the daemon");
+}
+
+#[test]
+fn rotating_a_daemons_tunnel_with_root_hands_it_the_new_token_by_file() {
+    let (s, env) = daemon_sandbox();
+    let out = s.run_env(&["tunnel", "rotate", "dr2-home"], &env);
+    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    let secret = s.world().tunnel(HOME).secret.clone();
+    let fresh = token_for("acct-home", HOME, &secret);
+    assert_eq!(std::fs::read_to_string(s.path("root/DorkyRobot2.token")).unwrap(), fresh);
+    let calls = std::fs::read_to_string(s.path("calls.log")).unwrap();
+    assert!(calls.contains("sudo /usr/bin/install -o root -g wheel -m 600"), "{calls}");
+    assert!(calls.contains("launchctl kickstart -k system/com.cloudflare.cloudflared-DorkyRobot2"), "{calls}");
+    assert!(!calls.contains("gui/"), "nothing touches the user domain: {calls}");
+    assert!(!calls.contains(&fresh), "the token is never in argv: {calls}");
+    assert!(!s.path("LaunchAgents/com.cloudflare.cloudflared-DorkyRobot2.plist").exists());
+}

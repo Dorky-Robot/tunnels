@@ -282,7 +282,8 @@ pub fn observe_local(config: &Config, machine: &str) -> LocalObs {
             account_id: t.account_id(),
             state: state.to_string(),
             pid,
-            label: launchd::label_for(&t.name),
+            // a system daemon says so, since that is where launchctl finds it
+            label: if launchd::is_daemon(&t.name) { format!("system/{}", launchd::label_for(&t.name)) } else { launchd::label_for(&t.name) },
             inline_token: launchd::plist_has_inline_token(&t.name),
         });
     }

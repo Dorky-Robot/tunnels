@@ -92,13 +92,21 @@ fn write_token_file_in(dir: &Path, token: &str) -> Result<PathBuf> {
 
 /// Does this tunnel's plist still carry its token inline?
 pub fn plist_has_inline_token(name: &str) -> bool {
-    std::fs::read_to_string(plist_path(name))
+    std::fs::read_to_string(runner_plist(name))
         .map(|s| s.contains("<string>--token</string>"))
         .unwrap_or(false)
 }
 
 /// Does the plist on disk point at this token (inline, or via its token file)?
 pub fn plist_runs_token(name: &str, token: &str) -> bool {
+    if is_daemon(name) {
+        // its token file is root's and usually unreadable here; "cannot
+        // tell" sends callers to restart, which re-copies the token
+        return daemon_token_file(name)
+            .and_then(|f| std::fs::read_to_string(f).ok())
+            .map(|t| t.trim() == token)
+            .unwrap_or(false);
+    }
     let Ok(plist) = std::fs::read_to_string(plist_path(name)) else { return false };
     if plist.contains(&format!("<string>{token}</string>")) {
         return true;
@@ -119,6 +127,143 @@ pub fn label_for(name: &str) -> String {
 
 pub fn plist_path(name: &str) -> PathBuf {
     plist_dir().join(format!("{}.plist", label_for(name)))
+}
+
+/// Where root LaunchDaemons live. A tunnel whose plist is here, under the
+/// same label, runs in the `system` domain: it is up at boot with nobody
+/// logged in, which a LaunchAgent is not. doug-mini's tunnel moved there
+/// because after a power cut it waited for a login.
+pub fn daemon_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("TUNNELS_LAUNCH_DAEMONS") {
+        return PathBuf::from(p);
+    }
+    PathBuf::from("/Library/LaunchDaemons")
+}
+
+pub fn daemon_plist_path(name: &str) -> PathBuf {
+    daemon_dir().join(format!("{}.plist", label_for(name)))
+}
+
+/// Does this tunnel run as a system daemon? When it does, that is the copy
+/// that counts: any LaunchAgent under the same label is a leftover, and
+/// tunnels must never write or load one beside it (that would be a second
+/// connector, and the watchdog would keep it alive).
+pub fn is_daemon(name: &str) -> bool {
+    daemon_plist_path(name).exists()
+}
+
+/// The plist that runs this tunnel: the daemon's if there is one.
+fn runner_plist(name: &str) -> PathBuf {
+    if is_daemon(name) { daemon_plist_path(name) } else { plist_path(name) }
+}
+
+/// `launchctl print system/<label>`: no root needed to read it.
+fn daemon_print(name: &str) -> Option<String> {
+    let out = launchctl().args(["print", &format!("system/{}", label_for(name))]).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn daemon_status(name: &str) -> Status {
+    match daemon_print(name) {
+        Some(text) => {
+            let pid = text
+                .lines()
+                // top level only: one tab in; nested dicts can say pid too
+                .find_map(|l| l.strip_prefix("\tpid = "))
+                .and_then(|p| p.trim().parse::<u32>().ok());
+            Status::Running { pid }
+        }
+        None => Status::Stopped,
+    }
+}
+
+/// The file the daemon's plist points `--token-file` at, if it does.
+pub fn daemon_token_file(name: &str) -> Option<PathBuf> {
+    let out = Command::new("/usr/bin/plutil")
+        .args(["-extract", "ProgramArguments", "json", "-o", "-"])
+        .arg(daemon_plist_path(name))
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let args: Vec<String> = serde_json::from_slice(&out.stdout).ok()?;
+    let i = args.iter().position(|a| a == "--token-file")?;
+    args.get(i + 1).map(PathBuf::from)
+}
+
+/// Run a command as root: directly when we are root, otherwise through
+/// `sudo -n`, which never prompts, so the agent fails fast instead of
+/// hanging. `TUNNELS_SUDO` stands in for sudo in the tests.
+fn as_root(program: &str, args: &[&str]) -> Result<()> {
+    let is_root = unsafe { libc::geteuid() } == 0;
+    let mut c = if is_root {
+        Command::new(program)
+    } else {
+        let mut c = Command::new(std::env::var("TUNNELS_SUDO").unwrap_or_else(|_| "/usr/bin/sudo".into()));
+        c.arg("-n").arg(program);
+        c
+    };
+    let out = c.args(args).stdin(std::process::Stdio::null()).output().with_context(|| format!("running {program} as root"))?;
+    if !out.status.success() {
+        anyhow::bail!("{}", diagnostic(&out).trim());
+    }
+    Ok(())
+}
+
+fn launchctl_program() -> String {
+    std::env::var("TUNNELS_LAUNCHCTL").unwrap_or_else(|_| "/bin/launchctl".into())
+}
+
+/// What went wrong, and the exact commands a person with sudo runs instead.
+fn needs_root(name: &str, what: &str, why: &str, cmds: &[String]) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{label} runs as a system daemon ({plist}); {what} needs root, and sudo -n was refused ({why}). Run, on this Mac:\n  {cmds}",
+        label = label_for(name),
+        plist = daemon_plist_path(name).display(),
+        cmds = cmds.join("\n  "),
+    )
+}
+
+fn daemon_kickstart(name: &str) -> Result<()> {
+    let target = format!("system/{}", label_for(name));
+    as_root(&launchctl_program(), &["kickstart", "-k", &target])
+        .map_err(|e| needs_root(name, "restarting it", &format!("{e:#}"), &[format!("sudo launchctl kickstart -k {target}")]))
+}
+
+fn daemon_bootstrap(name: &str) -> Result<()> {
+    let plist = daemon_plist_path(name);
+    let plist = plist.to_string_lossy();
+    let target = format!("system/{}", label_for(name));
+    as_root(&launchctl_program(), &["bootstrap", "system", &plist])
+        .and_then(|_| as_root(&launchctl_program(), &["kickstart", &target]))
+        .map_err(|e| {
+            needs_root(name, "loading it", &format!("{e:#}"), &[format!("sudo launchctl bootstrap system {plist}"), format!("sudo launchctl kickstart {target}")])
+        })
+}
+
+/// Hand a (new) token to the daemon: copy this user's 0600 token file into
+/// the daemon's root-owned one, then restart it. File to file, so the token
+/// is never in anybody's argv.
+fn daemon_take_token(name: &str, token: &str) -> Result<()> {
+    let src = write_token_file(token)?;
+    let target = format!("system/{}", label_for(name));
+    let Some(dst) = daemon_token_file(name) else {
+        anyhow::bail!(
+            "{} runs as a system daemon, but its plist ({}) has no --token-file; give it one (root-owned, 0600) before tunnels can hand it a token",
+            label_for(name),
+            daemon_plist_path(name).display()
+        );
+    };
+    let (s, d) = (src.to_string_lossy().to_string(), dst.to_string_lossy().to_string());
+    let install = ["-o", "root", "-g", "wheel", "-m", "600", s.as_str(), d.as_str()];
+    let copy = if src == dst { Ok(()) } else { as_root("/usr/bin/install", &install) };
+    copy.and_then(|_| as_root(&launchctl_program(), &["kickstart", "-k", &target])).map_err(|e| {
+        let mut cmds = Vec::new();
+        if src != dst {
+            cmds.push(format!("sudo install -o root -g wheel -m 600 {s} {d}"));
+        }
+        cmds.push(format!("sudo launchctl kickstart -k {target}"));
+        needs_root(name, "giving it the current token", &format!("{e:#}"), &cmds)
+    })
 }
 
 /// The plist for a tunnel, its token written to its 0600 file first. There
@@ -176,6 +321,9 @@ pub enum Status {
 }
 
 pub fn status(name: &str) -> Status {
+    if is_daemon(name) {
+        return daemon_status(name);
+    }
     let label = label_for(name);
     let output = launchctl()
         .args(["list", &label])
@@ -262,6 +410,9 @@ fn is_loaded(label: &str) -> bool {
 }
 
 pub fn is_loaded_name(name: &str) -> bool {
+    if is_daemon(name) {
+        return daemon_print(name).is_some();
+    }
     is_loaded(&label_for(name))
 }
 
@@ -269,6 +420,9 @@ pub fn is_loaded_name(name: &str) -> bool {
 /// connection carrying this command dies half way, nothing is stranded —
 /// the rule from 2026-09-21.
 pub fn kickstart(name: &str) -> Result<()> {
+    if is_daemon(name) {
+        return daemon_kickstart(name);
+    }
     let out = launchctl()
         .args(["kickstart", "-k", &format!("{}/{}", gui_domain(), label_for(name))])
         .output()
@@ -282,6 +436,9 @@ pub fn kickstart(name: &str) -> Result<()> {
 /// Load a job whose plist is on disk but which launchd has forgotten — the
 /// case KeepAlive cannot cover, and what the watchdog script used to do.
 pub fn bootstrap_existing(name: &str) -> Result<()> {
+    if is_daemon(name) {
+        return daemon_bootstrap(name);
+    }
     let path = plist_path(name);
     if !path.exists() {
         anyhow::bail!("no plist at {}", path.display());
@@ -312,6 +469,13 @@ fn wait_loaded(label: &str) -> bool {
 }
 
 pub fn start(name: &str, token: &str) -> Result<()> {
+    if is_daemon(name) {
+        // never a LaunchAgent beside the daemon: that is a second connector
+        return match daemon_print(name) {
+            Some(_) => Ok(()),
+            None => daemon_bootstrap(name),
+        };
+    }
     let label = label_for(name);
     let path = plist_path(name);
     let plist = generate_plist(name, token)?;
@@ -396,6 +560,16 @@ pub fn start(name: &str, token: &str) -> Result<()> {
 }
 
 pub fn stop(name: &str) -> Result<()> {
+    if is_daemon(name) {
+        let target = format!("system/{}", label_for(name));
+        let plist = daemon_plist_path(name);
+        return as_root(&launchctl_program(), &["bootout", &target]).map_err(|e| {
+            needs_root(name, "stopping it", &format!("{e:#}"), &[
+                format!("sudo launchctl bootout {target}"),
+                format!("sudo mv {p} {p}.disabled   # or it loads again at boot", p = plist.display()),
+            ])
+        });
+    }
     let label = label_for(name);
     let path = plist_path(name);
     if !path.exists() {
@@ -453,6 +627,12 @@ fn process_alive(pid: u32) -> bool {
 }
 
 pub fn restart(name: &str, token: &str) -> Result<()> {
+    if is_daemon(name) {
+        // the daemon's plist is root's and never rewritten here; the token
+        // moves by file and a kickstart -k, which keeps the job loaded, so
+        // this is safe over any connection
+        return daemon_take_token(name, token);
+    }
     // Always a full stop + start cycle: `launchctl kickstart -k` reuses the
     // cached service definition and won't pick up plist changes such as an
     // updated token (06354be), so bootout and bootstrap it is.
@@ -605,9 +785,10 @@ pub fn agent_loaded() -> bool {
 
 /// Every cloudflared LaunchAgent here, by the local name in its label.
 pub fn local_labels() -> Vec<String> {
-    let Ok(rd) = std::fs::read_dir(plist_dir()) else { return Vec::new() };
-    let mut out: Vec<String> = rd
-        .flatten()
+    let mut out: Vec<String> = [plist_dir(), daemon_dir()]
+        .iter()
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flat_map(|rd| rd.flatten())
         .filter_map(|e| {
             let f = e.file_name().to_string_lossy().to_string();
             let base = f.strip_suffix(".plist")?;
@@ -619,6 +800,7 @@ pub fn local_labels() -> Vec<String> {
         })
         .collect();
     out.sort();
+    out.dedup();
     out
 }
 
@@ -626,8 +808,26 @@ pub fn local_labels() -> Vec<String> {
 pub fn read_logs(name: &str, lines: usize) -> Result<String> {
     let label = label_for(name);
     let log_dir = log_dir();
-    let err_log = log_dir.join(format!("{}.err.log", label));
-    let out_log = log_dir.join(format!("{}.out.log", label));
+    let mut err_log = log_dir.join(format!("{}.err.log", label));
+    let mut out_log = log_dir.join(format!("{}.out.log", label));
+    if is_daemon(name) {
+        // a daemon logs where its own plist says (/var/log on doug-mini)
+        let key = |k: &str| {
+            Command::new("/usr/bin/plutil")
+                .args(["-extract", k, "raw", "-o", "-"])
+                .arg(daemon_plist_path(name))
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
+        };
+        if let Some(p) = key("StandardErrorPath") {
+            err_log = p;
+        }
+        if let Some(p) = key("StandardOutPath") {
+            out_log = p;
+        }
+    }
 
     let mut result = String::new();
 
@@ -660,11 +860,9 @@ pub struct DiscoveredTunnel {
 /// Import existing plists from both LaunchAgents and LaunchDaemons
 pub fn discover_existing() -> Vec<DiscoveredTunnel> {
     let mut found = Vec::new();
-    let daemon_dir = PathBuf::from("/Library/LaunchDaemons");
-
     let dirs: Vec<(PathBuf, bool)> = vec![
         (plist_dir(), false),
-        (daemon_dir, true),
+        (daemon_dir(), true),
     ];
 
     for (dir, is_daemon) in &dirs {
