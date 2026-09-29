@@ -422,12 +422,12 @@ pub fn plan(fleet: &Fleet, snap: &Snapshot, local: Option<&LocalObs>) -> Plan {
                 ));
             }
         } else if prim.map(|o| !o.up()).unwrap_or(false) && stby.map(|o| o.up()).unwrap_or(false) {
-            p.findings.push(finding(
-                Level::Warn,
-                &r.host,
-                format!("the primary {} is down and standby {sb} is up", r.tunnel),
-                Some(format!("tunnels promote {}", r.host)),
-            ));
+            let fix = match fleet.cold_standby_of(r) {
+                Some((_, t)) if !t.promote_with.is_empty() => t.promote_with.clone(),
+                Some(_) => format!("start {sb}'s apps, then move DNS; not tunnels promote, which refuses a cold standby"),
+                None => format!("tunnels promote {}", r.host),
+            };
+            p.findings.push(finding(Level::Warn, &r.host, format!("the primary {} is down and standby {sb} is up", r.tunnel), Some(fix)));
         }
     }
 
@@ -553,8 +553,10 @@ pub fn probe_origins(fleet: &Fleet, machine: &str) -> Vec<Finding> {
     let mut out = Vec::new();
     for r in &fleet.routes {
         let active_here = fleet.machine_of(r.active_tunnel()) == Some(machine);
-        let standby_here = !active_here
-            && [Some(r.tunnel.as_str()), r.standby.as_deref()].into_iter().flatten().any(|t| fleet.machine_of(t) == Some(machine));
+        // a cold standby is quiet on purpose: nothing should listen there
+        let warm_standby = r.standby.as_deref().filter(|_| fleet.cold_standby_of(r).is_none());
+        let standby_here =
+            !active_here && [Some(r.tunnel.as_str()), warm_standby].into_iter().flatten().any(|t| fleet.machine_of(t) == Some(machine));
         if !active_here && !standby_here {
             continue;
         }
@@ -734,6 +736,25 @@ mod tests {
         s.tunnels[0].tunnel.connections.clear();
         let p = plan(&sample(), &s, None);
         assert!(p.findings.iter().any(|f| f.fix.as_deref() == Some("tunnels promote admin.everyday.vet")));
+    }
+
+    #[test]
+    fn a_cold_standby_is_promoted_by_its_runbook_and_not_probed() {
+        let mut f = sample();
+        let t = f.tunnels.get_mut("vet-standby").unwrap();
+        t.standby_mode = crate::fleet::StandbyMode::Cold;
+        t.promote_with = "on mac2024: sh failover.sh dorkyrobot2".into();
+        let mut s = converged();
+        s.tunnels[0].tunnel.connections.clear();
+        let p = plan(&f, &s, None);
+        assert!(p.findings.iter().any(|x| x.fix.as_deref() == Some("on mac2024: sh failover.sh dorkyrobot2")), "{:?}", p.findings);
+        assert!(!p.findings.iter().any(|x| x.fix.as_deref().is_some_and(|x| x.starts_with("tunnels promote"))));
+        // nothing listens behind a cold standby, and that is not a problem
+        let mut f = f;
+        f.find_route_mut("admin.everyday.vet").unwrap().service = "http://localhost:1".into();
+        assert!(probe_origins(&f, "dr2").iter().all(|x| x.subject != "admin.everyday.vet"));
+        f.tunnels.get_mut("vet-standby").unwrap().standby_mode = crate::fleet::StandbyMode::Warm;
+        assert!(probe_origins(&f, "dr2").iter().any(|x| x.subject == "admin.everyday.vet"), "a warm one still is");
     }
 
     #[test]
