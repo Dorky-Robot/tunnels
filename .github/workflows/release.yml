@@ -14,8 +14,10 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
+            arch: arm64
             os: macos-latest
           - target: x86_64-apple-darwin
+            arch: x86_64
             os: macos-latest
     runs-on: ${{ matrix.os }}
     steps:
@@ -24,10 +26,37 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - run: cargo build --release --target ${{ matrix.target }}
+
+      # Sign and notarize before packaging, so the tarball, and the sha256 the
+      # formula pins, are of the signed binary. Without a Developer ID
+      # signature every brew upgrade looks like a new app to the macOS
+      # firewall, which then drops tailnet traffic to the agent (README,
+      # Releases). No secrets means the job fails: never ship unsigned again.
+      - name: Import signing certificate
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_P12_PASSWORD: ${{ secrets.MACOS_CERT_P12_PASSWORD }}
+        run: sh scripts/release/keychain.sh setup
+      - name: Sign
+        run: sh scripts/release/sign.sh target/${{ matrix.target }}/release/tunnels ${{ matrix.arch }}
+      - name: Notarize
+        env:
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: sh scripts/release/notarize.sh target/${{ matrix.target }}/release/tunnels
+      - name: Remove signing keychain
+        if: always()
+        run: sh scripts/release/keychain.sh cleanup
+
       - name: Package
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../tunnels-${{ github.ref_name }}-${{ matrix.target }}.tar.gz tunnels
+          tarball=tunnels-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          tar czf "$tarball" -C target/${{ matrix.target }}/release tunnels
+          # Check the copy we ship, not the one we signed.
+          mkdir shipped && tar xzf "$tarball" -C shipped
+          codesign --verify --strict --verbose=2 shipped/tunnels
+          codesign -dvv shipped/tunnels 2>&1 | grep -E '^(Identifier|Authority|TeamIdentifier)='
       - uses: actions/upload-artifact@v4
         with:
           name: tunnels-${{ matrix.target }}
