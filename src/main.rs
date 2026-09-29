@@ -896,6 +896,7 @@ fn import_cmd(machine: Option<String>, host: Option<String>, dry_run: bool, json
                     machine: Some(me.clone()),
                     note: format!("Cloudflare name {:?}; local name {:?}", obs.tunnel.name, t.name),
                     destroy: false,
+                    ..Default::default()
                 },
             );
             added.push(format!("tunnel {alias} = {} ({}) on {me}", obs.tunnel.name, short(&id)));
@@ -1517,7 +1518,7 @@ fn tunnel_cmd(cmd: TunnelCmd, json: bool) -> Result<i32> {
             announce(&format!("create tunnel {alias} in {account}"));
             let t = client.create_tunnel(&acct.id, &alias)?;
             let f = Fleet::edit(&c.me, |f| {
-                f.tunnels.insert(alias.clone(), TunnelDecl { id: t.id.clone(), account: account.clone(), machine: machine.clone(), note: String::new(), destroy: false });
+                f.tunnels.insert(alias.clone(), TunnelDecl { id: t.id.clone(), account: account.clone(), machine: machine.clone(), note: String::new(), destroy: false, ..Default::default() });
                 Ok(())
             })?;
             sync::notify(&f, &c.me);
@@ -1552,7 +1553,7 @@ fn tunnel_cmd(cmd: TunnelCmd, json: bool) -> Result<i32> {
                         bail!("no machine `{m}` in the fleet");
                     }
                 }
-                f.tunnels.insert(alias.clone(), TunnelDecl { id: r.id.clone(), account: acct, machine: machine.clone(), note: format!("Cloudflare name {:?}", r.cf_name), destroy: false });
+                f.tunnels.insert(alias.clone(), TunnelDecl { id: r.id.clone(), account: acct, machine: machine.clone(), note: format!("Cloudflare name {:?}", r.cf_name), destroy: false, ..Default::default() });
                 Ok(())
             })?;
             announce(&format!("adopt {} as {alias}", r.cf_name));

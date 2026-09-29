@@ -136,6 +136,31 @@ pub struct TunnelDecl {
     /// delete this tunnel in Cloudflare at the next `apply --allow-destroy`
     #[serde(default, skip_serializing_if = "is_false")]
     pub destroy: bool,
+    /// how this tunnel stands by for the routes that name it as their standby
+    #[serde(default, skip_serializing_if = "StandbyMode::is_warm")]
+    pub standby_mode: StandbyMode,
+    /// for a cold standby: what actually promotes it, said to whoever tries
+    /// `tunnels promote` instead
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub promote_with: String,
+}
+
+/// A warm standby has its apps running, so promoting it is a DNS flip. A
+/// cold one has nothing listening on purpose (the everyday.vet standby's
+/// apps would take the synced copy for production if they ran), and only a
+/// runbook that starts them may promote it — never `tunnels promote`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum StandbyMode {
+    #[default]
+    Warm,
+    Cold,
+}
+
+impl StandbyMode {
+    fn is_warm(&self) -> bool {
+        *self == StandbyMode::Warm
+    }
 }
 
 fn is_false(b: &bool) -> bool {
@@ -538,6 +563,23 @@ impl Fleet {
     }
 
     /// Which machine runs this tunnel, if a fleet machine does.
+    /// The route's standby tunnel, when it is cold: nothing listens behind
+    /// it, and only its runbook (`promote_with`) may move traffic there.
+    pub fn cold_standby_of(&self, r: &Route) -> Option<(&str, &TunnelDecl)> {
+        let sb = r.standby.as_deref()?;
+        self.tunnels.get_key_value(sb).filter(|(_, t)| t.standby_mode == StandbyMode::Cold).map(|(k, t)| (k.as_str(), t))
+    }
+
+    /// Why `tunnels promote` will not move this route, if it will not.
+    pub fn promote_refusal(&self, r: &Route) -> Option<String> {
+        let (sb, t) = self.cold_standby_of(r)?;
+        let how = if t.promote_with.is_empty() { "the runbook that starts its apps".to_string() } else { t.promote_with.clone() };
+        Some(format!(
+            "{}'s standby {sb} is cold: nothing listens behind it until its apps are started, so moving DNS alone would answer 502. Promote it with: {how}",
+            r.host
+        ))
+    }
+
     pub fn machine_of(&self, tunnel_alias: &str) -> Option<&str> {
         self.tunnels.get(tunnel_alias).and_then(|t| t.machine.as_deref())
     }
@@ -692,6 +734,21 @@ service = "http://localhost:2283"
             ..Default::default()
         });
         assert!(f.validate().iter().any(|p| p.contains("publish the tunnels web UI")));
+    }
+
+    #[test]
+    fn a_cold_standby_names_its_runbook_and_a_warm_one_promotes() {
+        let mut f = sample();
+        let r = f.find_route("admin.everyday.vet").unwrap().clone();
+        assert!(f.promote_refusal(&r).is_none(), "warm by default");
+        let t = f.tunnels.get_mut("vet-standby").unwrap();
+        t.standby_mode = StandbyMode::Cold;
+        t.promote_with = "on mac2024: sh failover.sh dorkyrobot2".into();
+        let why = f.promote_refusal(&r).unwrap();
+        assert!(why.contains("cold") && why.contains("sh failover.sh dorkyrobot2"), "{why}");
+        let again = Fleet::parse(&f.to_toml()).unwrap();
+        assert_eq!(again, f, "the mode survives a write");
+        assert!(sample().to_toml().find("standby_mode").is_none(), "warm is not written out");
     }
 
     #[test]
