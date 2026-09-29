@@ -74,14 +74,17 @@ pub fn token_file(tunnel_id: &str) -> PathBuf {
 }
 
 pub fn write_token_file(token: &str) -> Result<PathBuf> {
+    write_token_file_in(&crate::config::Config::dir().join("tokens"), token)
+}
+
+fn write_token_file_in(dir: &Path, token: &str) -> Result<PathBuf> {
     let id = crate::config::decode_token(token)?.tunnel_id;
-    let path = token_file(&id);
-    let dir = path.parent().unwrap().to_path_buf();
-    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(id);
+    std::fs::create_dir_all(dir)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
     }
     crate::util::write_atomic(&path, token.as_bytes(), 0o600)?;
     Ok(path)
@@ -118,17 +121,19 @@ pub fn plist_path(name: &str) -> PathBuf {
     plist_dir().join(format!("{}.plist", label_for(name)))
 }
 
-fn generate_plist(name: &str, token: &str) -> String {
-    // the token goes in a file beside the config, not on the command line;
-    // if the token cannot be decoded (it always can for a real one) fall
-    // back to passing it inline rather than writing a plist that cannot run
-    match write_token_file(token) {
-        Ok(path) => plist_xml(name, "--token-file", &path.to_string_lossy()),
-        Err(_) => plist_xml(name, "--token", token),
-    }
+/// The plist for a tunnel, its token written to its 0600 file first. There
+/// is no inline form: a plist's ProgramArguments are the process's argv, and
+/// `ps` shows argv to everyone on the box. It used to fall back to `--token
+/// <tok>` when the file could not be written; now it refuses, and the plist
+/// on disk stays as it was.
+fn generate_plist(name: &str, token: &str) -> Result<String> {
+    let path = write_token_file(token)
+        .context("could not keep the connector token in its token file; not putting it on the command line instead")?;
+    Ok(plist_xml(name, &path))
 }
 
-fn plist_xml(name: &str, flag: &str, value: &str) -> String {
+fn plist_xml(name: &str, token_file: &Path) -> String {
+    let token_file = token_file.to_string_lossy();
     let label = label_for(name);
     let log_dir = log_dir();
     let log_dir_str = log_dir.to_string_lossy();
@@ -145,8 +150,8 @@ fn plist_xml(name: &str, flag: &str, value: &str) -> String {
 		<string>{cloudflared}</string>
 		<string>tunnel</string>
 		<string>run</string>
-		<string>{flag}</string>
-		<string>{value}</string>
+		<string>--token-file</string>
+		<string>{token_file}</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
@@ -309,7 +314,7 @@ fn wait_loaded(label: &str) -> bool {
 pub fn start(name: &str, token: &str) -> Result<()> {
     let label = label_for(name);
     let path = plist_path(name);
-    let plist = generate_plist(name, token);
+    let plist = generate_plist(name, token)?;
 
     // Ensure directories exist
     if let Some(parent) = path.parent() {
@@ -493,7 +498,7 @@ fn detached_restart(name: &str, token: &str) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::create_dir_all(log_dir())?;
-    std::fs::write(&path, generate_plist(name, token))?;
+    std::fs::write(&path, generate_plist(name, token)?)?;
     let script = format!(
         "launchctl bootout {domain}/{label} >/dev/null 2>&1; sleep 2; \
          launchctl bootstrap {domain} {plist} >/dev/null 2>&1",
@@ -720,33 +725,51 @@ pub fn discover_existing() -> Vec<DiscoveredTunnel> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn generate_plist_embeds_token() {
-        let plist = plist_xml("default", "--token", "eyJTRUNSRVQ=");
-        assert!(plist.contains("eyJTRUNSRVQ="));
+    fn real_looking_token(tunnel: &str) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .encode(format!(r#"{{"a":"acct","t":"{tunnel}","s":"c2VjcmV0"}}"#))
     }
 
     #[test]
-    fn restart_writes_new_token_to_plist() {
-        // Simulate: plist exists with old token, restart is called with new token.
-        // After restart, the plist on disk must contain the new token.
+    fn the_plist_names_the_token_file_and_never_the_token() {
         let dir = tempfile::tempdir().unwrap();
-        let plist_path = dir.path().join("com.cloudflare.cloudflared.plist");
+        let token = real_looking_token("tun-1");
+        let file = write_token_file_in(dir.path(), &token).unwrap();
+        assert_eq!(file, dir.path().join("tun-1"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), token);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the token file must be readable by its owner only");
+        }
+        let plist = plist_xml("default", &file);
+        assert!(plist.contains("<string>--token-file</string>"));
+        assert!(plist.contains(&format!("<string>{}</string>", file.display())));
+        assert!(!plist.contains("<string>--token</string>"), "no inline --token: argv is visible in ps");
+        assert!(!plist.contains(&token), "the token itself must not be in the plist");
+    }
 
-        // Write an "old" plist
-        std::fs::write(&plist_path, plist_xml("default", "--token", "OLD_TOKEN")).unwrap();
-        assert!(std::fs::read_to_string(&plist_path).unwrap().contains("OLD_TOKEN"));
+    #[test]
+    fn a_token_that_cannot_go_in_a_file_is_refused_not_put_inline() {
+        // this used to fall back to `--token <tok>` in ProgramArguments
+        let err = generate_plist("default", "not-a-connector-token").unwrap_err();
+        assert!(format!("{err:#}").contains("not putting it on the command line"), "{err:#}");
+    }
 
-        // We can't call restart() directly in tests (it invokes launchctl),
-        // but we can verify the contract: restart must write the plist with
-        // the new token BEFORE attempting any launchctl commands.
-        // Extract the plist-writing logic and verify it.
-        let new_plist = plist_xml("default", "--token", "NEW_TOKEN");
-        std::fs::write(&plist_path, &new_plist).unwrap();
-
-        let content = std::fs::read_to_string(&plist_path).unwrap();
-        assert!(!content.contains("OLD_TOKEN"), "plist must not contain old token");
-        assert!(content.contains("NEW_TOKEN"), "plist must contain new token");
+    #[test]
+    fn a_rotated_token_rewrites_the_file_the_plist_already_names() {
+        // rotation keeps the tunnel id, so the plist does not change and a
+        // kickstart is enough; only the file's contents move
+        let dir = tempfile::tempdir().unwrap();
+        let old = real_looking_token("tun-1");
+        let new = old.replace("c2VjcmV0", "bmV3c2VjcmV0");
+        let p1 = write_token_file_in(dir.path(), &old).unwrap();
+        let p2 = write_token_file_in(dir.path(), &new).unwrap();
+        assert_eq!(p1, p2);
+        assert_eq!(plist_xml("default", &p1), plist_xml("default", &p2));
+        assert_eq!(std::fs::read_to_string(&p2).unwrap(), new);
     }
 
     #[test]
@@ -779,7 +802,7 @@ mod tests {
         // /opt/homebrew/bin/cloudflared. Whatever cloudflared_path()
         // returns must be the path embedded in the generated plist.
         let expected = cloudflared_path();
-        let plist = plist_xml("default", "--token", "TOKEN");
+        let plist = plist_xml("default", Path::new("/tmp/tokens/tun-1"));
         assert!(
             plist.contains(&format!("<string>{}</string>", expected)),
             "plist should embed resolved cloudflared path: {expected}\nplist: {plist}"
