@@ -56,7 +56,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from claude_bg import (CLAUDE, HOME, agents, box, flush, grant_path, job, load_env, load_json,  # noqa: E402
                        memory_tight, now, parse, pid_alive, plain, rc_link, read_leads, retired, run,
-                       save_json, stamp, trusted, BG_ID)
+                       save_json, stamp, transcript, trust_stall, trusted, BG_ID)
 
 REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 CONF = os.environ.get("LEAD_KEEPER_CONF", os.path.join(REPO, "mesh/leads.conf"))
@@ -71,6 +71,10 @@ RETRY_HOURS = float(os.environ.get("LEAD_KEEPER_RETRY_HOURS", "6"))
 # A process still alive for a name the list calls dead: say so after this
 # many passes (it may be a respawn that is taking its time).
 HUNG_RUNS = int(os.environ.get("LEAD_KEEPER_HUNG_RUNS", "3"))
+# How long a session may sit, alive, on the result of a move into a worktree
+# before it counts as stuck on the trust prompt. A model answers a tool
+# result in seconds; queued messages piling up for 15 minutes is not thinking.
+TRUST_MIN = float(os.environ.get("LEAD_KEEPER_TRUST_MIN", "15"))
 UNREADABLE_RUNS = int(os.environ.get("LEAD_KEEPER_UNREADABLE_RUNS", "6"))
 DOT = " · "
 TAG = "lead-keeper"
@@ -79,7 +83,7 @@ NOTE_LEAD = ("You were restarted by lead-keeper ({why}). Check your ledger and a
              "you had, then SendMessage CTO: \"{name} back\".")
 NOTE_WORKER = ("You were restarted by lead-keeper ({why}). SendMessage \"{lead}\" that you "
                "are back and what you were doing, then carry on.")
-DOWN = ("failed", "cannot", "hung", "removed")   # alerts that say it is down, answered by "back"
+DOWN = ("failed", "cannot", "hung", "removed", "trust")   # alerts that say it is down, answered by "back"
 
 
 def log(msg):
@@ -294,6 +298,28 @@ def main():
             e = newest(live) or newest(entries)
             if live:
                 j = job(e["id"]) if e.get("kind") == "background" and e.get("id") else None
+                stall = None
+                if j is not None and e.get("status") in ("busy", "waiting"):
+                    stall = trust_stall(j.get("linkScanPath") or transcript(e.get("cwd") or lead["cwd"], e["sessionId"]),
+                                        TRUST_MIN * 60)
+                if stall:
+                    # Alive and stuck where it stands: a revival would start it
+                    # in the same place and hang the same way. Say so, once.
+                    if dry:
+                        print("%-30s STUCK   %s pid %s (%s): on a worktree trust prompt since %s"
+                              % (name, e["id"], e["pid"], e.get("status"), stall["since"]))
+                    alert(st, ss, "trust", "%s: %s is stuck on a trust prompt" % (box(), name),
+                          "%s (%s, %s's) has sat since %s on the result of %s: %s\n"
+                          "It moved into a new worktree and is waiting on a trust prompt nobody can see"
+                          "%s. Reviving it in place would hang the same way. Restart it from a trusted "
+                          "folder (~/Projects) and have it work with git -C and absolute paths, without "
+                          "EnterWorktree or a cd into the worktree."
+                          % (name, e["id"], lead["name"], stall["since"], stall["tool"], stall["what"],
+                             "; %d messages queued to it since" % stall["queued"] if stall["queued"] else ""),
+                          name)
+                    ss.update({"session_id": e.get("sessionId"), "id": e.get("id"), "pid": e["pid"],
+                               "kind": e.get("kind"), "seen": stamp(), "runs": 0, "hung_runs": 0})
+                    continue
                 lost_rc = bool(j) and "--remote-control" not in (j.get("respawnFlags") or [])
                 # Stop only an idle one: busy is mid-turn, and waiting is a
                 # question (a permission prompt) someone has yet to answer.

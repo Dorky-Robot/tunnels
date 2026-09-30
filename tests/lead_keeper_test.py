@@ -20,6 +20,7 @@ import unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 SCRIPT = os.path.join(REPO, "scripts/lead-keeper.py")
+FIXTURES = os.path.join(REPO, "tests/fixtures")
 
 # world.json: "agents" as `claude agents --json --all` shows them, plus
 # "rc" (does a started session reach Remote Control), "broken" (does the
@@ -361,6 +362,63 @@ class LeadKeeper(unittest.TestCase):
         self.run_()
         argv = self.calls("--bg")[0]["argv"]
         self.assertEqual(argv[2:6], ["1a1a-cto", "--remote-control", "-n", "Mesh"])
+
+    # ---- stuck where it stands ------------------------------------------------
+
+    def stuck(self, id_, fixture, status="waiting"):
+        """Point a session's transcript at a copy of a fixture."""
+        path = os.path.join(self.d, id_ + ".jsonl")
+        open(path, "w").write(open(os.path.join(FIXTURES, fixture)).read())
+        j = os.path.join(self.d, "jobs", id_, "state.json")
+        st = json.load(open(j))
+        st["linkScanPath"] = path
+        json.dump(st, open(j, "w"))
+        self.set_(id_, status=status)
+        return path
+
+    def test_a_worker_stuck_on_a_worktree_trust_prompt_is_told_once_and_not_revived(self):
+        path = self.stuck("cccc0003", "trust-stall.jsonl")
+        for _ in range(4):
+            self.run_()
+        self.assertEqual(self.revivals(), [])                # same cwd, same hang: do not revive
+        self.assertEqual(self.titles(), ["Monica - daily briefs site is stuck on a trust prompt"])  # ASCII header
+        body = Ntfy.alerts[0]["body"]
+        self.assertIn("Monica · daily briefs site (cccc0003, Monica's)", body)
+        self.assertIn("since 2026-09-30T17:09:29Z", body)
+        self.assertIn("without EnterWorktree", body)
+        self.assertIn("2 messages queued", body)
+        self.assertEqual(len([k for k in self.kapwa() if k[0] == "say" and "--t" in k]), 1)
+        # restarted by someone and moving again: one "back", and the item is closed
+        open(path, "a").write(json.dumps({"type": "assistant", "timestamp": "2026-09-30T18:00:00Z",
+                                          "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}}) + "\n")
+        self.run_()
+        self.run_()
+        self.assertEqual(self.titles()[1:], ["Monica - daily briefs site is back"])
+        self.assertEqual([k[1] for k in self.kapwa() if k[0] == "done"], ["4f2a9"])
+
+    def test_a_long_tool_call_is_not_a_stall(self):
+        self.stuck("cccc0003", "long-tool-call.jsonl", status="busy")
+        for _ in range(3):
+            self.run_()
+        self.assertEqual(Ntfy.alerts, [])
+
+    def test_a_fresh_worktree_step_is_not_yet_a_stall(self):
+        self.stuck("cccc0003", "trust-stall.jsonl")
+        for _ in range(3):
+            self.run_(LEAD_KEEPER_TRUST_MIN="100000000")
+        self.assertEqual(Ntfy.alerts, [])
+
+    def test_an_idle_session_is_not_a_stall(self):
+        self.stuck("cccc0003", "trust-stall.jsonl", status="idle")   # it finished; nothing hangs
+        for _ in range(3):
+            self.run_()
+        self.assertEqual(Ntfy.alerts, [])
+
+    def test_dry_run_names_the_stuck_one(self):
+        self.stuck("cccc0003", "trust-stall.jsonl")
+        out = self.run_("--dry-run")
+        self.assertIn("STUCK", out)
+        self.assertIn("since 2026-09-30T17:09:29Z", out)
 
     # ---- safety ----------------------------------------------------------------
 
