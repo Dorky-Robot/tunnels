@@ -44,7 +44,14 @@ Nothing is listed by hand that can be derived.
   check for the `ssh-*` routes. Not the agent's `:7630`, which the mac2019
   and doug-mini firewalls do not answer.
 - **`mesh/watch.conf`** adds what neither file knows: hosts to skip and why,
-  public sites outside the tunnels, and text a page must contain.
+  pages no route covers, and text a page must contain. An `extra` can be a
+  site outside the tunnels or a second page on a routed host, such as the
+  Everyday Vet desks' `/health`, which answers `{"dots":N,"ok":true,…}` only
+  when the kita store opens; a lock or sign-in page still says "Everyday Vet",
+  so the page check alone cannot tell. An extra on a routed host is filed
+  under the machine that serves it. `expect` takes a host or an extra's exact
+  URL, and the URL wins, so `/health` wants `"ok":true` while the page wants
+  its text.
 
 `scripts/mesh-watch.py --list` prints every check and every skip with its reason.
 
@@ -122,5 +129,6 @@ Everything runs against servers on 127.0.0.1: one alert per incident, one on
 recovery, a blip is not an incident, a wrong page fails, many failures are
 one message, a flapping host is one incident, an unreadable fleet falls back
 and says so, an offline monitor judges nothing and says so in its heartbeat,
-an unsent alert waits, old history is pruned, and the heartbeat alerts once
-for a monitor that is stale, blind or unreachable.
+an unsent alert waits, old history is pruned, an expect keyed by URL beats
+the host's, a page on a routed host is filed under its machine, and the
+heartbeat alerts once for a monitor that is stale, blind or unreachable.
