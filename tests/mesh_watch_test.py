@@ -56,7 +56,9 @@ class MeshWatch(unittest.TestCase):
         Site.body["/flaky"] = b"hello Monica"
         self.dir = tempfile.mkdtemp()
         fleet = os.path.join(self.dir, "fleet.json")
-        json.dump({"routes": []}, open(fleet, "w"))
+        json.dump({"routes": [{"host": "ssh-x.example", "tunnel": "t", "service": "ssh://localhost:22"}],
+                   "tunnels": {"t": {"machine": "boxa"}}}, open(fleet, "w"))
+        self.fleet = fleet
         conf = os.path.join(self.dir, "watch.conf")
         with open(conf, "w") as f:
             f.write("extra %s/up   always up\n" % self.base)
@@ -90,9 +92,12 @@ class MeshWatch(unittest.TestCase):
         self.watch()                       # still down: no storm
         self.assertEqual(len(Site.alerts), 1)
         Site.status["/flaky"] = 200
+        self.watch()                       # one pass is not yet a recovery
+        self.assertEqual(len(Site.alerts), 1)
         self.watch()
         self.assertEqual(len(Site.alerts), 2)
         self.assertIn("back", Site.alerts[1]["title"])
+        self.assertIn("down ", Site.alerts[1]["body"])
         self.watch()
         self.assertEqual(len(Site.alerts), 2)
         self.assertEqual(self.incidents(), ["opened", "recovered"])
@@ -119,7 +124,8 @@ class MeshWatch(unittest.TestCase):
         self.watch()
         self.watch()
         self.assertEqual(len(Site.alerts), 1)
-        self.assertIn("2 checks down", Site.alerts[0]["title"])
+        self.assertIn("Outside the tunnels", Site.alerts[0]["body"])
+        self.assertEqual(Site.alerts[0]["body"].count(" since "), 2)
 
     def test_an_offline_monitor_judges_nothing(self):
         Site.status["/flaky"] = 500
@@ -155,8 +161,69 @@ class MeshWatch(unittest.TestCase):
         for _ in range(4):
             self.assertEqual(run().returncode, 0)
         self.assertEqual(len(Site.alerts), 1, Site.alerts)
-        self.assertIn("stopped", Site.alerts[0]["title"])
+        self.assertIn("annot reach dorkyrobot2", Site.alerts[0]["body"])
 
+
+    def test_a_flapping_host_is_one_incident(self):
+        Site.status["/flaky"] = 502
+        self.watch(); self.watch()          # opens
+        for code in (200, 502, 200, 502, 200, 502):
+            Site.status["/flaky"] = code
+            self.watch()
+        self.assertEqual(len(Site.alerts), 1)
+
+    def test_a_fleet_that_cannot_be_read_falls_back_and_says_so(self):
+        self.watch()                        # caches the fleet
+        open(self.fleet, "w").write("not json")
+        out = self.watch()
+        self.assertIn("FAIL monitor:fleet", out)
+        self.watch()
+        self.assertEqual(len(Site.alerts), 1)
+        self.assertIn("cannot read the fleet", Site.alerts[0]["body"])
+
+    def fake_ssh(self, script):
+        bin_ = os.path.join(self.dir, "bin")
+        os.makedirs(bin_, exist_ok=True)
+        with open(os.path.join(bin_, "ssh"), "w") as f:
+            f.write("#!/bin/sh\n" + script)
+        os.chmod(os.path.join(bin_, "ssh"), 0o755)
+        env = dict(self.env, PATH=bin_ + ":/usr/bin:/bin", MESH_WATCH_RETRIES="0")
+        return lambda: subprocess.run([SCRIPT, "heartbeat", "dorkyrobot2"], env=env, capture_output=True, text=True)
+
+    def test_heartbeat_alerts_at_once_when_the_monitor_is_stale(self):
+        run = self.fake_ssh("echo 2020-01-01T00:00:00Z ok\n")
+        self.assertIn("FAIL", run().stdout)
+        self.assertEqual(len(Site.alerts), 1)
+        self.assertIn("not watching", Site.alerts[0]["title"])
+        self.assertIn("get in: ssh dorkyrobot2", Site.alerts[0]["body"])
+
+    def test_heartbeat_names_a_monitor_that_has_lost_its_internet(self):
+        import datetime
+        t = datetime.datetime.utcnow()
+        fresh = t.strftime("%Y-%m-%dT%H:%M:%SZ")
+        old = (t - datetime.timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        run = self.fake_ssh("echo %s offline %s\n" % (fresh, old))
+        run()
+        self.assertEqual(len(Site.alerts), 1)
+        self.assertIn("no internet since", Site.alerts[0]["body"])
+        run = self.fake_ssh("echo %s ok\n" % fresh)
+        run()
+        self.assertEqual(len(Site.alerts), 2)
+        self.assertIn("watching again", Site.alerts[1]["title"])
+
+    def test_the_monitor_writes_offline_into_its_heartbeat(self):
+        self.env["MESH_WATCH_CANARY"] = "http://127.0.0.1:9/"
+        subprocess.run([SCRIPT, "--no-machines"], env=self.env, capture_output=True)
+        self.assertIn(" offline ", open(os.path.join(self.dir, "state/last-run")).read())
+
+    def test_old_history_is_pruned_and_incidents_kept(self):
+        st = os.path.join(self.dir, "state")
+        os.makedirs(st)
+        for n in ("checks-2001-01.jsonl", "incidents.jsonl"):
+            open(os.path.join(st, n), "w").write("{}\n")
+        self.watch()
+        self.assertFalse(os.path.exists(os.path.join(st, "checks-2001-01.jsonl")))
+        self.assertTrue(os.path.exists(os.path.join(st, "incidents.jsonl")))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

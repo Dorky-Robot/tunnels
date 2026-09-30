@@ -14,25 +14,31 @@ question a visitor asks, from one box, every five minutes.
 What it checks is derived, not listed:
   - every route in the fleet file (`tunnels fleet show --json`), fetched as
     https://<host>/ with redirects followed. ssh-* routes are skipped here;
-    the machine checks below go through them for real.
+    the machine checks below go through them for real. If the fleet cannot
+    be read, the last copy that could is used, and that is itself a finding.
   - every machine in mesh/machines: `tailscale ping`, `ssh <name> true`, and
     `ssh cloudflare-<name> true` when it has a tunnel. Not the agent's :7630,
     which mac2019 and doug-mini's firewalls do not answer.
+  - with MESH_WATCH_PEER=<machine>, that the heartbeat there is running: the
+    two watchers watch each other.
 mesh/watch.conf adds what the fleet cannot know: hosts to skip and why, sites
 outside the fleet, and text a page must contain.
 
 A check that fails is retried within the run. An incident opens after
-FAIL_RUNS failing runs in a row and is alerted once; its recovery is alerted
-once. Everything that opens in one run goes out as one message. If the
-monitor cannot reach the internet at all, the run judges nothing: a dead
-uplink here is not forty dead sites there.
+FAIL_RUNS failing runs in a row and is alerted once; it closes after OK_RUNS
+passing runs in a row, alerted once, so a flaky host does not flap. What
+opens in one run goes out as one message, grouped by the machine that serves
+it. If the monitor cannot reach the internet at all, the run judges nothing:
+a dead uplink here is not forty dead sites there. It says so in its
+heartbeat, and the heartbeat says so to Felix.
 
 History, for an uptime board later, under $MESH_WATCH_STATE
 (default ~/.local/state/mesh-watch):
-  checks-YYYY-MM.jsonl   one line per check per run
-  incidents.jsonl        one line per opened / alerted / recovered incident
+  checks-YYYY-MM.jsonl   one line per check per run; KEEP_MONTHS are kept
+  incidents.jsonl        one line per opened / recovered / retired incident
   state.json             open incidents and streaks
-  last-run               the heartbeat: UTC time of the last finished run
+  fleet.json             the last fleet that could be read
+  last-run               the heartbeat: "<UTC time> ok" or "<time> offline <since>"
 
 Alerts go to $MESH_WATCH_NTFY (a full ntfy URL, topic included), read from
 ~/.config/mesh-watch/env. The topic is the secret: it never goes in git. With
@@ -40,6 +46,7 @@ none set, alerts are logged as unsent and nothing leaves the box.
 """
 import concurrent.futures as cf
 import datetime as dt
+import glob
 import json
 import os
 import re
@@ -54,10 +61,14 @@ STATE = os.environ.get("MESH_WATCH_STATE", os.path.join(HOME, ".local/state/mesh
 ENVFILE = os.environ.get("MESH_WATCH_ENV", os.path.join(HOME, ".config/mesh-watch/env"))
 CONF = os.environ.get("MESH_WATCH_CONF", os.path.join(REPO, "mesh/watch.conf"))
 MACHINES = os.environ.get("MESH_WATCH_MACHINES", os.path.join(REPO, "mesh/machines"))
+REMOTE_STATE = os.environ.get("MESH_WATCH_REMOTE_STATE", ".local/state/mesh-watch")
 FAIL_RUNS = int(os.environ.get("MESH_WATCH_FAIL_RUNS", "2"))
+OK_RUNS = int(os.environ.get("MESH_WATCH_OK_RUNS", "2"))
 RETRIES = int(os.environ.get("MESH_WATCH_RETRIES", "2"))
 RETRY_GAP = float(os.environ.get("MESH_WATCH_RETRY_GAP", "15"))
-STALE_MIN = int(os.environ.get("MESH_WATCH_STALE_MIN", "15"))
+# Both jobs run every 5 minutes, so 11 minutes is two missed runs.
+STALE_MIN = int(os.environ.get("MESH_WATCH_STALE_MIN", "11"))
+KEEP_MONTHS = int(os.environ.get("MESH_WATCH_KEEP_MONTHS", "6"))
 # Somewhere that is up whenever the internet is. If it does not answer, the
 # problem is this box's uplink and the run judges nothing.
 CANARY = os.environ.get("MESH_WATCH_CANARY", "https://www.cloudflare.com/cdn-cgi/trace")
@@ -74,6 +85,14 @@ def now():
 
 def stamp(t=None):
     return (t or now()).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse(s):
+    return dt.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+
+
+def box():
+    return os.uname().nodename.split(".")[0]
 
 
 def load_env():
@@ -94,6 +113,11 @@ def run(argv, timeout):
         return 124, "", "timed out after %ss" % timeout
     except OSError as e:
         return 127, "", str(e)
+
+
+def last_line(s, default):
+    lines = s.strip().splitlines()
+    return (lines[-1] if lines else default)[:200]
 
 
 # ---- what to check ---------------------------------------------------------
@@ -118,16 +142,31 @@ def read_conf():
     return conf
 
 
-def fleet_routes():
-    fleet = os.environ.get("MESH_WATCH_FLEET")
-    if fleet:
-        data = json.load(open(fleet))
-    else:
-        rc, out, err = run(["tunnels", "fleet", "show", "--json"], 30)
-        if rc != 0:
-            raise SystemExit("mesh-watch: cannot read the fleet: " + (err or out).strip())
-        data = json.loads(out)
-    return data.get("routes", [])
+def read_fleet():
+    """The fleet, and None; or the last copy that could be read, and why."""
+    cache = os.path.join(STATE, "fleet.json")
+    try:
+        src = os.environ.get("MESH_WATCH_FLEET")
+        if src:
+            data = json.load(open(src))
+        else:
+            rc, out, err = run(["tunnels", "fleet", "show", "--json"], 30)
+            if rc != 0:
+                raise ValueError(last_line(err or out, "tunnels exited %d" % rc))
+            data = json.loads(out)
+        if not data.get("routes"):
+            raise ValueError("the fleet has no routes")
+    except (OSError, ValueError) as e:
+        try:
+            data = json.load(open(cache))
+        except (OSError, ValueError):
+            raise SystemExit("mesh-watch: cannot read the fleet (%s), and there is no earlier copy" % e)
+        return data, "cannot read the fleet (%s); checking the copy of %s" % (e, data.get("updated_at", "?"))
+    try:
+        save_json(data, "fleet.json")
+    except OSError:
+        pass
+    return data, None
 
 
 def read_machines():
@@ -142,33 +181,47 @@ def read_machines():
     return ms
 
 
-def targets(conf, machines=True):
+def targets(conf, fleet, machines=True):
     """Every check, and every skip with its reason."""
     out, skipped = [], []
-    for r in fleet_routes():
+    tunnels = fleet.get("tunnels", {})
+    for r in fleet.get("routes", []):
         h = r["host"]
         if h in conf["skip"]:
             skipped.append((h, conf["skip"][h]))
         elif r.get("service", "").startswith("ssh://"):
             skipped.append((h, "ssh route: checked by `ssh cloudflare-<machine>`"))
         else:
-            out.append({"id": "http:" + h, "kind": "http", "url": "https://%s/" % h,
-                        "where": r.get("tunnel", ""), "expect": conf["expect"].get(h)})
+            m = tunnels.get(r.get("tunnel"), {}).get("machine", "?")
+            where = "served by %s (tunnel %s)" % (m, r.get("tunnel"))
+            if r.get("standby"):
+                where += "; standby %s" % tunnels.get(r["standby"], {}).get("machine", r["standby"])
+            out.append({"id": "http:" + h, "kind": "http", "url": "https://%s/" % h, "label": h,
+                        "machine": m, "where": where, "expect": conf["expect"].get(h)})
     for url, why in conf["extra"]:
         h = re.sub(r"^https?://([^/]+).*", r"\1", url)
+        name = re.sub(r"^https?://", "", url).rstrip("/")
         # Named by host and path, so two pages on one host are two checks.
-        out.append({"id": "http:" + re.sub(r"^https?://", "", url).rstrip("/"), "kind": "http", "url": url, "where": why or "outside the fleet",
-                    "expect": conf["expect"].get(h)})
+        out.append({"id": "http:" + name, "kind": "http", "url": url, "label": name, "machine": None,
+                    "where": why or "outside the fleet", "expect": conf["expect"].get(h)})
     if machines:
         for m in read_machines():
-            if m["name"] in conf["skip"]:
-                skipped.append((m["name"], conf["skip"][m["name"]]))
+            n = m["name"]
+            if n in conf["skip"]:
+                skipped.append((n, conf["skip"][n]))
                 continue
-            out.append({"id": "tailnet:" + m["name"], "kind": "tailnet", "host": m["host"], "where": m["name"]})
-            out.append({"id": "ssh:" + m["name"], "kind": "ssh", "alias": m["name"], "where": m["name"]})
+            out.append({"id": "tailnet:" + n, "kind": "tailnet", "host": m["host"], "machine": n,
+                        "label": "%s: tailscale ping" % n, "where": "tailnet name " + m["host"]})
+            out.append({"id": "ssh:" + n, "kind": "ssh", "alias": n, "machine": n,
+                        "label": "%s: ssh over the tailnet" % n, "where": "ssh " + n})
             if m["tunnel"] != "-":
-                out.append({"id": "ssh-cf:" + m["name"], "kind": "ssh", "alias": "cloudflare-" + m["name"],
-                            "where": m["tunnel"]})
+                out.append({"id": "ssh-cf:" + n, "kind": "ssh", "alias": "cloudflare-" + n, "machine": n,
+                            "label": "%s: ssh through Cloudflare" % n, "where": m["tunnel"]})
+    peer = os.environ.get("MESH_WATCH_PEER")
+    if peer and machines:
+        out.append({"id": "heartbeat:" + peer, "kind": "peer", "alias": peer, "machine": peer,
+                    "label": "%s: the heartbeat that watches this monitor" % peer,
+                    "where": "com.dorkyrobot.mesh-watch-heartbeat on " + peer})
     return out, skipped
 
 
@@ -178,35 +231,52 @@ def check_http(t):
     rc, out, err = run(["curl", "-sS", "-L", "--max-redirs", "8", "-m", "20", "-A", "mesh-watch/1",
                         "-w", "\n%{http_code} %{url_effective}", t["url"]], 25)
     if rc != 0:
-        return False, None, (err.strip().splitlines() or ["curl %d" % rc])[-1][:200]
+        return False, None, last_line(err, "curl %d" % rc)
     body, _, tail = out.rpartition("\n")
     code, _, final = tail.partition(" ")
     code = int(code or 0)
+    at = "" if final == t["url"] else " at " + final
     if not 200 <= code < 300:
-        return False, code, "HTTP %d at %s" % (code, final)
+        return False, code, "HTTP %d%s" % (code, at)
     if not body.strip():
-        return False, code, "empty page at %s" % final
+        return False, code, "empty page" + at
     if CF_ERROR.search(body):
-        return False, code, "Cloudflare error page at %s" % final
+        return False, code, "Cloudflare error page" + at
     if t.get("expect") and t["expect"] not in body:
-        return False, code, "page lacks %r" % t["expect"]
-    return True, code, final if final != t["url"] else ""
+        return False, code, "page lacks %r%s" % (t["expect"], at)
+    return True, code, at.strip()
 
 
 def check_tailnet(t):
     rc, out, err = run(["tailscale", "ping", "-c", "3", "--timeout", "5s", t["host"]], 25)
-    msg = (out + err).strip().splitlines()
-    return rc == 0, None, (msg[-1] if msg else "")[:200]
+    return rc == 0, None, last_line(out + err, "")
 
 
 def check_ssh(t):
     rc, out, err = run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=12",
                         "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
                         t["alias"], "true"], 30)
-    return rc == 0, None, "" if rc == 0 else ((err.strip().splitlines() or ["ssh %d" % rc])[-1])[:200]
+    return rc == 0, None, "" if rc == 0 else last_line(err, "ssh %d" % rc)
 
 
-KINDS = {"http": check_http, "tailnet": check_tailnet, "ssh": check_ssh}
+def check_peer(t):
+    rc, out, err = run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=12", t["alias"],
+                        "cat %s/heartbeat-last" % REMOTE_STATE], 30)
+    if rc == 255:
+        # The machine checks already say it is unreachable; this is about the job.
+        return True, None, "unreachable; see the machine checks"
+    if rc != 0:
+        return False, None, "no heartbeat has run there (%s)" % last_line(err, "?")
+    try:
+        age = (now() - parse(out.split()[0])).total_seconds()
+    except (ValueError, IndexError):
+        return False, None, "heartbeat-last unreadable"
+    if age > STALE_MIN * 60:
+        return False, None, "the heartbeat last ran %s ago" % ago(out.split()[0], now())
+    return True, None, ""
+
+
+KINDS = {"http": check_http, "tailnet": check_tailnet, "ssh": check_ssh, "peer": check_peer}
 
 
 def check(t):
@@ -235,9 +305,14 @@ def check_all(ts, retries=RETRIES, gap=RETRY_GAP):
 
 def load_state(name="state.json"):
     try:
-        return json.load(open(os.path.join(STATE, name)))
+        s = json.load(open(os.path.join(STATE, name)))
+        if not isinstance(s, dict):
+            raise ValueError
     except (OSError, ValueError):
-        return {"streak": {}, "open": {}, "pending": []}
+        s = {}
+    for k, v in (("streak", {}), ("open", {}), ("pending", [])):
+        s.setdefault(k, v)
+    return s
 
 
 def save_json(obj, name):
@@ -254,16 +329,27 @@ def append(name, rows):
             f.write(json.dumps(r, sort_keys=True) + "\n")
 
 
-def send(title, body, dry, tags="rotating_light"):
+def prune(t):
+    """Per-check history is kept KEEP_MONTHS; incidents.jsonl is kept for good."""
+    keep = {(t.year * 12 + t.month - 1 - i) for i in range(KEEP_MONTHS)}
+    for p in glob.glob(os.path.join(STATE, "*-[0-9][0-9][0-9][0-9]-[0-9][0-9].jsonl")):
+        m = re.search(r"-(\d{4})-(\d{2})\.jsonl$", p)
+        if m and int(m.group(1)) * 12 + int(m.group(2)) - 1 not in keep:
+            os.remove(p)
+
+
+def send(msg, dry):
     """Send one alert. True if it left the box (or was printed, when dry)."""
     if dry:
-        print("ALERT %s\n%s\n" % (title, body))
+        print("ALERT %s\n%s\n" % (msg["title"], msg["body"]))
         return True
     url = os.environ.get("MESH_WATCH_NTFY")
     if not url:
         return False
-    rc, out, err = run(["curl", "-sS", "-f", "-m", "20", "-H", "Title: " + title, "-H", "Tags: " + tags,
-                        "-H", "Priority: high", "--data-binary", body, url], 25)
+    rc, out, err = run(["curl", "-sS", "-f", "-m", "20", "-H", "Title: " + msg["title"],
+                        "-H", "Tags: " + msg.get("tags", "rotating_light"),
+                        "-H", "Priority: " + msg.get("priority", "high"),
+                        "--data-binary", msg["body"], url], 25)
     return rc == 0
 
 
@@ -271,96 +357,151 @@ def flush(state, dry):
     """Send what is waiting, oldest first; keep whatever did not go."""
     left = []
     for a in state["pending"]:
-        if left or not send(a["title"], a["body"], dry, a.get("tags", "rotating_light")):
+        if left or not send(a, dry):
             left.append(a)
     state["pending"] = left
 
 
-def judge(state, ts, results, t):
+def judge(state, ts, results, t, fail_runs=FAIL_RUNS, ok_runs=OK_RUNS):
     """Fold one run into the state. Returns (opened, recovered) incident ids."""
     by_id = {x["id"]: x for x in ts}
-    opened, recovered = [], []
-    rows = []
+    opened, recovered, rows = [], [], []
     for tid, r in results.items():
+        inc = state["open"].get(tid)
         if r["ok"]:
             state["streak"].pop(tid, None)
-            inc = state["open"].pop(tid, None)
             if inc:
-                inc["recovered"] = stamp(t)
-                rows.append({"ts": stamp(t), "event": "recovered", "id": tid, "since": inc["since"],
-                             "alerted": inc["alerted"]})
-                if inc["alerted"]:
+                inc["oks"] = inc.get("oks", 0) + 1
+                if inc["oks"] >= ok_runs:
+                    del state["open"][tid]
+                    rows.append({"ts": stamp(t), "event": "recovered", "id": tid, "since": inc["since"]})
                     recovered.append((tid, inc))
+            continue
+        if inc:
+            inc["oks"] = 0
+            inc["detail"] = r["detail"]
             continue
         s = state["streak"].setdefault(tid, {"since": stamp(t), "runs": 0})
         s["runs"] += 1
         s["detail"] = r["detail"]
-        if tid not in state["open"] and s["runs"] >= FAIL_RUNS:
-            state["open"][tid] = {"since": s["since"], "alerted": True, "detail": r["detail"],
-                                  "where": by_id.get(tid, {}).get("where", "")}
+        need = r.get("fail_runs", fail_runs)
+        if s["runs"] >= need:
+            x = by_id.get(tid, {})
+            state["open"][tid] = {"since": s["since"], "detail": r["detail"], "oks": 0,
+                                  "label": x.get("label", tid), "where": x.get("where", ""),
+                                  "machine": x.get("machine")}
+            del state["streak"][tid]
             rows.append({"ts": stamp(t), "event": "opened", "id": tid, "since": s["since"], "detail": r["detail"]})
             opened.append(tid)
     # A check that is no longer derived (route removed, host skipped) closes quietly.
     for tid in list(state["open"]):
         if tid not in by_id:
-            state["open"].pop(tid)
+            del state["open"][tid]
             rows.append({"ts": stamp(t), "event": "retired", "id": tid})
     for tid in list(state["streak"]):
         if tid not in by_id:
-            state["streak"].pop(tid)
+            del state["streak"][tid]
     append("incidents.jsonl", rows)
     return opened, recovered
 
 
 def ago(since, t):
-    mins = int((t - dt.datetime.strptime(since, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)).total_seconds() // 60)
+    mins = int((t - parse(since)).total_seconds() // 60)
     return "%dm" % mins if mins < 120 else "%dh%02dm" % (mins // 60, mins % 60)
 
 
-def compose(state, opened, recovered, t, box):
+def clock(s):
+    """UTC stamp to this box's wall clock, which is Felix's."""
+    return time.strftime("%H:%M", time.localtime(parse(s).timestamp()))
+
+
+def ways_in(m):
+    return "ssh %s · ssh cloudflare-%s · ssh %s-lan" % (m, m, m)
+
+
+def compose(state, ts, opened, recovered, t, box):
+    """One message for everything that opened, one for everything that closed."""
     msgs = []
+    per_machine = {}
+    for x in ts:
+        per_machine.setdefault(x.get("machine"), []).append(x["id"])
     if opened:
-        lines = ["%s — %s (%s)" % (tid, state["open"][tid]["detail"] or "failed", state["open"][tid]["where"])
-                 for tid in opened]
+        groups = {}
+        for tid in opened:
+            groups.setdefault(state["open"][tid].get("machine"), []).append(tid)
+        lines, heads = [], []
+        for m in sorted(groups, key=lambda m: (m is None, m or "")):
+            ids = groups[m]
+            down_all = m and set(per_machine.get(m, [])) <= set(state["open"])
+            if m is None:
+                lines.append("Outside the tunnels:")
+            elif down_all:
+                lines.append("%s looks down: all %d of its checks fail." % (m, len(per_machine[m])))
+                heads.append(m)
+            else:
+                lines.append("On %s:" % m)
+                heads.extend(state["open"][i]["label"] for i in ids)
+            for tid in ids:
+                inc = state["open"][tid]
+                lines.append("  %s — %s, since %s" % (inc["label"], inc["detail"] or "failed", clock(inc["since"])))
+                if inc.get("where") and not inc["label"].startswith((m or "") + ":"):
+                    lines.append("    %s" % inc["where"])
+            if m:
+                lines.append("  get in: " + ways_in(m))
         still = len(state["open"]) - len(opened)
         if still:
-            lines.append("(%d other incident%s still open)" % (still, "" if still == 1 else "s"))
-        title = "mesh: %s down" % (opened[0] if len(opened) == 1 else "%d checks" % len(opened))
-        msgs.append({"title": title, "body": "\n".join(lines) + "\n— mesh-watch on " + box, "tags": "rotating_light"})
+            lines.append("(%d earlier incident%s still open)" % (still, "" if still == 1 else "s"))
+        title = "down: " + (heads[0] if len(heads) == 1 else ", ".join(heads[:3]) +
+                            (" +%d" % (len(heads) - 3) if len(heads) > 3 else ""))
+        if not heads:
+            title = "down: " + ", ".join(state["open"][i]["label"] for i in opened)
+        msgs.append({"title": title[:120], "body": "\n".join(lines) + "\n— mesh-watch on " + box,
+                     "tags": "rotating_light", "priority": "high"})
     if recovered:
-        lines = ["%s — back after %s" % (tid, ago(inc["since"], t)) for tid, inc in recovered]
+        lines = ["%s — back; down %s (%s–%s)" % (inc["label"], ago(inc["since"], t), clock(inc["since"]),
+                                                 clock(stamp(t))) for tid, inc in recovered]
         if state["open"]:
             lines.append("(%d still down)" % len(state["open"]))
-        title = "mesh: %s back" % (recovered[0][0] if len(recovered) == 1 else "%d checks" % len(recovered))
-        msgs.append({"title": title, "body": "\n".join(lines) + "\n— mesh-watch on " + box, "tags": "white_check_mark"})
+        title = "back: " + ", ".join(inc["label"] for _, inc in recovered)
+        msgs.append({"title": title[:120], "body": "\n".join(lines) + "\n— mesh-watch on " + box,
+                     "tags": "white_check_mark", "priority": "default"})
     return msgs
+
+
+def write_heartbeat(name, text):
+    with open(os.path.join(STATE, name), "w") as f:
+        f.write(text + "\n")
 
 
 # ---- modes -----------------------------------------------------------------
 
 def watch(dry, machines=True):
-    os.makedirs(STATE, exist_ok=True)
-    conf = read_conf()
-    ts, _ = targets(conf, machines)
-    box = os.uname().nodename.split(".")[0]
     state = load_state()
     t = now()
-    rc, _, _ = run(["curl", "-sS", "-f", "-o", "/dev/null", "-m", "15", CANARY], 20)
+    rc, _, err = run(["curl", "-sS", "-f", "-o", "/dev/null", "-m", "15", CANARY], 20)
     if rc != 0:
+        state.setdefault("offline_since", stamp(t))
         append("checks-%s.jsonl" % t.strftime("%Y-%m"),
-               [{"ts": stamp(t), "id": "canary", "ok": False, "detail": "this box is offline; nothing judged"}])
+               [{"ts": stamp(t), "id": "canary", "ok": False, "detail": last_line(err, "canary %d" % rc)}])
+        save_json(state, "state.json")
+        write_heartbeat("last-run", "%s offline %s" % (stamp(), state["offline_since"]))
         print("mesh-watch: the canary did not answer; this box looks offline, judging nothing", file=sys.stderr)
         return 3
+    state.pop("offline_since", None)
+    fleet, fleet_note = read_fleet()
+    ts, _ = targets(read_conf(), fleet, machines)
     results = check_all(ts)
-    append("checks-%s.jsonl" % t.strftime("%Y-%m"),
-           [dict(r, ts=stamp(t)) for r in results.values()])
+    ts.append({"id": "monitor:fleet", "label": "the fleet file on " + box(), "machine": None,
+               "where": "`tunnels fleet show --json` on " + box()})
+    results["monitor:fleet"] = {"id": "monitor:fleet", "ok": fleet_note is None, "detail": fleet_note or ""}
+    append("checks-%s.jsonl" % t.strftime("%Y-%m"), [dict(r, ts=stamp(t)) for r in results.values()])
     opened, recovered = judge(state, ts, results, t)
-    state["pending"].extend(compose(state, opened, recovered, t, box))
+    state["pending"].extend(compose(state, ts, opened, recovered, t, box()))
     flush(state, dry)
     state["last_run"] = stamp()
     save_json(state, "state.json")
-    with open(os.path.join(STATE, "last-run"), "w") as f:
-        f.write(stamp() + "\n")
+    write_heartbeat("last-run", "%s ok" % stamp())
+    prune(t)
     bad = [r for r in results.values() if not r["ok"]]
     print("mesh-watch: %d checks, %d failing, %d open, %d alert(s) waiting" %
           (len(results), len(bad), len(state["open"]), len(state["pending"])))
@@ -371,10 +512,8 @@ def watch(dry, machines=True):
 
 def heartbeat(machine, dry):
     """From a second box: has the monitor on <machine> finished a run lately?"""
-    os.makedirs(STATE, exist_ok=True)
     state = load_state("heartbeat.json")
     t = now()
-    path = os.environ.get("MESH_WATCH_REMOTE_STATE", ".local/state/mesh-watch") + "/last-run"
     last, how, reached = None, [], False
     # Tailnet first, then the Cloudflare path, so one path down is not "the
     # monitor is down". ssh exits 255 only when it could not get in.
@@ -383,50 +522,66 @@ def heartbeat(machine, dry):
             if attempt:
                 time.sleep(RETRY_GAP)
             rc, out, err = run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=12", alias,
-                                "cat " + path], 30)
+                                "cat %s/last-run" % REMOTE_STATE], 30)
             if rc != 255:
                 break
         reached = rc != 255
         if rc == 0:
             last = out.strip()
-        how.append("%s: %s" % (alias, "ok" if rc == 0 else (err.strip().splitlines() or ["?"])[-1][:120]))
+        how.append("%s: %s" % (alias, "ok" if rc == 0 else last_line(err, "?")[:120]))
         if reached:
             break
-    ok, detail = False, ""
+    # Unreachable is judged over two runs, since the fault may be this box's;
+    # a stale or missing heartbeat already means two missed runs, so at once.
+    ok, detail, fail_runs = False, "", 1
     if not reached:
-        detail = "cannot reach %s (%s)" % (machine, "; ".join(how))
+        detail, fail_runs = "cannot reach %s (%s)" % (machine, "; ".join(how)), 2
     elif last is None:
-        detail = "%s answers but has no heartbeat (%s)" % (machine, how[-1])
+        detail = "%s answers, but mesh-watch has never finished a run there (%s)" % (machine, how[-1])
     else:
+        f = last.split()
         try:
-            age = (t - dt.datetime.strptime(last, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)).total_seconds()
-            ok = age < STALE_MIN * 60
-            detail = "last run %s ago" % ago(last, t)
-        except ValueError:
+            age = (t - parse(f[0])).total_seconds()
+            if age > STALE_MIN * 60:
+                detail = "its last run was %s ago, at %s" % (ago(f[0], t), clock(f[0]))
+            elif len(f) >= 3 and f[1] == "offline" and (t - parse(f[2])).total_seconds() > STALE_MIN * 60:
+                detail = ("it is running, but %s has had no internet since %s, so it cannot see the "
+                          "sites or send alerts" % (machine, clock(f[2])))
+            else:
+                ok, detail = True, "last run %s ago" % ago(f[0], t)
+        except (ValueError, IndexError):
             detail = "last-run unreadable: %r" % last[:40]
     tid = "monitor:" + machine
     append("heartbeat-%s.jsonl" % t.strftime("%Y-%m"), [{"ts": stamp(t), "id": tid, "ok": ok, "detail": detail}])
-    fake = [{"id": tid, "where": "mesh-watch on " + machine}]
-    opened, recovered = judge(state, fake, {tid: {"ok": ok, "detail": detail}}, t)
-    msgs = []
+    fake = [{"id": tid, "label": "mesh-watch on " + machine, "machine": machine}]
+    opened, recovered = judge(state, fake, {tid: {"ok": ok, "detail": detail, "fail_runs": fail_runs}}, t,
+                              ok_runs=1)
     if opened:
-        msgs.append({"title": "mesh-watch on %s has stopped" % machine,
-                     "body": "%s. Nothing is watching the mesh until it is back.\n— heartbeat on %s"
-                             % (detail, os.uname().nodename.split(".")[0]), "tags": "warning"})
+        state["pending"].append({
+            "title": "mesh-watch on %s is not watching" % machine,
+            "body": "%s. Nothing is checking the mesh until it is back; since %s.\n  get in: %s\n"
+                    "— heartbeat on %s" % (detail[0].upper() + detail[1:], clock(state["open"][tid]["since"]),
+                                           ways_in(machine), box()),
+            "tags": "warning", "priority": "high"})
     if recovered:
-        msgs.append({"title": "mesh-watch on %s is back" % machine,
-                     "body": "%s; it was out for %s." % (detail, ago(recovered[0][1]["since"], t)),
-                     "tags": "white_check_mark"})
-    state["pending"].extend(msgs)
+        state["pending"].append({
+            "title": "mesh-watch on %s is watching again" % machine,
+            "body": "Out %s (%s–%s); %s.\n— heartbeat on %s" % (
+                ago(recovered[0][1]["since"], t), clock(recovered[0][1]["since"]), clock(stamp(t)), detail, box()),
+            "tags": "white_check_mark", "priority": "default"})
     flush(state, dry)
     save_json(state, "heartbeat.json")
+    write_heartbeat("heartbeat-last", "%s %s" % (stamp(), "ok" if ok else "fail"))
+    prune(t)
     print("heartbeat %s: %s — %s" % (machine, "ok" if ok else "FAIL", detail))
     return 0
 
 
 def listing():
-    conf = read_conf()
-    ts, skipped = targets(conf)
+    fleet, note = read_fleet()
+    if note:
+        print("note   " + note)
+    ts, skipped = targets(read_conf(), fleet)
     for t in ts:
         print("check  %-44s %s%s" % (t["id"], t.get("url") or t.get("alias") or t.get("host"),
                                      "  expect %r" % t["expect"] if t.get("expect") else ""))
@@ -438,6 +593,7 @@ def listing():
 
 def main(argv):
     load_env()
+    os.makedirs(STATE, exist_ok=True)
     dry = "--dry" in argv
     args = [a for a in argv if not a.startswith("--")]
     if "--list" in argv:
