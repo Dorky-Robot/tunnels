@@ -80,30 +80,56 @@ USAGE
 }
 
 # ---- commands ------------------------------------------------------------
+# Every machine is probed at once, and each machine's two paths at once too.
+# One at a time, a box that is off or asleep costs its full timeouts on both
+# paths — and a .local name that does not answer is mDNS waiting ~5s before nc
+# even starts — so --list took 20s to say two machines were missing.
 do_list() {
-  local m mesh lan cf port host pid
+  local m i=0 dir
+  dir=$(mktemp -d) || die "no temp dir"
   for m in $(machines); do
-    lookup "$m"
-    host=$(ssh_field "$mesh" hostname)
-    if [ -n "$host" ] && reachable "$host"; then
-      printf '  %-12s tailnet  %s:5900\n' "$m" "$host"
-      continue
-    fi
-    host=$(ssh_field "$lan" hostname)
-    if [ -n "$host" ] && reachable "$host"; then
-      printf '  %-12s lan      %s:5900\n' "$m" "$host"
-      continue
-    fi
-    if [ -n "$cf" ] && listening "$port"; then
-      pid=$(lsof -nP -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -1)
-      printf '  %-12s tunnel   localhost:%s -> %s  (pid %s)\n' "$m" "$port" "$cf" "$pid"
-    elif [ -n "$cf" ]; then
-      printf '  %-12s —        no screen on any path\n' "$m"
-    else
-      printf '  %-12s —        no screen on either path (no tunnel)\n' "$m"
-    fi
+    list_one "$m" >"$dir/$i" &
+    i=$((i + 1))
   done
+  wait
+  # In mesh/machines order, not in the order the probes happened to finish.
+  for ((m = 0; m < i; m++)); do cat "$dir/$m"; done
+  rm -rf "$dir"
   do_list_unknown
+}
+
+# The machine you are sitting at is not probed: its own 5900 answers only if
+# Screen Sharing is on, and a screen you are already looking at is no path.
+this_host() { scutil --get LocalHostName 2>/dev/null || hostname -s; }
+
+list_one() {
+  local m=$1 mesh lan cf port thost lhost tp lp pid
+  lookup "$m"
+  thost=$(ssh_field "$mesh" hostname)
+  if [ "$thost" = "$(this_host)" ]; then
+    printf '  %-12s here     this machine\n' "$m"
+    return
+  fi
+  lhost=$(ssh_field "$lan" hostname)
+  [ -n "$thost" ] && { reachable "$thost" & tp=$!; }
+  [ -n "$lhost" ] && { reachable "$lhost" & lp=$!; }
+  if [ -n "${tp:-}" ] && wait "$tp"; then
+    [ -n "${lp:-}" ] && kill "$lp" 2>/dev/null
+    printf '  %-12s tailnet  %s:5900\n' "$m" "$thost"
+    return
+  fi
+  if [ -n "${lp:-}" ] && wait "$lp"; then
+    printf '  %-12s lan      %s:5900\n' "$m" "$lhost"
+    return
+  fi
+  if [ -n "$cf" ] && listening "$port"; then
+    pid=$(lsof -nP -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -1)
+    printf '  %-12s tunnel   localhost:%s -> %s  (pid %s)\n' "$m" "$port" "$cf" "$pid"
+  elif [ -n "$cf" ]; then
+    printf '  %-12s —        no screen on any path\n' "$m"
+  else
+    printf '  %-12s —        no screen on either path (no tunnel)\n' "$m"
+  fi
 }
 
 # Every machine mesh.conf lists but lookup() does not know. Without this the
