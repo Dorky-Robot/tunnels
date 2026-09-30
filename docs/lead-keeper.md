@@ -68,7 +68,10 @@ plist is in `~/Library/LaunchAgents`, a `last-run` older than 11 minutes
 is how a session is finished on purpose, so a removed session is never
 brought back. Per name only the newest entry counts: if any entry by that
 name is alive, the name is alive, and an older duplicate is never revived.
-`exclude | <name>` in the config leaves a session alone.
+`exclude | <name or glob>` in the config leaves sessions alone; a glob matches
+the whole name or the task after " · ". Test sessions (`lk-throwaway*`,
+`claude-update probe`) are always left alone: each revival of one is one more
+record in Felix's claude.ai sidebar.
 
 **When.** A name is revived when two passes in a row find either:
 
@@ -157,7 +160,10 @@ in settings). Instead, once a week:
 2. Probe the new binary before anything depends on it. A promptless
    `claude --bg --remote-control -n "claude-update probe"` must show its RC
    link within 60 s, and `lsof` must show it running the new file. The
-   probe is always stopped and removed afterwards. A script can neither
+   probe is always stopped and removed afterwards. It is one conversation,
+   resumed every time, because a Remote Control session is a claude.ai
+   sidebar record that no CLI command archives, and a resumed session
+   reattaches to its old record instead of adding a new one. A script can neither
    grant nor read Full Disk Access, so this is the check. If the probe
    hangs, or runs the old binary and so proves nothing, Felix gets one
    alert naming the exact path to grant, and **nothing is respawned**.

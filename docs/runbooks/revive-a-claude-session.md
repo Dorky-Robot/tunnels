@@ -129,6 +129,30 @@ launchctl kickstart -k gui/$(id -u)/com.felixflores.claude-rc
 It **kills every session running under it**, so say so first. It is safe
 over `ssh mini`: it doesn't carry the ssh.
 
+## 7. Clean up every test session, in both places
+
+A session you start to test something (name it `lk-throwaway-<n>`, which
+lead-keeper never revives) lives in two places. Clean up both before you
+report.
+
+1. **Locally**: `claude stop <id>`, then `claude rm <id>`. **Check:**
+   `claude agents --json --all` no longer lists it.
+2. **In the claude.ai sidebar**: any session that ran with
+   `--remote-control`, or was resumed with it, has a claude.ai record, and
+   `claude rm` leaves that record behind. No CLI command archives it
+   (checked in 2.1.285/2.1.286 help and in the Remote Control and agent-view
+   docs). Find its link with `claude logs <id>` before you remove it, or
+   read the `bridgeSessionId` (`cse_X`, link `claude.ai/code/session_X`)
+   from its transcript, then ask Felix to archive it: open the link, and in
+   the claude.ai/code session list open that session's menu and choose
+   Archive.
+
+Keep sidebar records rare. Test without `--remote-control` when RC is not
+what you are testing. When it is, resume one test conversation
+(`claude --bg --resume <its sessionId> --remote-control -n <name>`)
+instead of starting new ones: a resumed session reattaches to its
+existing claude.ai record. claude-update's probe works this way.
+
 ## Stop and ask a person if
 
 - the probe shows the `openat` hang (only Felix, at the screen, can grant
@@ -157,3 +181,7 @@ over `ssh mini`: it doesn't carry the ssh.
   and RC link, note delivered); with flags it made a copy and left a dead
   duplicate. `claude rm` kept the transcript, and the flagged resume
   brought the conversation back.
+- 2026-09-30: lead-keeper's throwaways left six records in Felix's claude.ai
+  sidebar after `claude rm`. Step 7 added: clean up in both places. A
+  resumed test conversation reattached to its own record (session_01XYsUNP…),
+  which is how the claude-update probe now stays at one record.
