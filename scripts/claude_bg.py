@@ -1,0 +1,218 @@
+"""What lead-keeper.py and claude-update.py both need from Claude Code's
+background sessions, and the one way both of them tell Felix something.
+
+Everything here shells out to the `claude` CLI by full path: launchd gives a
+job /usr/bin:/bin and nothing else, and on 2026-09-29 "command not found"
+over a non-login shell was PATH, not a missing install.
+
+Learned on throwaway sessions (2026-09-30, Claude Code 2.1.285):
+  - A session is dead when its `claude agents --json --all` entry has no pid.
+  - `claude --bg --resume <sessionId> "<note>"`, with NO other flags, wakes a
+    dead background session in place: same id, same conversation, its saved
+    --remote-control and -n, and the same claude.ai/code link. The note
+    arrives as its next prompt.
+  - Pass flags to that command and you get a copy with a new id instead
+    ("keeps its own saved options, so the flags you passed started a copy").
+  - `claude rm <id>` keeps the transcript; after it, the flagged --resume
+    brings the conversation back (and may even keep the id). Plain
+    `claude respawn <id>` also wakes a dead entry, but carries no note.
+  - `claude logs <id>` on a dead session says "job not found", so an RC link
+    in the logs is always from the live process.
+  - A promptless `claude --bg --remote-control -n <name>` shows its RC link
+    within seconds and spends no tokens: a free probe of a binary.
+"""
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import time
+
+HOME = os.path.expanduser("~")
+CLAUDE = os.environ.get("CLAUDE_BIN", os.path.join(HOME, ".local/bin/claude"))
+KAPWA = os.environ.get("KAPWA_BIN", os.path.join(HOME, ".local/bin/kapwa"))
+# mesh-watch's alert channel: one topic, one env file, the topic never in git.
+ENVFILE = os.environ.get("MESH_WATCH_ENV", os.path.join(HOME, ".config/mesh-watch/env"))
+PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+os.environ["PATH"] = os.path.join(HOME, ".local/bin") + ":" + os.environ.get("PATH", "") + ":" + PATH
+
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
+RC_LINK = re.compile(r"claude\.ai/code/session_[A-Za-z0-9]+")
+BG_ID = re.compile(r"backgrounded\s*·\s*([0-9a-f]{8})")
+
+
+def now():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def stamp(t=None):
+    return (t or now()).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse(s):
+    return dt.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+
+
+def box():
+    return os.uname().nodename.split(".")[0]
+
+
+def load_env():
+    if os.path.exists(ENVFILE):
+        for line in open(ENVFILE):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+
+
+def run(argv, timeout, cwd=None):
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL, cwd=cwd)
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", "timed out after %ss" % timeout
+    except OSError as e:
+        return 127, "", str(e)
+
+
+def plain(s):
+    return ANSI.sub("", s or "")
+
+
+def agents():
+    """Every session, live and dead, or None when the list cannot be read.
+    None is unknown, not empty: nothing is revived on the strength of it."""
+    rc, out, err = run([CLAUDE, "agents", "--json", "--all"], 60)
+    if rc != 0:
+        return None
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return None
+    return data if isinstance(data, list) else None
+
+
+def pid_alive(pid):
+    """Is there a process with this pid, and is it Claude? A pid reused by
+    something else is not a lead."""
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, ValueError):
+        return False
+    rc, out, _ = run(["/bin/ps", "-o", "command=", "-p", str(pid)], 10)
+    return rc == 0 and "claude" in out
+
+
+def rc_link(short_id, wait, gap=2.0):
+    """Poll `claude logs` until the session shows its Remote Control link.
+    The link, or None if none appeared within `wait` seconds."""
+    end = time.monotonic() + wait
+    while True:
+        rc, out, _ = run([CLAUDE, "logs", short_id], 20)
+        m = RC_LINK.search(plain(out)) if rc == 0 else None
+        if m:
+            return "https://" + m.group(0)
+        if time.monotonic() >= end:
+            return None
+        time.sleep(gap)
+
+
+def trusted(cwd):
+    """Has the trust dialog been accepted for cwd or a folder above it? An
+    untrusted cwd makes a background session refuse to start."""
+    try:
+        projects = json.load(open(os.path.join(HOME, ".claude.json"))).get("projects", {})
+    except (OSError, ValueError):
+        return None
+    d = os.path.realpath(cwd)
+    while True:
+        if (projects.get(d) or {}).get("hasTrustDialogAccepted"):
+            return True
+        up = os.path.dirname(d)
+        if up == d:
+            return False
+        d = up
+
+
+def transcript(cwd, session_id):
+    """Where Claude keeps a session's conversation: the file --resume reads."""
+    return os.path.join(HOME, ".claude/projects", re.sub(r"[^A-Za-z0-9]", "-", cwd),
+                        session_id + ".jsonl")
+
+
+# ---- telling Felix ----------------------------------------------------------
+
+def ntfy(title, body, dry, priority="high", tags="rotating_light"):
+    """True if it left the box (or was printed, when dry)."""
+    if dry:
+        print("ALERT %s\n%s\n" % (title, body))
+        return True
+    url = os.environ.get("MESH_WATCH_NTFY")
+    if not url:
+        return False
+    rc, _, _ = run(["curl", "-sS", "-f", "-m", "20", "-H", "Title: " + title,
+                    "-H", "Tags: " + tags, "-H", "Priority: " + priority,
+                    "--data-binary", body, url], 25)
+    return rc == 0
+
+
+def kapwa(headline, detail, tag, dry, done=None):
+    """One item on #mesh: the headline is its name forever, so it is short
+    and the detail goes in a note on it. With done=<id>, close that item
+    instead of opening one: the recovery answers the alert where it was
+    raised. The item's id (or True) once it is on the board, else None."""
+    if dry:
+        print("KAPWA #mesh %s%s\n  %s\n" % ("done %s: " % done if done else "", headline, detail))
+        return True
+    if not os.path.exists(KAPWA):
+        return None
+    if done:
+        rc, _, _ = run([KAPWA, "done", done, headline + ". " + detail, "--tag", tag], 60)
+        return done if rc == 0 else None
+    rc, out, _ = run([KAPWA, "say", headline, "--t", "mesh", "--tag", tag], 60)
+    if rc != 0:
+        return None
+    # kapwa ids are short hex; one with a digit in it, so a word like
+    # "added" in the output is not mistaken for one.
+    m = re.search(r"\b((?=[0-9a-f]*[0-9])[0-9a-f]{5,12})\b", plain(out))
+    if not m:
+        return True
+    if detail:
+        run([KAPWA, "say", m.group(1), detail, "--tag", tag], 60)
+    return m.group(1)
+
+
+def flush(pending, dry, tag):
+    """Send what is waiting, oldest first. Returns (what did not go, what
+    did). An alert is ntfy and kapwa both, each half retried on its own;
+    a sent alert carries its kapwa item id in "kapwa_sent"."""
+    left, sent = [], []
+    for a in pending:
+        if "at" in a and (now() - parse(a["at"])).total_seconds() > 86400:
+            continue                     # a day late is news nobody can use
+        if not a.get("ntfy_sent"):
+            a["ntfy_sent"] = ntfy(a["title"], a["body"], dry, a.get("priority", "high"),
+                                  a.get("tags", "rotating_light"))
+        if not a.get("kapwa_sent"):
+            a["kapwa_sent"] = kapwa(a["title"], a["body"], tag, dry, a.get("kapwa_done"))
+        (sent if a["ntfy_sent"] and a["kapwa_sent"] else left).append(a)
+    return left, sent
+
+
+def load_json(path, default):
+    try:
+        return json.load(open(path))
+    except (OSError, ValueError):
+        return default
+
+
+def save_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1, sort_keys=True)
+    os.replace(tmp, path)
