@@ -23,19 +23,24 @@ Before 2026-09 `route rm` deleted the DNS record whatever it pointed at
 
 ## Before you start
 
-On dorkyrobot2 (or another box on `remote_from`):
+On dorkyrobot2 (or another box on `remote_from`), name it once:
+
+```sh
+H=<hostname>            # e.g. william.felixflor.es
+Z=<its zone>            # the Cloudflare zone: felixflor.es, everyday.vet, …
+```
 
 ```sh
 tunnels plan; echo "exit $?"          # 0: nothing else is drifting, so the plan below is only yours
-tunnels route list | grep -E '^<host> '     # its tunnel, service, and DNS state
+tunnels route list | grep -E "^$H "     # its tunnel, service, and DNS state
 ```
 
 Write down the before state, so the Undo works:
 
 ```sh
-tunnels fleet show | grep -B1 -A4 '"<host>"'     # the route block: tunnel, service, standby
-tunnels cf get '/zones/{zone:<zone>}/dns_records?name=<host>' | grep -E '"(type|content)"'
-curl -s -o /dev/null -w '%{http_code}\n' https://<host>/
+tunnels fleet show | grep -B1 -A4 "\"$H\""     # the route block: tunnel, service, standby
+tunnels cf get "/zones/{zone:$Z}/dns_records?name=$H" | grep -E '"(type|content)"'
+curl -s -o /dev/null -w '%{http_code}\n' https://$H/
 tunnels fleet history | head -1                  # serial N
 ```
 
@@ -49,7 +54,7 @@ change.
 1. **Remove it.**
 
    ```sh
-   tunnels route rm <host>
+   tunnels route rm $H
    ```
 
    **Check:** it announces `removing <host>` and the apply report lists the
@@ -61,10 +66,10 @@ change.
 
    ```sh
    tunnels fleet history | head -1          # serial N+1, by this box
-   tunnels route list | grep -c '^<host> '   # 0
-   tunnels cf get '/zones/{zone:<zone>}/dns_records?name=<host>'   # [] (or only non-tunnel records)
+   tunnels route list | grep -c "^$H "   # 0
+   tunnels cf get "/zones/{zone:$Z}/dns_records?name=$H"   # [] (or only non-tunnel records)
    tunnels plan; echo "exit $?"              # 0
-   dig +short <host>                         # nothing, once caches expire
+   dig +short $H                         # nothing, once caches expire
    ```
 
    A 530 from `curl` straight afterwards is Cloudflare's edge before the
@@ -86,7 +91,7 @@ the fleet already dropped it and the Cloudflare side was left behind.
 2. Remove only those, only for this hostname:
 
    ```sh
-   tunnels apply --prune --host <host>
+   tunnels apply --prune --host $H
    ```
 
 3. If `plan` shows nothing for it, it isn't a tunnel route at all (an A
@@ -94,23 +99,25 @@ the fleet already dropped it and the Cloudflare side was left behind.
    it with `tunnels cf`, which previews first and logs an undo:
 
    ```sh
-   tunnels cf delete '/zones/{zone:<zone>}/dns_records/{record:<host>}'          # preview
-   tunnels cf delete '/zones/{zone:<zone>}/dns_records/{record:<host>}' --yes    # send
+   tunnels cf delete "/zones/{zone:$Z}/dns_records/{record:$H}"          # preview
+   tunnels cf delete "/zones/{zone:$Z}/dns_records/{record:$H}" --yes    # send
    ```
 
 ## Stop and ask a person if
 
 - `tunnels plan` before you start is not 0 and the drift is not yours;
 - the DNS record points at a tunnel outside the fleet (an orphan such as
-  `mac-sara`): `tunnels` will leave it, and deleting it is a decision about
-  that tunnel, not this hostname;
+  `mac-sara`): `plan` leaves it and `tunnels cf delete` refuses it (tunnel
+  CNAMEs belong to routes). The way out is deciding that tunnel: `tunnel
+  adopt` it and then `route rm`, or `tunnel destroy`, which deletes its DNS
+  too;
 - the hostname is production (everyday.vet, homesforsalebymonica.com) and
   the go-ahead didn't come from Felix directly.
 
 ## Undo
 
 ```sh
-tunnels route add <host> <service> --tunnel <alias>   # the service and tunnel you wrote down
+tunnels route add $H <service> --tunnel <alias>   # the service and tunnel you wrote down
 ```
 
 It puts back ingress and DNS and adds the route to the fleet. A record you
@@ -124,6 +131,7 @@ deleted with `tunnels cf delete` comes back with `tunnels cf undo <id>
 - 2026-09-30: `william.felixflor.es` retired (serial 50). It shared its
   backend with `jerry.felixflor.es`, which stayed: the app kept running.
   Right afterwards curl gave 530 while `dig` was already empty.
-- 2026-09-30: written. The reads above run against the live fleet; `route
-  rm` itself was not run for this (it is a write); its refusal message is
-  from `src/main.rs`.
+- 2026-09-30: written. The reads above run against the live fleet with
+  `H=jerry.felixflor.es`; the `cf delete` preview on it answered "refused:
+  DNS records that point at a tunnel belong to its route". `route rm` itself
+  was not run (it is a write); its refusal message is from `src/main.rs`.
