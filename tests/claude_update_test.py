@@ -30,6 +30,7 @@ def save(): json.dump(w, open(W, "w"))
 me = os.path.basename(os.path.realpath(sys.argv[0]))
 if a == ["--version"]: print(me + " (Claude Code)"); sys.exit(0)
 if a == ["update"]:
+    if os.path.exists(os.path.join(d, "fail")): print("network error"); sys.exit(1)
     if w.get("next"):
         link = os.environ["CLAUDE_BIN"]; os.remove(link)
         os.symlink(os.path.join(d, "versions", w["next"]), link)
@@ -147,7 +148,7 @@ class ClaudeUpdate(unittest.TestCase):
                  CLAUDE_UPDATE_STATE=os.path.join(t, "state"), CLAUDE_UPDATE_LOCK=os.path.join(t, "state/running"),
                  CLAUDE_JOBS=os.path.join(t, "jobs"), CLAUDE_BUNDLE=os.path.join(t, "ClaudeCode.app"),
                  CLAUDE_UPDATE_PROBE_CWD=os.path.join(t, "Projects"), CLAUDE_UPDATE_LSOF=os.path.join(t, "lsof"),
-                 CLAUDE_UPDATE_PROBE_WAIT="0", CLAUDE_UPDATE_RC_WAIT="0", CLAUDE_UPDATE_BUSY_WAIT="0")
+                 CLAUDE_UPDATE_PROBE_WAIT="0", LEAD_KEEPER_CONF=os.path.join(t, "no-leads.conf"), CLAUDE_UPDATE_RC_WAIT="0", CLAUDE_UPDATE_BUSY_WAIT="0")
         e.update(env)
         p = subprocess.run(["/usr/bin/python3", SCRIPT] + list(args), env=e, capture_output=True, text=True, timeout=60)
         self.assertEqual(p.returncode, 0, p.stderr)
@@ -208,6 +209,21 @@ class ClaudeUpdate(unittest.TestCase):
         self.assertEqual(len(Ntfy.alerts), 1)
         self.assertIn("Monica (bbbb0002): back without Remote Control", Ntfy.alerts[0]["body"])
         self.assertNotIn("worker", Ntfy.alerts[0]["body"])      # never had RC, not missing it
+
+    def test_a_kept_session_back_without_rc_is_left_to_lead_keeper(self):
+        open(os.path.join(self.d, "leads.conf"), "w").write("Monica | ~/Projects\n")
+        self.world(lose_rc=["bbbb0002"])
+        out = self.run_(LEAD_KEEPER_CONF=os.path.join(self.d, "leads.conf"))
+        self.assertIn("lead-keeper repairs it", out)
+        self.assertEqual(Ntfy.alerts, [])
+
+    def test_an_update_that_keeps_failing_is_said_once(self):
+        open(os.path.join(self.d, "fail"), "w").write("")
+        for _ in range(4):
+            self.run_()
+        self.assertEqual(len(Ntfy.alerts), 1)
+        self.assertIn("has not updated for 2 weeks", Ntfy.alerts[0]["title"])
+        self.assertTrue(os.path.exists(os.path.join(self.d, "state/last-run")))
 
     def test_dry_run_installs_and_restarts_nothing(self):
         out = self.run_("--dry-run")

@@ -183,6 +183,37 @@ def memory_tight():
         return False
 
 
+LEADS = os.environ.get("LEAD_KEEPER_CONF",
+                       os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "mesh/leads.conf"))
+
+
+def read_leads(path=None):
+    """mesh/leads.conf: ([{name, cwd, note}], {excluded names})."""
+    leads, excludes = [], set()
+    for line in open(path or LEADS):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [p.strip() for p in line.split(" | ")]
+        if parts[0] == "exclude" and len(parts) == 2:
+            excludes.add(parts[1])
+            continue
+        if len(parts) < 2 or not parts[0]:
+            raise SystemExit("%s: bad line: %s" % (path or LEADS, line))
+        leads.append({"name": parts[0], "cwd": os.path.expanduser(parts[1]),
+                      "note": parts[2] if len(parts) > 2 and parts[2] else ""})
+    return leads, excludes
+
+
+def kept(name):
+    """Is this a session lead-keeper looks after: a lead, or '<lead> · <task>'?"""
+    try:
+        leads, excludes = read_leads()
+    except (OSError, SystemExit):
+        return False
+    return name not in excludes and any(name == l["name"] or name.startswith(l["name"] + " · ") for l in leads)
+
+
 def trusted(cwd):
     """Has the trust dialog been accepted for cwd or a folder above it? An
     untrusted cwd makes a background session refuse to start."""

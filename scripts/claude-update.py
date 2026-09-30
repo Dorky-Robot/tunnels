@@ -33,7 +33,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from claude_bg import (CLAUDE, HOME, agents, box, flush, grant_path, job, load_env, load_json,  # noqa: E402
+from claude_bg import (CLAUDE, HOME, agents, box, flush, grant_path, job, kept, load_env, load_json,  # noqa: E402
                        rc_link, run, save_json, stamp, BG_ID, plain)
 
 STATE = os.environ.get("CLAUDE_UPDATE_STATE", os.path.join(HOME, ".local/state/claude-update"))
@@ -44,6 +44,7 @@ PROBE_WAIT = float(os.environ.get("CLAUDE_UPDATE_PROBE_WAIT", "60"))
 RC_WAIT = float(os.environ.get("CLAUDE_UPDATE_RC_WAIT", "90"))
 BUSY_WAIT = float(os.environ.get("CLAUDE_UPDATE_BUSY_WAIT", "1800"))
 LSOF = os.environ.get("CLAUDE_UPDATE_LSOF", "/usr/sbin/lsof")
+FAIL_WEEKS = int(os.environ.get("CLAUDE_UPDATE_FAIL_RUNS", "2"))
 TAG = "claude-update"
 
 
@@ -149,7 +150,12 @@ def respawn_all(before, version, dry):
         if not after.get("pid"):
             bad.append("%s (%s): not running after respawn" % (s["name"], s["id"]))
         elif not link:
-            bad.append("%s (%s): back without Remote Control" % (s["name"], s["id"]))
+            if kept(s["name"]):
+                # lead-keeper stops and copies it with --remote-control once
+                # the lock is gone: not something Felix has to do
+                log("%s (%s) came back without Remote Control; lead-keeper repairs it" % (s["name"], s["id"]))
+            else:
+                bad.append("%s (%s): back without Remote Control" % (s["name"], s["id"]))
         elif v and v != version:
             bad.append("%s (%s): still on %s" % (s["name"], s["id"], v))
     return bad
@@ -181,8 +187,15 @@ def main():
         rc, out, err = run([CLAUDE, "update"], 900)
         new, real = binary()
         if rc != 0:
-            log("claude update failed (%s): %s" % (rc, plain(out + err).strip()[-200:]))
+            why = plain(out + err).strip()[-200:]
+            log("claude update failed (%s): %s" % (rc, why))
+            st["failures"] = st.get("failures", 0) + 1
+            if st["failures"] == FAIL_WEEKS:   # once: a week's blip is not news, a stuck install is
+                st["pending"].append({"at": stamp(), "title": "%s: Claude Code has not updated for %d weeks"
+                                      % (box(), FAIL_WEEKS), "body": "`claude update` failed %d runs in a row; "
+                                      "still on %s. Last error: %s" % (FAIL_WEEKS, old, why)})
             return 0                     # nothing changed; next week tries again
+        st["failures"] = 0
         if new == old and real == old_real:
             log("up to date: %s" % new)
             return 0
@@ -216,6 +229,8 @@ def main():
         st["pending"], _ = flush(st["pending"], False, TAG)
         st["last_run"] = stamp()
         save_json(path, st)
+        with open(os.path.join(STATE, "last-run"), "w") as f:   # mesh-watch reads this
+            f.write(stamp() + "\n")
 
 
 if __name__ == "__main__":
