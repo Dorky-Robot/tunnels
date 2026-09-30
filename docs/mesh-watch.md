@@ -26,7 +26,9 @@ Nothing is listed by hand that can be derived.
 
 - **Every route in the fleet file** (`tunnels fleet show --json`): `https://<host>/`,
   redirects followed. It passes on a 2xx final page that is not empty, is not
-  a Cloudflare error page, and contains the `expect` text if one is set.
+  a Cloudflare error page, is not an error or placeholder page by its title
+  (502, "Welcome to nginx", "no healthy upstream"…), and contains the `expect`
+  text if one is set.
   A sign-in redirect therefore passes only if the sign-in page itself answers.
 - **Every machine in `mesh/machines`**: `tailscale ping`, `ssh <name> true`,
   and `ssh cloudflare-<name> true` where it has a tunnel. That last one is the
