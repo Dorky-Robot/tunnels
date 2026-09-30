@@ -255,7 +255,7 @@ Most things never meet any of these, and should stay documented API calls.
 | **2** ✓ | `tunnels cf` writes: preview, `--yes`, before/after log, `cf log`, `cf undo`; refusal of paths `tunnels` owns | a PATCH and its undo round-trip against the fake Cloudflare in tests, and once for real on a throwaway setting |
 | **3a** ✓ | agent side: verifying the Access token, `admins`, relaying machine actions across the mesh, a target-machine picker in the UI, recording who made each change | tested against a fake Access (its own signing keys): a non-admin gets the page without buttons and 403 on any write; an admin restarts a tunnel on another machine from the page |
 | **3b** | Cloudflare side, waiting on the admin token and the pocket-id client: login provider, Access app, `tunnels.felixflor.es` route; runbook `publish-the-web-ui` | signed in as an admin at `tunnels.felixflor.es`, you can restart a tunnel on mini; signed in as anyone else, you can only look |
-| **4** | the rest of the first runbooks; `CLAUDE.md` points agents to the index | each has been run once for real, and its History section has an entry |
+| **4** (written) | the rest of the first runbooks; `CLAUDE.md` points agents to the index | each has been run once for real, and its History section has an entry. Written 2026-09-30: `after-a-power-cut`, `rotate-a-leaked-token`, `add-a-machine`, `retire-a-hostname`, `revive-a-claude-session`; their reads proven against the mesh, none yet run for real |
 | **5** | promote whatever phases 3–4 show is worth it | — |
 
 ## The web UI on the internet

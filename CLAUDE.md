@@ -135,3 +135,9 @@ builds both architectures and updates `dorky-robot/homebrew-tap`.
 `cloudflare-`). Push it to every machine with `sh mesh/install.sh`, which also runs
 `tunnels agent install`. `docs/remote-access.md` explains why it is shaped this way and how to add
 a machine.
+
+## Runbooks
+
+For a mesh job (a box back after a power cut, a leaked tunnel token, a new machine, retiring a
+hostname, reviving a Claude lead), read `docs/runbooks/README.md` first and follow the runbook.
+When one turns out wrong, fix the step and add a line to its History.
