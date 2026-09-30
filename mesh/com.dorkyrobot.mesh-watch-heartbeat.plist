@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.dorkyrobot.mesh-watch-heartbeat</string>
+  <!-- On the mini: is mesh-watch on dorkyrobot2 still running? It reads
+       dorkyrobot2's last-run over ssh (tailnet, then Cloudflare) and alerts
+       once when it is stale or unreachable: docs/mesh-watch.md. A
+       LaunchDaemon run as felixflores, for the same reasons as the monitor. -->
+  <key>UserName</key><string>felixflores</string>
+  <key>ProgramArguments</key><array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/felixflores/Projects/dorky_robot/tunnels/scripts/mesh-watch.py</string>
+    <string>heartbeat</string><string>dorkyrobot2</string>
+  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>HOME</key><string>/Users/felixflores</string>
+  </dict>
+  <key>StartCalendarInterval</key><array>
+    <dict><key>Minute</key><integer>4</integer></dict><dict><key>Minute</key><integer>9</integer></dict><dict><key>Minute</key><integer>14</integer></dict><dict><key>Minute</key><integer>19</integer></dict><dict><key>Minute</key><integer>24</integer></dict><dict><key>Minute</key><integer>29</integer></dict><dict><key>Minute</key><integer>34</integer></dict><dict><key>Minute</key><integer>39</integer></dict><dict><key>Minute</key><integer>44</integer></dict><dict><key>Minute</key><integer>49</integer></dict><dict><key>Minute</key><integer>54</integer></dict><dict><key>Minute</key><integer>59</integer></dict>
+  </array>
+  <key>StandardOutPath</key><string>/Users/felixflores/Library/Logs/mesh-watch-heartbeat.log</string>
+  <key>StandardErrorPath</key><string>/Users/felixflores/Library/Logs/mesh-watch-heartbeat.log</string>
+</dict></plist>

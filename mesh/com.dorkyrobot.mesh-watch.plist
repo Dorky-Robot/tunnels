@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.dorkyrobot.mesh-watch</string>
+  <!-- The mesh seen from outside, on dorkyrobot2: docs/mesh-watch.md. A
+       LaunchDaemon in /Library/LaunchDaemons, so it runs with nobody logged
+       in, but as dorkyrobot2 (UserName), because the checks are that user's
+       ssh keys and the script lives in that user's checkout. -->
+  <key>UserName</key><string>dorkyrobot2</string>
+  <key>ProgramArguments</key><array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/dorkyrobot2/Projects/dorky_robot/tunnels/scripts/mesh-watch.py</string>
+  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>HOME</key><string>/Users/dorkyrobot2</string>
+  </dict>
+  <!-- By the clock, not StartInterval: after the macOS 27 upgrade
+       (2026-09-23) only StartCalendarInterval jobs ran. Two minutes past
+       the tunnel-watchdog, so a repair it makes is seen, not raced. -->
+  <key>StartCalendarInterval</key><array>
+    <dict><key>Minute</key><integer>2</integer></dict><dict><key>Minute</key><integer>7</integer></dict><dict><key>Minute</key><integer>12</integer></dict><dict><key>Minute</key><integer>17</integer></dict><dict><key>Minute</key><integer>22</integer></dict><dict><key>Minute</key><integer>27</integer></dict><dict><key>Minute</key><integer>32</integer></dict><dict><key>Minute</key><integer>37</integer></dict><dict><key>Minute</key><integer>42</integer></dict><dict><key>Minute</key><integer>47</integer></dict><dict><key>Minute</key><integer>52</integer></dict><dict><key>Minute</key><integer>57</integer></dict>
+  </array>
+  <key>StandardOutPath</key><string>/Users/dorkyrobot2/Library/Logs/mesh-watch.log</string>
+  <key>StandardErrorPath</key><string>/Users/dorkyrobot2/Library/Logs/mesh-watch.log</string>
+</dict></plist>
