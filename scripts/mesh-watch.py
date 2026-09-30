@@ -78,6 +78,16 @@ os.environ["PATH"] = os.environ.get("PATH", "") + ":" + PATH  # launchd gives /u
 # Cloudflare's own error pages: the edge answered, the origin did not.
 CF_ERROR = re.compile(r"cf-error-details|Error 10(16|33)|cloudflare-nginx|<title>[^<]*\| Cloudflare</title>", re.I)
 
+# A page that answers 200 but is an error or a placeholder: a proxy with no
+# app behind it, a web server's default page, an app's crash screen. Judged
+# on the <title>, and on the whole text only when the page is tiny, because a
+# real page can mention "not found" anywhere in its scripts.
+BROKEN = (r"^\s*(\d{3}\b|bad gateway|internal server error|service unavailable|gateway time-?out|"
+          r"application error|welcome to nginx|it works!?|index of /|test page|page not found|"
+          r"not found|no healthy upstream|upstream connect error|cannot (get|post) /|error\b)")
+BROKEN_TITLE = re.compile(r"<title>" + BROKEN, re.I)
+BROKEN_TINY = re.compile(BROKEN, re.I)
+
 
 def now():
     return dt.datetime.now(dt.timezone.utc)
@@ -242,6 +252,9 @@ def check_http(t):
         return False, code, "empty page" + at
     if CF_ERROR.search(body):
         return False, code, "Cloudflare error page" + at
+    m = BROKEN_TITLE.search(body) or (len(body) < 1000 and BROKEN_TINY.search(re.sub(r"<[^>]*>", " ", body)))
+    if m:
+        return False, code, "error page (%r)%s" % (m.group(0).replace("<title>", "").strip()[:60], at)
     if t.get("expect") and t["expect"] not in body:
         return False, code, "page lacks %r%s" % (t["expect"], at)
     return True, code, at.strip()

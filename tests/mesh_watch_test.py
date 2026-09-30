@@ -225,5 +225,13 @@ class MeshWatch(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(st, "checks-2001-01.jsonl")))
         self.assertTrue(os.path.exists(os.path.join(st, "incidents.jsonl")))
 
+    def test_a_200_that_is_an_error_page_is_caught_without_an_expect(self):
+        with open(self.env["MESH_WATCH_CONF"], "w") as f:
+            f.write("extra %s/flaky\n" % self.base)
+        for body in (b"<html><title>502 Bad Gateway</title></html>", b"no healthy upstream",
+                     b"<title>Welcome to nginx!</title>"):
+            Site.body["/flaky"] = body
+            self.assertIn("error page", self.watch())
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
