@@ -1,0 +1,7 @@
+{"isSidechain": false, "sessionId": "s", "cwd": "/Users/x/Projects", "type": "user", "timestamp": "2026-09-30T17:00:00.000Z", "message": {"role": "user", "content": "start the rewrite"}}
+{"isSidechain": false, "sessionId": "s", "cwd": "/Users/x/Projects", "type": "assistant", "timestamp": "2026-09-30T17:09:28.108Z", "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": ""}, {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "git -C site worktree add ../site-rewrite -b rewrite"}}]}}
+{"isSidechain": false, "sessionId": "s", "cwd": "/Users/x/Projects", "type": "user", "timestamp": "2026-09-30T17:09:29.856Z", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "Preparing worktree (new branch 'rewrite')"}]}}
+{"isSidechain": false, "sessionId": "s", "cwd": "/Users/x/Projects", "type": "attachment", "timestamp": "2026-09-30T17:09:29.862Z", "attachment": {"type": "total_tokens_reminder"}}
+{"type": "queue-operation", "operation": "enqueue", "timestamp": "2026-09-30T17:20:51.321Z", "sessionId": "s", "content": "are you there?"}
+{"type": "queue-operation", "operation": "enqueue", "timestamp": "2026-09-30T17:34:14.087Z", "sessionId": "s", "content": "status?"}
+{"type": "permission-mode", "sessionId": "s"}

@@ -173,6 +173,71 @@ def retired(short_id, since_ms):
     return False
 
 
+# Lines a session appends without taking a turn: a message queued to it,
+# a reminder, bookkeeping. None of them means it moved on.
+IDLE_LINES = ("queue-operation", "attachment", "bridge-session", "cost-state", "last-prompt",
+              "summary", "system")
+
+
+def trust_stall(path, min_age):
+    """Is this session stuck on the invisible trust prompt a new worktree
+    raises? (2026-09-30, e961533d.) Its transcript ends at the tool_result
+    of the step that moved it into a worktree (EnterWorktree, or a Bash
+    command about a worktree) and has grown nothing but queued messages and
+    bookkeeping for `min_age` seconds. A long tool call does not match: it
+    ends at the tool_use, since the result is not back yet. Returns
+    {since, tool, what, queued} or None."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 512 * 1024))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    rows = []
+    for l in lines:
+        try:
+            rows.append(json.loads(l))
+        except ValueError:
+            continue
+    queued, last = 0, None
+    for i in range(len(rows) - 1, -1, -1):
+        r = rows[i]
+        if r.get("type") in ("user", "assistant") and r.get("message"):
+            last = i
+            break
+        if r.get("type") == "queue-operation" and r.get("operation") == "enqueue":
+            queued += 1
+    if last is None or rows[last]["type"] != "user":
+        return None
+    content = rows[last]["message"].get("content")
+    ids = [b.get("tool_use_id") for b in content if isinstance(b, dict) and b.get("type") == "tool_result"] \
+        if isinstance(content, list) else []
+    if not ids:
+        return None
+    use = None
+    for r in reversed(rows[:last]):
+        c = (r.get("message") or {}).get("content") if r.get("type") == "assistant" else None
+        for b in c if isinstance(c, list) else []:
+            if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id") in ids:
+                use = b
+        if use:
+            break
+    if not use:
+        return None
+    inp = use.get("input") or {}
+    what = inp.get("command") or inp.get("name") or inp.get("path") or ""
+    if not (use.get("name") == "EnterWorktree" or (use.get("name") == "Bash" and "worktree" in what)):
+        return None
+    try:
+        since = dt.datetime.strptime(rows[last]["timestamp"][:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=dt.timezone.utc)
+    except (KeyError, ValueError):
+        return None
+    if (now() - since).total_seconds() < min_age:
+        return None
+    return {"since": stamp(since), "tool": use.get("name"), "what": str(what)[:160], "queued": queued}
+
+
 def memory_tight():
     """Is the machine short of memory? The kernel's own pressure level:
     1 normal, 2 warning, 4 critical."""

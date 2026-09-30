@@ -1,0 +1,4 @@
+{"isSidechain": false, "sessionId": "s", "cwd": "/Users/x/Projects", "type": "user", "timestamp": "2026-09-30T17:00:00.000Z", "message": {"role": "user", "content": "start the rewrite"}}
+{"isSidechain": false, "sessionId": "s", "cwd": "/Users/x/Projects", "type": "assistant", "timestamp": "2026-09-30T17:09:28.108Z", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_2", "name": "Bash", "input": {"command": "git worktree add ../w && cargo test --release"}}]}}
+{"isSidechain": false, "sessionId": "s", "cwd": "/Users/x/Projects", "type": "attachment", "timestamp": "2026-09-30T17:09:29.862Z", "attachment": {"type": "total_tokens_reminder"}}
+{"type": "queue-operation", "operation": "enqueue", "timestamp": "2026-09-30T17:20:51.321Z", "sessionId": "s", "content": "are you there?"}
