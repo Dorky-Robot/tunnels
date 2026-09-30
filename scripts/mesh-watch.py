@@ -69,6 +69,8 @@ RETRY_GAP = float(os.environ.get("MESH_WATCH_RETRY_GAP", "15"))
 # Both jobs run every 5 minutes, so 11 minutes is two missed runs.
 STALE_MIN = int(os.environ.get("MESH_WATCH_STALE_MIN", "11"))
 KEEP_MONTHS = int(os.environ.get("MESH_WATCH_KEEP_MONTHS", "6"))
+# How often to ask Cloudflare what it really serves; 0 turns it off.
+DRIFT_MIN = int(os.environ.get("MESH_WATCH_DRIFT_MIN", "60"))
 # Somewhere that is up whenever the internet is. If it does not answer, the
 # problem is this box's uplink and the run judges nothing.
 CANARY = os.environ.get("MESH_WATCH_CANARY", "https://www.cloudflare.com/cdn-cgi/trace")
@@ -179,6 +181,76 @@ def read_fleet():
     return data, None
 
 
+def cf_get(path):
+    rc, out, err = run(["tunnels", "cf", "get", "--json", path], 30)
+    if rc != 0:
+        raise ValueError("tunnels cf get %s: %s" % (path.split("?")[0], last_line(err or out, str(rc))))
+    r = json.loads(out).get("response") or {}
+    if not r.get("success", True):
+        raise ValueError("Cloudflare refused %s: %s" % (path.split("?")[0], r.get("errors")))
+    return r["result"]
+
+
+def live_routes(fleet):
+    """Every hostname Cloudflare sends to a tunnel, by ingress rule or by
+    tunnel CNAME, whether or not the fleet file knows it: {host: tunnel}."""
+    src = os.environ.get("MESH_WATCH_LIVE")
+    if src:
+        return json.load(open(src))
+    accounts = {a: v["id"] for a, v in fleet.get("accounts", {}).items()}
+    alias = {v["id"]: k for k, v in fleet.get("tunnels", {}).items()}
+    live = {}
+    for a, aid in accounts.items():
+        for t in cf_get("/accounts/%s/cfd_tunnel?is_deleted=false&per_page=100" % aid):
+            conf = cf_get("/accounts/%s/cfd_tunnel/%s/configurations" % (aid, t["id"])) or {}
+            for r in (conf.get("config") or {}).get("ingress") or []:
+                if r.get("hostname"):
+                    live[r["hostname"]] = alias.get(t["id"], "unlisted tunnel " + t.get("name", t["id"][:8]))
+    for a, v in fleet.get("accounts", {}).items():
+        for z in v.get("zones", []):
+            for r in cf_get("/zones/{zone:%s}/dns_records?type=CNAME&per_page=500" % z):
+                if r.get("content", "").endswith(".cfargotunnel.com"):
+                    tid = r["content"].split(".")[0]
+                    live.setdefault(r["name"], alias.get(tid, "unlisted tunnel " + tid[:8]))
+    return live
+
+
+def drift(fleet, t):
+    """What Cloudflare serves that the fleet does not say, and the reverse.
+    Asked every DRIFT_MIN minutes; a difference counts only when two fetches
+    in a row see it, so a `route add` caught halfway is not drift. Returns
+    ({host: tunnel} live but not in the fleet, finding or None, error or None)."""
+    if DRIFT_MIN <= 0:
+        return {}, None, None
+    try:
+        cache = json.load(open(os.path.join(STATE, "drift.json")))
+    except (OSError, ValueError):
+        cache = {}
+    err = None
+    if not cache.get("fetched") or (t - parse(cache["fetched"])).total_seconds() >= DRIFT_MIN * 60 - 30:
+        try:
+            live = live_routes(fleet)
+            cache = {"fetched": stamp(t), "live": live, "prev": cache.get("live")}
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            # Unknown is not missing: a failed fetch reports nothing.
+            err = str(e)[:200]
+            cache["error"] = err
+        save_json(cache, "drift.json")
+    fleet_hosts = {r["host"] for r in fleet.get("routes", [])}
+    live, prev = cache.get("live") or {}, cache.get("prev")
+    unlisted = {h: v for h, v in live.items() if h not in fleet_hosts}
+    if prev is None:
+        return unlisted, None, err
+    extra = sorted(h for h in unlisted if h in prev)
+    gone = sorted(h for h in fleet_hosts if h not in live and h not in prev)
+    parts = []
+    if extra:
+        parts.append("live but not in the fleet file: " + ", ".join("%s (%s)" % (h, live[h]) for h in extra))
+    if gone:
+        parts.append("in the fleet file but not in Cloudflare: " + ", ".join(gone))
+    return unlisted, "; ".join(parts) or None, err
+
+
 def read_machines():
     ms = []
     if not os.path.exists(MACHINES):
@@ -191,10 +263,18 @@ def read_machines():
     return ms
 
 
-def targets(conf, fleet, machines=True):
+def targets(conf, fleet, machines=True, unlisted=None):
     """Every check, and every skip with its reason."""
     out, skipped = [], []
     tunnels = fleet.get("tunnels", {})
+    # Hosts Cloudflare serves that the fleet does not know are checked too:
+    # the list comes from what is live, not only from what was written down.
+    for h, tun in sorted((unlisted or {}).items()):
+        if h in conf["skip"] or h.startswith("ssh-"):
+            continue
+        m = tunnels.get(tun, {}).get("machine", "?")
+        out.append({"id": "http:" + h, "kind": "http", "url": "https://%s/" % h, "label": h, "machine": m,
+                    "where": "live on %s but not in the fleet file" % tun, "expect": conf["expect"].get(h)})
     for r in fleet.get("routes", []):
         h = r["host"]
         if h in conf["skip"]:
@@ -237,15 +317,41 @@ def targets(conf, fleet, machines=True):
 
 # ---- one check -------------------------------------------------------------
 
-def check_http(t):
-    rc, out, err = run(["curl", "-sS", "-L", "--max-redirs", "8", "-m", "20", "-A", "mesh-watch/1",
-                        "-w", "\n%{http_code} %{url_effective}", t["url"]], 25)
+# Sign-in lives at id.<domain> (Pocket ID), which answers 429 to one address
+# polling it every few seconds. Following every app's sign-in redirect would
+# hit it several times a run at once, so a redirect there ends the check: the
+# app answered, and the id host has a check of its own.
+IDP = re.compile(r"^https?://id(-dev)?\.[^/]+/", re.I)
+
+
+def fetch(url):
+    """(rc, code, location, body, err) for one request, redirects not followed."""
+    rc, out, err = run(["curl", "-sS", "-m", "20", "-A", "mesh-watch/1",
+                        "-w", "\n%{http_code} %{redirect_url}", url], 25)
     if rc != 0:
-        return False, None, last_line(err, "curl %d" % rc)
+        return rc, None, "", "", last_line(err, "curl %d" % rc)
     body, _, tail = out.rpartition("\n")
-    code, _, final = tail.partition(" ")
-    code = int(code or 0)
-    at = "" if final == t["url"] else " at " + final
+    code, _, loc = tail.partition(" ")
+    return 0, int(code or 0), loc.strip(), body, ""
+
+
+def check_http(t):
+    url = t["url"]
+    for _ in range(8):
+        rc, code, loc, body, err = fetch(url)
+        if rc != 0:
+            return False, None, err
+        if 300 <= code < 400 and loc:
+            if IDP.match(loc) and not IDP.match(t["url"]):
+                return True, code, "sign-in redirect to " + loc.split("?")[0]
+            url = loc
+            continue
+        break
+    else:
+        return False, code, "more than 8 redirects"
+    at = "" if url == t["url"] else " at " + url.split("?")[0]
+    if code == 429:
+        return True, code, "rate-limited (429), so it is up" + at
     if not 200 <= code < 300:
         return False, code, "HTTP %d%s" % (code, at)
     if not body.strip():
@@ -402,7 +508,7 @@ def judge(state, ts, results, t, fail_runs=FAIL_RUNS, ok_runs=OK_RUNS):
             x = by_id.get(tid, {})
             state["open"][tid] = {"since": s["since"], "detail": r["detail"], "oks": 0,
                                   "label": x.get("label", tid), "where": x.get("where", ""),
-                                  "machine": x.get("machine")}
+                                  "machine": x.get("machine"), "priority": x.get("priority", "high")}
             del state["streak"][tid]
             rows.append({"ts": stamp(t), "event": "opened", "id": tid, "since": s["since"], "detail": r["detail"]})
             opened.append(tid)
@@ -435,6 +541,13 @@ def ways_in(m):
 def compose(state, ts, opened, recovered, t, box):
     """One message for everything that opened, one for everything that closed."""
     msgs = []
+    low = [i for i in opened if state["open"][i].get("priority") == "low"]
+    opened = [i for i in opened if i not in low]
+    for tid in low:
+        inc = state["open"][tid]
+        msgs.append({"title": "note: " + inc["label"], "body": "%s.\nNothing is down because of it; %s.\n— mesh-watch on %s"
+                     % (inc["detail"][0].upper() + inc["detail"][1:], inc["where"], box),
+                     "tags": "memo", "priority": "low"})
     per_machine = {}
     for x in ts:
         per_machine.setdefault(x.get("machine"), []).append(x["id"])
@@ -470,6 +583,11 @@ def compose(state, ts, opened, recovered, t, box):
             title = "down: " + ", ".join(state["open"][i]["label"] for i in opened)
         msgs.append({"title": title[:120], "body": "\n".join(lines) + "\n— mesh-watch on " + box,
                      "tags": "rotating_light", "priority": "high"})
+    quiet = [r for r in recovered if r[1].get("priority") == "low"]
+    recovered = [r for r in recovered if r not in quiet]
+    for tid, inc in quiet:
+        msgs.append({"title": "cleared: " + inc["label"], "body": "Open %s.\n— mesh-watch on %s" % (ago(inc["since"], t), box),
+                     "tags": "white_check_mark", "priority": "low"})
     if recovered:
         lines = ["%s — back; down %s (%s–%s)" % (inc["label"], ago(inc["since"], t), clock(inc["since"]),
                                                  clock(stamp(t))) for tid, inc in recovered]
@@ -502,11 +620,17 @@ def watch(dry, machines=True):
         return 3
     state.pop("offline_since", None)
     fleet, fleet_note = read_fleet()
-    ts, _ = targets(read_conf(), fleet, machines)
+    unlisted, drift_note, drift_err = drift(fleet, t)
+    ts, _ = targets(read_conf(), fleet, machines, unlisted)
     results = check_all(ts)
     ts.append({"id": "monitor:fleet", "label": "the fleet file on " + box(), "machine": None,
                "where": "`tunnels fleet show --json` on " + box()})
     results["monitor:fleet"] = {"id": "monitor:fleet", "ok": fleet_note is None, "detail": fleet_note or ""}
+    if DRIFT_MIN > 0:
+        ts.append({"id": "monitor:drift", "label": "the fleet file and Cloudflare disagree", "machine": None,
+                   "priority": "low", "where": "`tunnels plan` shows the fix; hosts live in Cloudflare are checked anyway"})
+        results["monitor:drift"] = {"id": "monitor:drift", "ok": drift_note is None,
+                                    "detail": drift_note or drift_err or ""}
     append("checks-%s.jsonl" % t.strftime("%Y-%m"), [dict(r, ts=stamp(t)) for r in results.values()])
     opened, recovered = judge(state, ts, results, t)
     state["pending"].extend(compose(state, ts, opened, recovered, t, box()))
@@ -594,7 +718,10 @@ def listing():
     fleet, note = read_fleet()
     if note:
         print("note   " + note)
-    ts, skipped = targets(read_conf(), fleet)
+    unlisted, note2, err = drift(fleet, now())
+    if note2 or err:
+        print("note   " + (note2 or "drift unknown: " + err))
+    ts, skipped = targets(read_conf(), fleet, unlisted=unlisted)
     for t in ts:
         print("check  %-44s %s%s" % (t["id"], t.get("url") or t.get("alias") or t.get("host"),
                                      "  expect %r" % t["expect"] if t.get("expect") else ""))

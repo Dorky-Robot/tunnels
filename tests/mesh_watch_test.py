@@ -24,6 +24,11 @@ class Site(http.server.BaseHTTPRequestHandler):
     alerts = []
 
     def do_GET(self):
+        if self.path == "/app":                  # an app sending you to sign in
+            self.send_response(302)
+            self.send_header("Location", "http://id.example.invalid/authorize?x=1")
+            self.end_headers()
+            return
         code = self.status.get(self.path, 200)
         self.send_response(code)
         self.end_headers()
@@ -68,7 +73,7 @@ class MeshWatch(unittest.TestCase):
                         MESH_WATCH_ENV=os.path.join(self.dir, "none"), MESH_WATCH_CONF=conf,
                         MESH_WATCH_FLEET=fleet, MESH_WATCH_MACHINES=os.path.join(self.dir, "none"),
                         MESH_WATCH_CANARY=self.base + "/up", MESH_WATCH_RETRY_GAP="0",
-                        MESH_WATCH_NTFY=self.base + "/topic")
+                        MESH_WATCH_NTFY=self.base + "/topic", MESH_WATCH_DRIFT_MIN="0")
 
     def watch(self, *args):
         p = subprocess.run([SCRIPT, "--no-machines", *args], env=self.env, capture_output=True, text=True)
@@ -232,6 +237,34 @@ class MeshWatch(unittest.TestCase):
                      b"<title>Welcome to nginx!</title>"):
             Site.body["/flaky"] = body
             self.assertIn("error page", self.watch())
+
+    def test_a_sign_in_redirect_is_not_followed_to_the_id_host(self):
+        with open(self.env["MESH_WATCH_CONF"], "w") as f:
+            f.write("extra %s/app\n" % self.base)
+        self.assertIn("0 failing", self.watch())   # id.example.invalid is never asked
+
+    def test_429_means_up(self):
+        Site.status["/flaky"] = 429
+        self.watch(); self.watch()
+        self.assertEqual(Site.alerts, [])
+
+    def test_a_live_host_missing_from_the_fleet_is_checked_and_noted_quietly(self):
+        live = os.path.join(self.dir, "live.json")
+        json.dump({"ssh-x.example": "t", self.base.split("//")[1]: "t"}, open(live, "w"))
+        self.env.update(MESH_WATCH_DRIFT_MIN="60", MESH_WATCH_LIVE=live)
+        drift = os.path.join(self.dir, "state/drift.json")
+        out = self.watch()
+        host = self.base.split("//")[1]
+        self.assertIn("http:" + host, out)        # the unlisted host is checked at once (https, so it fails here)
+        with open(self.env["MESH_WATCH_CONF"], "a") as f:
+            f.write("skip %s test server has no https\n" % host)
+        for _ in range(3):                        # two more fetches: now it is drift
+            d = json.load(open(drift)); d["fetched"] = "2000-01-01T00:00:00Z"; json.dump(d, open(drift, "w"))
+            self.watch()
+        notes = [a for a in Site.alerts if a["title"].startswith("note:")]
+        self.assertEqual(len(Site.alerts), 1, Site.alerts)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("not in the fleet file", notes[0]["body"])
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
