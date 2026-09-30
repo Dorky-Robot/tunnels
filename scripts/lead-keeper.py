@@ -22,7 +22,7 @@ duplicate is never revived.
 A name needs reviving when, two passes in a row:
   - no entry has a live process (a respawn leaves entries without a pid for
     a moment, and a listed pid can be stale), or
-  - it is alive and not busy, but its saved flags have lost
+  - it is alive and idle, but its saved flags have lost
     --remote-control, as the 2026-09-29 respawn did to three leads.
 Never while a process it was last seen with is still alive: that is how
 you get two copies.
@@ -295,10 +295,12 @@ def main():
             if live:
                 j = job(e["id"]) if e.get("kind") == "background" and e.get("id") else None
                 lost_rc = bool(j) and "--remote-control" not in (j.get("respawnFlags") or [])
-                if not lost_rc or e.get("status") == "busy":
+                # Stop only an idle one: busy is mid-turn, and waiting is a
+                # question (a permission prompt) someone has yet to answer.
+                if not lost_rc or e.get("status") != "idle":
                     if dry:
                         print("%-30s up      %s pid %s (%s)%s" % (name, e.get("id") or e.get("kind"), e["pid"],
-                              e.get("status"), "; RC lost, waits until it is not busy" if lost_rc else ""))
+                              e.get("status"), "; RC lost, repaired once it is idle" if lost_rc else ""))
                     elif set(ss.get("said", [])) & set(DOWN):
                         back(st, ss, name, e)
                     ss.update({"session_id": e.get("sessionId"), "id": e.get("id"), "pid": e["pid"],

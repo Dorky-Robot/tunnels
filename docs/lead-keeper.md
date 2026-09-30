@@ -56,8 +56,9 @@ name is alive, the name is alive, and an older duplicate is never revived.
 **When.** A name is revived when two passes in a row find either:
 
 - no entry with a live process, or
-- a live, not-busy session whose saved flags have lost `--remote-control`,
-  as the 09-29 respawn did.
+- a live, idle session whose saved flags have lost `--remote-control`, as
+  the 09-29 respawn did. A busy session, or one waiting on a permission
+  prompt, is left until it is idle.
 
 It is never revived while the process it was last seen with is still alive.
 It also does nothing while claude-update holds its lock.

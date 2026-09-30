@@ -330,6 +330,10 @@ class LeadKeeper(unittest.TestCase):
         for _ in range(3):
             self.run_()
         self.assertEqual(self.revivals(), [])                # mid-turn: wait
+        self.set_("abab0008", status="waiting")
+        self.run_()
+        self.run_()
+        self.assertEqual(self.revivals(), [])                # a question pending: wait
         self.set_("abab0008", status="idle")
         self.run_()
         out = self.run_()
