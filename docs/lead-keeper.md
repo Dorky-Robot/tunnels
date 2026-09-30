@@ -93,6 +93,19 @@ Leads come first. While the kernel reports memory pressure
 (`kern.memorystatus_vm_pressure_level` of 2 or higher), only leads are
 revived and workers wait.
 
+**Stuck where it stands.** A session that moves into a new worktree
+(EnterWorktree, or a Bash command that adds a worktree) can hang on a trust
+prompt nobody can see. Its pid stays alive and it shows busy or waiting, but
+its transcript ends at that step's tool_result and grows nothing after it
+except queued messages and bookkeeping (e961533d and 7c528581, 2026-09-30).
+After 15 minutes like that it is stuck. A long tool call never matches,
+because its transcript ends at the tool_use until the result is back.
+Reviving it would start it in the same place and hang the same way, so
+lead-keeper does not revive it: it sends one alert naming the session and
+its lead, saying to restart it from a trusted folder and work with
+`git -C` and absolute paths instead of EnterWorktree or a `cd` into the
+worktree. There is one "back" when the transcript moves again.
+
 **Did it work.** A revival counts once `claude logs <id>` shows a
 claude.ai/code link within 60 s. If the process starts and no link ever
 appears, that is the privacy-prompt hang. The attempt is stopped (a stuck
@@ -114,6 +127,7 @@ Felix gets an ntfy alert, plus one kapwa item on `#mesh` signed
 - a revival hung without Remote Control (once, with the path to grant),
 - a lead cannot be revived (untrusted cwd, missing cwd), a lead was
   removed, or a lead's process is alive but unlisted for three passes,
+- a session (lead or worker) is stuck on a worktree trust prompt,
 - a lead died twice in 24 hours, not counting idle retires (at most once a
   day), or
 - `claude agents` has been unreadable for 30 minutes.
