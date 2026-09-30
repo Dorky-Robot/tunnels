@@ -34,7 +34,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from claude_bg import (CLAUDE, HOME, agents, box, flush, grant_path, job, kept, load_env, load_json,  # noqa: E402
-                       rc_link, run, save_json, stamp, BG_ID, plain)
+                       rc_link, run, save_json, stamp, transcript, BG_ID, plain)
 
 STATE = os.environ.get("CLAUDE_UPDATE_STATE", os.path.join(HOME, ".local/state/claude-update"))
 LOCK = os.environ.get("CLAUDE_UPDATE_LOCK", os.path.join(STATE, "running"))
@@ -75,14 +75,27 @@ def same_file(a, b):
         return False
 
 
-def probe(real, dry):
+def probe(real, dry, st=None):
     """Start a throwaway session on the new binary and see it reach Remote
-    Control. (ok, why). Always cleans up after itself."""
+    Control. (ok, why). Always stops and removes it afterwards.
+
+    Every Remote Control session is a record in Felix's claude.ai sidebar,
+    and no CLI command archives one; `claude rm` removes only the local
+    job. So the probe is one conversation, resumed each time: a resumed
+    session reattaches to its claude.ai record instead of adding one
+    (2026-09-30: session_01XYsUNP… came back as itself). The first probe
+    makes it; its session id is kept in state["probe_session"]."""
+    sid = (st or {}).get("probe_session")
+    if sid and not os.path.exists(transcript(PROBE_CWD, sid)):
+        sid = None
+    argv = [CLAUDE, "--bg"] + (["--resume", sid] if sid else []) + ["--remote-control", "-n", PROBE_NAME]
     if dry:
-        print("would probe: from %s, %s --bg --remote-control -n %r (no prompt, no model turn);\n"
-              "  it must show a claude.ai/code link within %ds and run %s" % (PROBE_CWD, CLAUDE, PROBE_NAME, PROBE_WAIT, real))
+        print("would probe: from %s, %s (no prompt, no model turn%s);\n"
+              "  it must show a claude.ai/code link within %ds and run %s"
+              % (PROBE_CWD, " ".join(a if " " not in a else repr(a) for a in argv),
+                 ", the same claude.ai record as last time" if sid else "", PROBE_WAIT, real))
         return True, ""
-    rc, out, err = run([CLAUDE, "--bg", "--remote-control", "-n", PROBE_NAME], 120, cwd=PROBE_CWD)
+    rc, out, err = run(argv, 120, cwd=PROBE_CWD)
     m = BG_ID.search(plain(out + err))
     if rc != 0 or not m:
         return False, "the probe did not start: %s" % plain(out + err).strip()[-200:]
@@ -90,6 +103,8 @@ def probe(real, dry):
     try:
         link = rc_link(pid_, PROBE_WAIT)
         e = [a for a in (agents() or []) if a.get("id") == pid_]
+        if e and st is not None and e[0].get("sessionId"):
+            st["probe_session"] = e[0]["sessionId"]
         img = image(e[0]["pid"]) if e and e[0].get("pid") else None
         if not link:
             return False, ("a new session on it sat for %ds without reaching Remote Control, the way "
@@ -176,7 +191,7 @@ def main():
             else "the version file itself, so every version needs its own grant"))
         print("would run: %s update" % CLAUDE)
         print("if the version changes:")
-        probe(old_real, True)
+        probe(old_real, True, st)
         respawn_all(sessions(), old, True)
         print("then check each is running, on the new version, with its RC link if it had one")
         return 0
@@ -201,7 +216,7 @@ def main():
             return 0
         log("updated %s -> %s (%s)" % (old, new, real))
         g, carries = grant_path(real)
-        ok, why = probe(real, False)
+        ok, why = probe(real, False, st)
         if not ok:
             log("NOT respawning: %s" % why)
             st["pending"].append({"at": stamp(), "title": "%s: grant Full Disk Access to Claude %s" % (box(), new),

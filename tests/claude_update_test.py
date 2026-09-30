@@ -43,10 +43,11 @@ if a[:1] == ["logs"]:
     e = [e for e in w["agents"] if e.get("id") == a[1] and e.get("pid")]
     if not e: print("job not found"); sys.exit(1)
     print("https://claude.ai/code/session_01X" if e[0].get("rc") else "/rc connecting…"); sys.exit(0)
-if a[:2] == ["--bg", "--remote-control"]:
-    w["agents"].append({"id": "b0be0000", "name": a[3], "kind": "background", "pid": 4242,
-                        "rc": w.get("probe_rc", True), "startedAt": 1})
-    save(); print("backgrounded · b0be0000 · " + a[3]); sys.exit(0)
+if a[:2] in (["--bg", "--remote-control"], ["--bg", "--resume"]):
+    sid = a[2] if a[1] == "--resume" else "b0be0000-new"
+    w["agents"].append({"id": "b0be0000", "name": a[-1], "kind": "background", "pid": 4242,
+                        "rc": w.get("probe_rc", True), "startedAt": 1, "sessionId": sid})
+    save(); print("backgrounded · b0be0000 · " + a[-1]); sys.exit(0)
 if a[:1] in (["stop"], ["rm"]):
     w["agents"] = [e for e in w["agents"] if not (a[0] == "rm" and e.get("id") == a[1])]
     for e in w["agents"]:
@@ -176,6 +177,24 @@ class ClaudeUpdate(unittest.TestCase):
         self.assertEqual(self.calls(["rm"])[0]["argv"], ["rm", "b0be0000"])  # probe cleaned up
         self.assertFalse(os.path.exists(os.path.join(self.d, "state/running")))
         self.assertEqual(Ntfy.alerts, [])
+
+    def test_the_probe_is_one_claude_ai_record_resumed_each_time(self):
+        self.run_()
+        first = self.calls(["--bg"])[0]["argv"]
+        self.assertNotIn("--resume", first)
+        # the probe's conversation exists, so next time it is resumed, not made anew
+        tdir = os.path.join(self.d, ".claude/projects", os.path.join(self.d, "Projects").replace("/", "-"))
+        os.makedirs(tdir)
+        open(os.path.join(tdir, "b0be0000-new.jsonl"), "w").write("{}\n")
+        self.world(next="2.1.291")
+        p = os.path.join(self.d, "versions", "2.1.291")
+        open(p, "w").write(FAKE_CLAUDE)
+        os.chmod(p, 0o755)
+        self.run_()
+        second = self.calls(["--bg"])[1]["argv"]
+        self.assertEqual(second[:3], ["--bg", "--resume", "b0be0000-new"])
+        self.assertEqual(second[3:], ["--remote-control", "-n", "claude-update probe"])
+        self.assertEqual(len(self.calls(["rm"])), 2)            # gone locally both times
 
     def test_a_probe_that_hangs_stops_everything_and_names_the_path(self):
         self.world(probe_rc=False)
