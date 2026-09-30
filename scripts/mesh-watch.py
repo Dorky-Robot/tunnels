@@ -71,6 +71,13 @@ STALE_MIN = int(os.environ.get("MESH_WATCH_STALE_MIN", "11"))
 KEEP_MONTHS = int(os.environ.get("MESH_WATCH_KEEP_MONTHS", "6"))
 # How often to ask Cloudflare what it really serves; 0 turns it off.
 DRIFT_MIN = int(os.environ.get("MESH_WATCH_DRIFT_MIN", "60"))
+# Keepers on this box that nothing else watches: (state dir name, launchd
+# label, seconds before its last-run is stale). lead-keeper runs every 5
+# minutes, claude-update weekly; each is checked only once its plist is in
+# ~/Library/LaunchAgents.
+AGENTS = os.environ.get("MESH_WATCH_AGENTS", os.path.join(HOME, "Library/LaunchAgents"))
+LOCAL_JOBS = [("lead-keeper", "com.dorkyrobot.lead-keeper", 11 * 60),
+              ("claude-update", "com.dorkyrobot.claude-update", 8 * 86400)]
 # Somewhere that is up whenever the internet is. If it does not answer, the
 # problem is this box's uplink and the run judges nothing.
 CANARY = os.environ.get("MESH_WATCH_CANARY", "https://www.cloudflare.com/cdn-cgi/trace")
@@ -307,6 +314,12 @@ def targets(conf, fleet, machines=True, unlisted=None):
             if m["tunnel"] != "-":
                 out.append({"id": "ssh-cf:" + n, "kind": "ssh", "alias": "cloudflare-" + n, "machine": n,
                             "label": "%s: ssh through Cloudflare" % n, "where": m["tunnel"]})
+    for name, label, stale in LOCAL_JOBS:
+        # Watched once installed: a keeper that stops running says nothing
+        # by itself, and nobody would think to look at its log.
+        if os.path.exists(os.path.join(AGENTS, label + ".plist")):
+            out.append({"id": "job:" + name, "kind": "job", "name": name, "stale": stale, "machine": box(),
+                        "label": "%s: %s has run lately" % (box(), name), "where": label})
     peer = os.environ.get("MESH_WATCH_PEER")
     if peer and machines:
         out.append({"id": "heartbeat:" + peer, "kind": "peer", "alias": peer, "machine": peer,
@@ -395,7 +408,19 @@ def check_peer(t):
     return True, None, ""
 
 
-KINDS = {"http": check_http, "tailnet": check_tailnet, "ssh": check_ssh, "peer": check_peer}
+def check_job(t):
+    """Has a job on this box written its last-run lately?"""
+    try:
+        last = open(os.path.join(HOME, ".local/state", t["name"], "last-run")).read().split()[0]
+        age = (now() - parse(last)).total_seconds()
+    except (OSError, ValueError, IndexError):
+        return False, None, "installed, but has never written ~/.local/state/%s/last-run" % t["name"]
+    if age > t["stale"]:
+        return False, None, "last ran %s ago" % ago(last, now())
+    return True, None, ""
+
+
+KINDS = {"http": check_http, "tailnet": check_tailnet, "ssh": check_ssh, "peer": check_peer, "job": check_job}
 
 
 def check(t):

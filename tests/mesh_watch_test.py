@@ -73,7 +73,8 @@ class MeshWatch(unittest.TestCase):
                         MESH_WATCH_ENV=os.path.join(self.dir, "none"), MESH_WATCH_CONF=conf,
                         MESH_WATCH_FLEET=fleet, MESH_WATCH_MACHINES=os.path.join(self.dir, "none"),
                         MESH_WATCH_CANARY=self.base + "/up", MESH_WATCH_RETRY_GAP="0",
-                        MESH_WATCH_NTFY=self.base + "/topic", MESH_WATCH_DRIFT_MIN="0")
+                        MESH_WATCH_NTFY=self.base + "/topic", MESH_WATCH_DRIFT_MIN="0",
+                        MESH_WATCH_AGENTS=os.path.join(self.dir, "LaunchAgents"), HOME=self.dir)
 
     def watch(self, *args):
         p = subprocess.run([SCRIPT, "--no-machines", *args], env=self.env, capture_output=True, text=True)
@@ -83,6 +84,26 @@ class MeshWatch(unittest.TestCase):
     def incidents(self):
         p = os.path.join(self.dir, "state/incidents.jsonl")
         return [json.loads(l)["event"] for l in open(p)] if os.path.exists(p) else []
+
+    def test_an_installed_keeper_that_stops_running_is_an_incident(self):
+        self.watch()                       # not installed: not watched
+        self.assertEqual(Site.alerts, [])
+        os.makedirs(os.path.join(self.dir, "LaunchAgents"))
+        open(os.path.join(self.dir, "LaunchAgents/com.dorkyrobot.lead-keeper.plist"), "w").write("")
+        beat = os.path.join(self.dir, ".local/state/lead-keeper/last-run")
+        os.makedirs(os.path.dirname(beat))
+        open(beat, "w").write("2026-01-01T00:00:00Z\n")
+        self.watch()
+        self.watch()
+        self.assertEqual(len(Site.alerts), 1)
+        self.assertIn("lead-keeper", Site.alerts[0]["body"])
+        self.assertIn("last ran", Site.alerts[0]["body"])
+        import datetime
+        open(beat, "w").write(datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ\n"))
+        self.watch()
+        self.watch()
+        self.assertEqual(len(Site.alerts), 2)
+        self.assertIn("back", Site.alerts[1]["title"])
 
     def test_one_alert_per_incident_and_one_on_recovery(self):
         self.watch()
