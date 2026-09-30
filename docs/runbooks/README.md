@@ -1,0 +1,70 @@
+# Runbooks
+
+Short, runnable steps for the mesh jobs that come up at the worst times. Each
+one says when to use it, what to check before you start, one step at a time
+with the check that proves it worked, and when to stop and get a person. The
+plan behind them is [`../agent-operations.md`](../agent-operations.md),
+"Layer 3".
+
+| Runbook | Use it when |
+|---|---|
+| [after-a-power-cut.md](after-a-power-cut.md) | a box (or the house) lost power or rebooted, and you need it back and proven |
+| [rotate-a-leaked-token.md](rotate-a-leaked-token.md) | a tunnel's connector token was seen somewhere it shouldn't be |
+| [add-a-machine.md](add-a-machine.md) | a new Mac joins the mesh |
+| [retire-a-hostname.md](retire-a-hostname.md) | a public hostname should stop existing |
+| [revive-a-claude-session.md](revive-a-claude-session.md) | a Claude lead or worker is gone, or stuck on "connecting…" |
+
+## Three rules that apply to every one of them
+
+1. **Never cut the path you're on.** Before anything that restarts
+   cloudflared, Tailscale, sshd or networking, know how you are connected:
+
+   ```sh
+   ssh -G <box> | grep -i '^proxycommand'   # prints nothing: tailnet, safe
+                                            # prints cloudflared: you ride the tunnel
+   ```
+
+   Go in by `ssh <box>` (tailnet) or `ssh <box>-lan`, never by
+   `ssh cloudflare-<box>`, when the tunnel is what you are touching. Restart a
+   loaded job with `launchctl kickstart -k`, never `bootout` then `bootstrap`.
+   The story is in [`../remote-access.md`](../remote-access.md).
+2. **Over ssh, PATH has no Homebrew.** Start remote commands with
+   `export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH`. "command not found"
+   over ssh is PATH, not a missing install.
+3. **Unknown is not missing.** A check that could not run (box unreachable,
+   token can't read the account) is "unknown". Don't remove, restart or
+   rotate anything on the strength of it.
+
+## Two checks the runbooks reuse
+
+**What the agent on a box thinks of its tunnel tokens**, with no secret shown
+(loopback has full rights on the agent):
+
+```sh
+curl -s http://127.0.0.1:7630/api/tokens | python3 -c 'import json,sys
+for c in json.load(sys.stdin)["connectors"]:
+    print(c["name"], c.get("alias"), c["state"], "token_file=%s" % c["token_file"], "current=%s" % c["current"])'
+```
+
+`current=True` means the token on this box is the one Cloudflare issues now;
+`False` means it is dead (rotated away); `None` means unknown (no API token
+here reaches that account).
+
+**Does every public hostname answer**, from any box:
+
+```sh
+tunnels route list --json | python3 -c 'import json,sys
+for r in json.load(sys.stdin)["routes"]: print(r["host"])' | while read h; do
+  printf '%-45s %s\n' "$h" "$(curl -s -o /dev/null -m 10 -w '%{http_code}' "https://$h/")"
+done
+```
+
+`ssh-*` hosts answer 200 to a browser request too; a 530 or 502 is a tunnel
+or its origin down; 000 is no answer at all. `scripts/mesh-watch.py` does
+this properly (expected text, retries); the loop is the 3am version.
+
+## When a runbook is wrong
+
+Fix it in the same sitting: change the step, and add a line to its
+**History** saying what happened and what changed. That is how these get
+better.
