@@ -110,7 +110,7 @@ the fleet already dropped it and the Cloudflare side was left behind.
 ## Undo
 
 ```sh
-tunnels route add <host> <port> --tunnel <alias>      # the tunnel and port you wrote down
+tunnels route add <host> <service> --tunnel <alias>   # the service and tunnel you wrote down
 ```
 
 It puts back ingress and DNS and adds the route to the fleet. A record you
