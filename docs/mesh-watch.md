@@ -103,6 +103,21 @@ nothing leaves the box. ntfy.sh is outside the mesh, so an alert about the
 mesh does not depend on the mesh; Felix gets it on his phone through the ntfy
 app, subscribed to that topic.
 
+## Bridges
+
+A bridge is a service outside the mesh that the mesh depends on. Each is
+named, with what it carries and why it is outside.
+
+| bridge | carries | why it is outside the mesh |
+|---|---|---|
+| **ntfy.sh** | alert text only: which checks failed, since when, the ways in. No page content, no tokens | an alert about the mesh must arrive when the mesh is down |
+| **Healthchecks.io** (planned) | a ping with no body, from the monitor and the heartbeat | the dead man's switch: it notices silence, which nothing inside a dead mesh can |
+| **Cloudflare** | every public hostname, and the `cloudflare-<name>` ssh path | the checks are what a visitor sees, and visitors come through it |
+| **Tailscale** | the ssh and `tailscale ping` checks | it is how the boxes reach each other, and it keeps working when Cloudflare doesn't |
+
+If a bridge is down, the monitor says so rather than blaming the mesh: no
+`www.cloudflare.com` means it judges nothing that run (see Incidents).
+
 ## Install (sudo, on each box)
 
 Not done until the box choice and the channel are approved.

@@ -35,6 +35,20 @@ plan behind them is [`../agent-operations.md`](../agent-operations.md),
    token can't read the account) is "unknown". Don't remove, restart or
    rotate anything on the strength of it.
 
+## Bridges
+
+A bridge is a service outside the mesh the mesh depends on. These runbooks
+cross three; when a step fails, ask first whether the bridge is down:
+
+| bridge | the runbooks use it for | if it is down |
+|---|---|---|
+| **Cloudflare** | public hostnames, tunnels, DNS, `tunnels cf`, the `cloudflare-<box>` ssh path | sites are down everywhere at once; ssh by the tailnet or LAN still works; don't rotate or retire anything |
+| **Tailscale** | `ssh <box>`, the agents' fleet sync, Taildrop | use `<box>-lan` or `cloudflare-<box>`; a box that drops off alone is more likely its key or its daemon |
+| **GitHub** | this repo, `mesh/rollout`'s key step, releases of `tunnels` | nothing running stops; landing and rollout wait |
+
+The alert bridges (ntfy.sh, and the planned Healthchecks.io) are in
+[`../mesh-watch.md`](../mesh-watch.md#bridges).
+
 ## Two checks the runbooks reuse
 
 **What the agent on a box thinks of its tunnel tokens**, with no secret shown
