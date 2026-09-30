@@ -121,6 +121,68 @@ def rc_link(short_id, wait, gap=2.0):
         time.sleep(gap)
 
 
+BUNDLE = os.environ.get("CLAUDE_BUNDLE", os.path.join(HOME, ".local/share/claude/ClaudeCode.app"))
+JOBS = os.environ.get("CLAUDE_JOBS", os.path.join(HOME, ".claude/jobs"))
+DAEMON_LOG = os.environ.get("CLAUDE_DAEMON_LOG", os.path.join(HOME, ".claude/daemon.log"))
+
+
+def job(id_):
+    """The supervisor's saved state for a background session: its
+    respawnFlags say whether it comes back with --remote-control."""
+    try:
+        return json.load(open(os.path.join(JOBS, id_, "state.json")))
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def grant_path(real):
+    """What Full Disk Access has to be granted to for this binary. On
+    dorkyrobot2 the installer keeps an app bundle whose executable is a
+    hard link to the current version, and the grant belongs to the bundle
+    (bundle id plus signature), so it carries across versions. Without that
+    link (the mini) the process runs the version file itself, a path macOS
+    has never seen. (path, whether it is the bundle)."""
+    exe = os.path.join(BUNDLE, "Contents/MacOS/claude")
+    try:
+        if os.stat(exe).st_ino == os.stat(real).st_ino:
+            return BUNDLE, True
+    except OSError:
+        pass
+    return real, False
+
+
+def retired(short_id, since_ms):
+    """Did the supervisor retire this session for sitting idle, after it
+    started? ("[bg] bg retire <id>: idle-prompt, idle 8h"). Nothing was
+    in flight then, so it can come back without a word."""
+    try:
+        with open(DAEMON_LOG, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 512 * 1024))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError:
+        return False
+    for m in re.finditer(r"^\[([0-9T:.\-]+)Z\] \[bg\] bg retire %s: (idle-prompt|settled)" % re.escape(short_id),
+                         tail, re.M):
+        try:
+            t = dt.datetime.strptime(m.group(1)[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=dt.timezone.utc)
+        except ValueError:
+            continue
+        if t.timestamp() * 1000 >= (since_ms or 0):
+            return True
+    return False
+
+
+def memory_tight():
+    """Is the machine short of memory? The kernel's own pressure level:
+    1 normal, 2 warning, 4 critical."""
+    rc, out, _ = run(["/usr/sbin/sysctl", "-n", "kern.memorystatus_vm_pressure_level"], 10)
+    try:
+        return int(out.strip()) >= int(os.environ.get("LEAD_KEEPER_PRESSURE_LEVEL", "2"))
+    except ValueError:
+        return False
+
+
 def trusted(cwd):
     """Has the trust dialog been accepted for cwd or a folder above it? An
     untrusted cwd makes a background session refuse to start."""

@@ -33,13 +33,11 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from claude_bg import (CLAUDE, HOME, agents, box, flush, load_env, load_json, rc_link,  # noqa: E402
-                       run, save_json, stamp, BG_ID, plain)
+from claude_bg import (CLAUDE, HOME, agents, box, flush, grant_path, job, load_env, load_json,  # noqa: E402
+                       rc_link, run, save_json, stamp, BG_ID, plain)
 
 STATE = os.environ.get("CLAUDE_UPDATE_STATE", os.path.join(HOME, ".local/state/claude-update"))
 LOCK = os.environ.get("CLAUDE_UPDATE_LOCK", os.path.join(STATE, "running"))
-JOBS = os.environ.get("CLAUDE_JOBS", os.path.join(HOME, ".claude/jobs"))
-BUNDLE = os.environ.get("CLAUDE_BUNDLE", os.path.join(HOME, ".local/share/claude/ClaudeCode.app"))
 PROBE_CWD = os.path.expanduser(os.environ.get("CLAUDE_UPDATE_PROBE_CWD", "~/Projects"))
 PROBE_NAME = "claude-update probe"
 PROBE_WAIT = float(os.environ.get("CLAUDE_UPDATE_PROBE_WAIT", "60"))
@@ -58,26 +56,6 @@ def binary():
     real = os.path.realpath(CLAUDE)
     rc, out, _ = run([CLAUDE, "--version"], 60)
     return (out.split()[0] if rc == 0 and out.split() else "?"), real
-
-
-def grant_path(real):
-    """What Full Disk Access has to be granted to for this binary. On
-    dorkyrobot2 the installer keeps an app bundle whose executable is a
-    hard link to the current version, and the grant belongs to the bundle
-    (bundle id plus signature), so it carries across versions. Without that
-    link (the mini) the process runs the version file itself, a path macOS
-    has never seen."""
-    exe = os.path.join(BUNDLE, "Contents/MacOS/claude")
-    try:
-        if os.stat(exe).st_ino == os.stat(real).st_ino:
-            return BUNDLE, True
-    except OSError:
-        pass
-    return real, False
-
-
-def job(id_):
-    return load_json(os.path.join(JOBS, id_, "state.json"), {})
 
 
 def image(pid):
