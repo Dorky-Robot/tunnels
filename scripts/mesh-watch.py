@@ -295,14 +295,19 @@ def targets(conf, fleet, machines=True, unlisted=None):
                 where += "; standby %s" % tunnels.get(r["standby"], {}).get("machine", r["standby"])
             out.append({"id": "http:" + h, "kind": "http", "url": "https://%s/" % h, "label": h,
                         "machine": m, "where": where, "expect": conf["expect"].get(h)})
+    served = {x["url"].split("/")[2]: x for x in out}
     for url, why in conf["extra"]:
         h = re.sub(r"^https?://([^/]+).*", r"\1", url)
         name = re.sub(r"^https?://", "", url).rstrip("/")
         # Named by host and path, so two pages on one host are two checks. An
         # expect keyed by this exact URL wins over the host's: a /health that
         # answers JSON does not carry the page text the host's expect wants.
-        out.append({"id": "http:" + name, "kind": "http", "url": url, "label": name, "machine": None,
-                    "where": why or "outside the fleet", "expect": conf["expect"].get(url, conf["expect"].get(h))})
+        # A page on a tunnelled host belongs to the machine that serves it, so
+        # its alert lands under that machine and not "outside the tunnels".
+        m = served.get(h, {}).get("machine")
+        where = "; ".join(w for w in (why, served.get(h, {}).get("where")) if w) or "outside the fleet"
+        out.append({"id": "http:" + name, "kind": "http", "url": url, "label": name, "machine": m,
+                    "where": where, "expect": conf["expect"].get(url, conf["expect"].get(h))})
     if machines:
         for m in read_machines():
             n = m["name"]

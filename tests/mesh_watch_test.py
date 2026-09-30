@@ -279,6 +279,18 @@ class MeshWatch(unittest.TestCase):
         Site.body["/health"] = b"hello Monica"              # the page itself is not a health answer
         self.assertIn("1 failing", self.watch())
 
+    def test_a_page_on_a_tunnelled_host_is_filed_under_its_machine(self):
+        host = self.base.split("//")[1]
+        fleet = json.load(open(self.fleet))
+        fleet["routes"].append({"host": host, "tunnel": "t", "service": "http://localhost:1"})
+        json.dump(fleet, open(self.fleet, "w"))
+        Site.status["/flaky"] = 502
+        self.watch(); self.watch()
+        body = Site.alerts[0]["body"]
+        self.assertIn("On boxa:", body)             # the route itself fails too (no https here), /up does not
+        self.assertNotIn("Outside the tunnels", body)
+        self.assertIn("the one we break; served by boxa", body)
+
     def test_429_means_up(self):
         Site.status["/flaky"] = 429
         self.watch(); self.watch()
