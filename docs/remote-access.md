@@ -162,7 +162,7 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/com.dorkyrobot.tunnel-wat
 ```
 
 Check it: `sudo launchctl print system/com.dorkyrobot.tunnel-watchdog`
-shows `runs` climbing every five minutes, and `/var/log/tunnel-watchdog.log`
+shows `runs` climbing every minute, and `/var/log/tunnel-watchdog.log`
 says what it did (it is silent when all is well). To make it run now:
 `sudo launchctl kickstart system/com.dorkyrobot.tunnel-watchdog`.
 

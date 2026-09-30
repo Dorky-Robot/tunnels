@@ -10,13 +10,15 @@
   <key>ProgramArguments</key><array>
     <string>/bin/sh</string><string>/usr/local/bin/tunnel-watchdog.sh</string>
   </array>
-  <!-- Every five minutes by the clock, not StartInterval. After the macOS 27
+  <!-- Every minute by the clock, not StartInterval. After the macOS 27
        upgrade (2026-09-23) launchd left every RunAtLoad/StartInterval agent
-       at runs = 0 for fourteen hours, this one included; the only agents
-       that ran were StartCalendarInterval ones. -->
-  <key>StartCalendarInterval</key><array>
-    <dict><key>Minute</key><integer>0</integer></dict><dict><key>Minute</key><integer>5</integer></dict><dict><key>Minute</key><integer>10</integer></dict><dict><key>Minute</key><integer>15</integer></dict><dict><key>Minute</key><integer>20</integer></dict><dict><key>Minute</key><integer>25</integer></dict><dict><key>Minute</key><integer>30</integer></dict><dict><key>Minute</key><integer>35</integer></dict><dict><key>Minute</key><integer>40</integer></dict><dict><key>Minute</key><integer>45</integer></dict><dict><key>Minute</key><integer>50</integer></dict><dict><key>Minute</key><integer>55</integer></dict>
-  </array>
+       at runs = 0 for fourteen hours, this one included; the only jobs that
+       ran were StartCalendarInterval ones. An empty dict fires every minute:
+       a stranded agent is kicked within a minute of the console login, which
+       is what lets doug-mini be all back within five minutes of power-on.
+       A healthy run is silent and takes about 0.1 s, and launchd never
+       starts a second copy of a label that is still running. -->
+  <key>StartCalendarInterval</key><dict/>
   <key>RunAtLoad</key><true/>
   <key>StandardErrorPath</key><string>/var/log/tunnel-watchdog.log</string>
 </dict></plist>
