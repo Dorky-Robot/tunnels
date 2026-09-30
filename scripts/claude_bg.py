@@ -247,6 +247,9 @@ def ntfy(title, body, dry, priority="high", tags="rotating_light"):
     url = os.environ.get("MESH_WATCH_NTFY")
     if not url:
         return False
+    # The title is an HTTP header, read as Latin-1: a worker's "·" arrives as
+    # "Â·". Plain ASCII there; the body is UTF-8 and keeps the exact name.
+    title = title.replace("\u00b7", "-").encode("ascii", "replace").decode()
     rc, _, _ = run(["curl", "-sS", "-f", "-m", "20", "-H", "Title: " + title,
                     "-H", "Tags: " + tags, "-H", "Priority: " + priority,
                     "--data-binary", body, url], 25)
