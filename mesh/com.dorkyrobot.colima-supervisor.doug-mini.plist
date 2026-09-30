@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.dorkyrobot.colima-supervisor</string>
+  <!-- A loop under KeepAlive, run by launchd and, after a macOS upgrade
+       strands user agents ("needs LWCR update", 2026-09-23), kickstarted by
+       the clock-fired tunnel watchdog, which starts any agent that is loaded
+       but not running. Source: tunnels/scripts/colima-supervisor.sh
+
+       doug-mini's copy. Since 2026-09-30 colima carries only Nextcloud:
+       Pocket ID runs natively (com.dorkyrobot.pocket-id, ~/Prod/pocket-id),
+       so sign-in no longer needs the VM or T7, and pocket-id-dev is retired.
+       Neither may come back into COLIMA_CONTAINERS, or this would start the
+       old container against the native one on :1411. The one exception is
+       ~/Prod/pocket-id/rollback.sh, which puts pocket-id back on purpose.
+       Installed at ~/Library/LaunchAgents/; an env change needs a reload,
+       detached so it outlives ssh (nohup sh -c 'bootout; sleep 2; bootstrap'). -->
+  <key>ProgramArguments</key><array>
+    <string>/bin/bash</string>
+    <string>-c</string>
+    <string>while :; do /bin/bash /Users/douggraham/.local/bin/colima-supervisor.sh; sleep 120; done</string>
+  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>COLIMA_VOLUMES</key><string>T7</string>
+    <key>COLIMA_CONTAINERS</key><string>nextcloud nextcloud-db nextcloud-redis nextcloud-cron</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>60</integer>
+  <key>StandardOutPath</key><string>/Users/douggraham/Library/Logs/colima-supervisor.error.log</string>
+  <key>StandardErrorPath</key><string>/Users/douggraham/Library/Logs/colima-supervisor.error.log</string>
+</dict>
+</plist>
