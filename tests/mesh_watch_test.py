@@ -264,6 +264,21 @@ class MeshWatch(unittest.TestCase):
             f.write("extra %s/app\n" % self.base)
         self.assertIn("0 failing", self.watch())   # id.example.invalid is never asked
 
+    def test_an_expect_keyed_by_url_wins_over_the_hosts(self):
+        # A /health that answers JSON has none of the page text the host's
+        # expect wants, and must be judged by its own marker instead.
+        with open(self.env["MESH_WATCH_CONF"], "a") as f:
+            f.write("extra %s/health the store opens\n" % self.base)
+            f.write('expect %s/health "ok":true\n' % self.base)
+        Site.body["/health"] = b'{"dots":3,"ok":true,"statements":7}'
+        self.assertIn("0 failing", self.watch())
+        Site.body["/health"] = b'{"ok":false,"error":"store will not open"}'
+        out = self.watch()
+        self.assertIn("1 failing", out)
+        self.assertIn("""lacks '"ok":true'""", out)
+        Site.body["/health"] = b"hello Monica"              # the page itself is not a health answer
+        self.assertIn("1 failing", self.watch())
+
     def test_429_means_up(self):
         Site.status["/flaky"] = 429
         self.watch(); self.watch()

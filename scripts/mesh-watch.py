@@ -142,7 +142,7 @@ def last_line(s, default):
 # ---- what to check ---------------------------------------------------------
 
 def read_conf():
-    """skip <name> <why…> · extra <url> <why…> · expect <host> <text…>"""
+    """skip <name> <why…> · extra <url> <why…> · expect <host or url> <text…>"""
     conf = {"skip": {}, "extra": [], "expect": {}}
     if not os.path.exists(CONF):
         return conf
@@ -298,9 +298,11 @@ def targets(conf, fleet, machines=True, unlisted=None):
     for url, why in conf["extra"]:
         h = re.sub(r"^https?://([^/]+).*", r"\1", url)
         name = re.sub(r"^https?://", "", url).rstrip("/")
-        # Named by host and path, so two pages on one host are two checks.
+        # Named by host and path, so two pages on one host are two checks. An
+        # expect keyed by this exact URL wins over the host's: a /health that
+        # answers JSON does not carry the page text the host's expect wants.
         out.append({"id": "http:" + name, "kind": "http", "url": url, "label": name, "machine": None,
-                    "where": why or "outside the fleet", "expect": conf["expect"].get(h)})
+                    "where": why or "outside the fleet", "expect": conf["expect"].get(url, conf["expect"].get(h))})
     if machines:
         for m in read_machines():
             n = m["name"]
