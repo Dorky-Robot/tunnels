@@ -21,6 +21,23 @@ speak through mesh-watch's channel (below). mesh-watch watches both: once a
 plist is in `~/Library/LaunchAgents`, a `last-run` older than 11 minutes
 (lead-keeper) or 8 days (claude-update) is an incident like a dead site.
 
+## Where it sits
+
+- **What it serves.** The org's Claude sessions on dorkyrobot2 (the leads
+  and their workers) and the mesh that depends on them.
+- **Where the data stays.** On machines we own. The state and logs stay on
+  dorkyrobot2, and the kapwa notes stay on our own kapwa nodes. Nothing
+  reads or copies a conversation: a revival only asks Claude to resume
+  one, where it already lives.
+- **Peer-to-peer, no center.** Each box keeps its own sessions and needs
+  nothing else to do it. mesh-watch on the same box watches both jobs, and
+  the mini's heartbeat watches mesh-watch. There is one bridge:
+  **ntfy.sh**, which sees each alert's title and text (a session name, a
+  version, a path) and nothing more. So alert text never carries secrets,
+  tokens or records. The planned layer 3 is an off-mesh dead man's switch
+  (Healthchecks.io, not being built now), a second bridge that would see
+  only pings.
+
 ## What the CLI does (Claude Code 2.1.285, tried on throwaway sessions)
 
 - A session is dead when its `claude agents --json --all` entry has no pid,
