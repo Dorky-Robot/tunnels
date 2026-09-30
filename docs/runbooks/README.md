@@ -13,6 +13,7 @@ plan behind them is [`../agent-operations.md`](../agent-operations.md),
 | [add-a-machine.md](add-a-machine.md) | a new Mac joins the mesh |
 | [retire-a-hostname.md](retire-a-hostname.md) | a public hostname should stop existing |
 | [revive-a-claude-session.md](revive-a-claude-session.md) | a Claude lead or worker is gone, or stuck on "connecting…" |
+| [restore-from-media-backup.md](restore-from-media-backup.md) | a photo or video in the library is missing, truncated or won't decode |
 
 ## Three rules that apply to every one of them
 
