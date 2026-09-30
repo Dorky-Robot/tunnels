@@ -53,6 +53,12 @@ characters of its id: retired for idleness. Nothing: it may have crashed;
 
 ## 3. Bring it back, with its conversation
 
+If it is dead (listed with no pid) and was started with `--remote-control`,
+wake it in place instead: `cd <its cwd> && claude --bg --resume <sessionId>
+"<note>"` with **no other flags** keeps its id, its saved options and its
+claude.ai link, and delivers the note. Flags are what make the copy below.
+`scripts/lead-keeper.py` does all of this by itself (docs/lead-keeper.md).
+
 If it still shows in `claude agents` but has no Remote Control, stop it
 first and wait until `claude agents` no longer lists it:
 
@@ -146,3 +152,8 @@ over `ssh mini`: it doesn't carry the ssh.
   exemption. Written the same day; the listers, `claude … --help` and the
   claude-rc job were checked on dorkyrobot2 and the mini. Resume and pin
   were not run.
+- 2026-09-30: run on throwaway sessions for lead-keeper. With no flags,
+  `--resume <sessionId> "<note>"` woke a stopped session in place (same id
+  and RC link, note delivered); with flags it made a copy and left a dead
+  duplicate. `claude rm` kept the transcript, and the flagged resume
+  brought the conversation back.
