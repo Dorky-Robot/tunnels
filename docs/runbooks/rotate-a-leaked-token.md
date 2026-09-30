@@ -4,162 +4,153 @@
 runs with) was seen somewhere it shouldn't be: a transcript, a paste, `ps`
 output, a plist in a backup.
 **Don't use when:** it was a Cloudflare **API** token (`cfut_…`). Roll that
-one in the Cloudflare dashboard, then give each box the new one from the web
-UI (the account card's **rotate**) or with `tunnels token add <new>` and
+in the Cloudflare dashboard, then give each box the new one from the web
+UI (the account card's **rotate**), or `tunnels token add <new>` and
 `tunnels token rm <n>` on each box that had it.
-**Scope:** [this Mac + cloudflare]. There is no preview and no undo:
-from the moment `rotate` returns, every token issued before it is dead,
-everywhere.
-**Needs:** the tunnel's fleet alias; a box with an API token for the
-tunnel's account; the tunnel's owner reachable over the tailnet.
+**Scope:** [this Mac + cloudflare]. **No preview, no undo:** from the moment
+`rotate` returns, every token issued before it is dead, everywhere.
+**Needs:** the tunnel's owner reachable over the tailnet, holding an API
+token for the tunnel's account (`tunnels token list` there).
 
 ## Before you start
 
-1. **Name the tunnel and its owner.**
+1. **Name it once.** On any box, with the fleet alias of the tunnel
+   (`tunnels route list` shows which tunnel carries a hostname):
 
    ```sh
-   tunnels route list | grep <alias>      # the hostnames it carries
-   tunnels fleet show | grep -A4 '^\[tunnels.<alias>\]'   # machine = its owner
+   A=<alias>
+   read OWNER ACCT ID <<< "$(tunnels fleet show --json | python3 -c 'import json,sys; t=json.load(sys.stdin)["tunnels"][sys.argv[1]]; print(t["machine"], t["account"], t["id"])' $A)"
+   echo "owner=$OWNER account=$ACCT"
    ```
 
 2. **Get onto the owner by a path the rotation can't cut.** Rotating
-   restarts the owner's cloudflared. If your ssh runs through it, you lose
+   restarts the owner's cloudflared; if your ssh runs through it, you lose
    the box.
 
    ```sh
-   ssh -G <owner> | grep -i '^proxycommand'    # must print nothing
-   ssh <owner>                                 # the tailnet; or <owner>-lan
+   ssh -G $OWNER | grep -i '^proxycommand'    # must print nothing
+   ssh $OWNER                                 # the tailnet (or $OWNER-lan), never cloudflare-$OWNER
    export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
    ```
 
-   Never `ssh cloudflare-<owner>` for this. On the owner, `tunnels token
-   list` must show a token for the tunnel's account; if not, run the rotate
-   from a box that has one and the owner's agent follows within a pass.
-
-3. **Write down the before state** (no token is printed by any of these):
+   Set `A`, `OWNER`, `ACCT` and `ID` again there (step 1), then its local
+   name:
 
    ```sh
-   date -u +%FT%TZ                                  # T: the rotation time is after this
-   tunnels tunnel list                              # its local name, PID, TOKEN column
-   tunnels cf get '/accounts/{account:<acct>}/cfd_tunnel/{tunnel:<alias>}/connections' \
-     | grep -E '"(client_id|opened_at)"'
+   N=$(tunnels tunnel list --json | python3 -c 'import json,sys; print(next(t["name"] for t in json.load(sys.stdin)["tunnels"] if t.get("fleet_alias")==sys.argv[1]))' $A)
    ```
 
-   and the baseline of every hostname it carries (the loop in the
-   [index](README.md), filtered to this box). `<acct>` is the fleet account
-   alias, `dorkyrobot` or `felixflor`.
+3. **Write down the before state.** Nothing here prints a token.
 
-4. **Every copy of this token in the mesh**, from the owner's agent:
+   ```sh
+   date -u +%FT%TZ                       # T: everything after the rotation is newer than this
+   tunnels tunnel list                   # $N: its PID, and TOKEN "file" or "in plist"
+   tunnels cf get "/accounts/{account:$ACCT}/cfd_tunnel/{tunnel:$A}/connections" | grep -E '"(client_id|opened_at)"'
+   ```
+
+   plus the index's host loop for this box (`| grep "^$OWNER "`).
+
+4. **Every copy of this token in the mesh**, as the agents see them:
 
    ```sh
    curl -s http://127.0.0.1:7630/api/accounts | python3 -c 'import json,sys
    for acct in json.load(sys.stdin):
        for m,c in acct["tunnels"]:
            if c.get("alias")==sys.argv[1]: print(m, c["name"], c["state"], "token_file=%s" % c["token_file"], "current=%s" % c["current"])
-       if acct.get("unknown"): print("unknown, agent not answering:", acct["unknown"])' <alias>
+       if acct.get("unknown"): print("unknown, agent not answering:", acct["unknown"])' $A
    ```
 
-   Expect the owner, plus any box that keeps a spare copy. `tunnels` can't
-   see copies it didn't write: on the owner also look for file names (not
-   contents): `ls ~/.cloudflared/`, and
+   Expect the owner, plus any box keeping a spare copy. Copies `tunnels`
+   didn't write it can't see; on the owner, list file **names** only:
+   `ls ~/.cloudflared/` and
    `grep -l -- '--token' ~/Library/LaunchAgents/com.cloudflare.cloudflared-*.plist`.
 
-5. **Is the tunnel a root LaunchDaemon?**
-   `ls /Library/LaunchDaemons | grep cloudflared`. If it is (doug-mini, once
-   its visit is done), plan for the sudo step in step 3 below.
+5. **A root LaunchDaemon?** `ls /Library/LaunchDaemons | grep cloudflared`.
+   If it lists `com.cloudflare.cloudflared-$N` (doug-mini, after its visit),
+   step 3 below needs the owner's password.
 
 ## Steps
 
 1. **Rotate**, on the owner:
 
    ```sh
-   tunnels tunnel rotate <alias>
+   tunnels tunnel rotate $A
    ```
 
-   **Check:** it prints `<alias> has a new secret — every connector token
-   issued before now no longer works; this Mac took the new one and
-   restarted <name>`. Over ssh the restart is detached, so your session
-   survives it.
+   **Check:** `✓ <alias> has a new secret — every connector token issued
+   before now no longer works; this Mac took the new one and restarted
+   <name>`. Over ssh the restart is detached, so your session survives it.
    **If not:** an error before "new secret" changed nothing; fix it and
-   rerun. An error after it (fetching or restarting) means the old token is
-   already dead and the owner doesn't have the new one yet: go straight to
-   step 2's fix line.
+   rerun. An error after it means the old token is already dead and the
+   owner doesn't have the new one yet: go to step 2's fix line now.
 
-2. **The owner runs on the new token, from a file.**
-
-   ```sh
-   tunnels tunnel list        # <name>: loaded, a new PID, TOKEN file
-   plutil -extract ProgramArguments json -o - \
-     ~/Library/LaunchAgents/com.cloudflare.cloudflared-<name>.plist | grep -c '"--token"'   # 0
-   ls -l ~/.config/tunnels/tokens/<tunnel-id>        # -rw-------, written just now
-   ```
-
-   and step 4 from Before again: the owner shows `token_file=True
-   current=True`.
-   **If not:** rotating from another box leaves the owner to its agent;
-   wait one pass (`policy.interval`, 120 s) and look for
-   `its tunnel was rotated; took the new connector token` in
-   `tunnels agent status`. Still nothing: `tunnels tunnel restart <name>` on
-   the owner, or **paste tunnel token** on its card in the web UI.
-
-3. **Root daemon only.** tunnels 0.25.x doesn't manage a tunnel running as
-   a root LaunchDaemon; newer releases do it through `sudo -n` or print the
-   two lines to run. Either way, on the owner, with its password:
+2. **The owner runs the new token, from a file.**
 
    ```sh
-   sudo install -o root -g wheel -m 600 ~/.config/tunnels/tokens/<tunnel-id> /etc/cloudflared/<name>.token
-   sudo launchctl kickstart -k system/com.cloudflare.cloudflared-<name>
+   tunnels tunnel list                  # $N: loaded, a new PID, TOKEN file
+   plutil -extract ProgramArguments json -o - ~/Library/LaunchAgents/com.cloudflare.cloudflared-$N.plist | grep -c '"--token"'   # 0
+   ls -l ~/.config/tunnels/tokens/$ID   # -rw-------, written just now
    ```
 
-   Skipping this leaves the daemon on a dead token: it keeps its current
-   connections and fails at its next restart or reboot.
+   and the copy list (Before, 4) shows the owner `token_file=True current=True`.
+   **Fix line:** `tunnels tunnel restart $N` on the owner; or **paste tunnel
+   token** on its card in the web UI. (Rotated from another box, the owner's
+   agent takes the new token within one pass, 120 s:
+   `tunnels agent status` says `its tunnel was rotated; took the new
+   connector token`.)
 
-4. **Cloudflare sees only the new connector.**
+3. **Root daemon only.** tunnels 0.25.x doesn't manage a tunnel run as a
+   root LaunchDaemon; later releases do it through `sudo -n` or print these
+   two lines. On the owner, with its password:
 
    ```sh
-   tunnels cf get '/accounts/{account:<acct>}/cfd_tunnel/{tunnel:<alias>}/connections' \
-     | grep -E '"(client_id|opened_at)"'
+   sudo install -o root -g wheel -m 600 ~/.config/tunnels/tokens/$ID /etc/cloudflared/$N.token
+   sudo launchctl kickstart -k system/com.cloudflare.cloudflared-$N
    ```
 
-   **Check:** every `opened_at` is after T, and the `client_id` differs from
-   the one you wrote down. **If an old `client_id` is still there:** some
-   cloudflared still holds a connection it opened with the old token. Find
-   it with the copy list (Before, step 4) and stop it there; it can't
-   reconnect.
+   Skip it and the daemon keeps its open connections on a dead token and
+   fails at its next restart or reboot.
 
-5. **Every hostname answers as before** (the index's loop).
+4. **Cloudflare sees only the new connector.** The `connections` read from
+   Before, 3 again: every `opened_at` is after T and the `client_id` is new.
+   An old `client_id` still there is some cloudflared holding a connection
+   it opened with the old token: find it in the copy list and stop it
+   there. It can't reconnect.
 
-6. **Clean up the other copies.** Rerun the copy list. Any box other than
-   the owner now shows `current=False`: that copy is dead, which is the
-   proof Cloudflare no longer honours what leaked. Remove it on that box
-   with `tunnels tunnel forget <its local name>` (local only; it changes
-   nothing in Cloudflare). Delete leftover files you found in Before step 4
-   once the owner is confirmed running from `~/.config/tunnels/tokens/`.
+5. **Every hostname answers as before** (the host loop again).
 
-## What you can and cannot prove
+6. **Clean up the other copies.** Rerun the copy list: every box other than
+   the owner now shows `current=False`. That is the proof Cloudflare no
+   longer honours what leaked. On each, `tunnels tunnel forget <its name>`
+   (local only). Delete the leftover files from Before, 4 once the owner
+   runs from `~/.config/tunnels/tokens/`.
 
-You never handle the old token, so you can't try it. What you can show:
-`rotate` returned (Cloudflare replaced the secret), the owner's copy is
-`current=True` while every copy made before is `current=False`, and every
-live connection opened after T. Report those three, and never paste a token
-into the report.
+## What to report
+
+You never hold the old token, so you can't try it. You can show three
+things: `rotate` returned, every pre-rotation copy reads `current=False`
+while the owner's reads `current=True`, and every live connection opened
+after T. Never paste a token into a report.
 
 ## Stop and ask a person if
 
 - the owner doesn't answer over the tailnet (you'd be rotating blind);
-- the owner isn't running the new token after step 2's fix line, and its
-  hostnames are down: that's an outage, tell the owning lead now;
-- the tunnel is a root daemon and nobody with the owner's password is there:
-  rotate anyway only if the leak is worse than the next reboot killing it.
+- the owner's hostnames are down after step 2's fix line: that is an
+  outage, so tell the owning lead now;
+- it is a root daemon and nobody with the owner's password is around:
+  rotate anyway only if the leak is worse than the next reboot killing the
+  tunnel.
 
 ## Undo
 
-None. A rotated secret can't be put back; the fix for a bad rotation is a
-correct token on the owner (step 2's fix line).
+None. A rotated secret can't be put back. The fix for a bad rotation is the
+right token on the owner (step 2's fix line).
 
 ## History
 
-- 2026-09-29: doug-mini's plist carried its token inline, so it showed in
-  `ps`, and a copy sat in an old transcript on the mini. Rotation was
-  planned, not yet run. The rotate, token-file and copy checks here were run
-  read-only against the live mesh on 2026-09-30.
+- 2026-09-29: doug-mini's plist carried its token inline (visible in `ps`),
+  and a copy sat in an old transcript on the mini. Rotation planned, not yet
+  run.
+- 2026-09-30: written. Every read here run against the live mesh
+  (doug-mini-dorkyrobot: fleet lookup, tunnel list, connections, copy list,
+  stray files); `rotate` itself not run.
