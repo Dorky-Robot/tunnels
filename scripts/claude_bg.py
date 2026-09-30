@@ -22,6 +22,7 @@ Learned on throwaway sessions (2026-09-30, Claude Code 2.1.285):
     within seconds and spends no tokens: a free probe of a binary.
 """
 import datetime as dt
+import fnmatch
 import json
 import os
 import re
@@ -270,13 +271,26 @@ def read_leads(path=None):
     return leads, excludes
 
 
+# Test sessions are never ours to keep, whatever the config says: a revived
+# throwaway is one more record in Felix's claude.ai sidebar.
+THROWAWAYS = ("lk-throwaway*", "claude-update probe")
+
+
+def excluded(name, excludes=()):
+    """Does an exclude (a name or a glob) match this session's name, or the
+    task after its " · "? So "lk-throwaway*" also covers "Mesh · lk-throwaway-2"."""
+    parts = [name] + ([name.split(" · ", 1)[1]] if " · " in name else [])
+    return any(fnmatch.fnmatchcase(p, pat) for pat in tuple(THROWAWAYS) + tuple(excludes) for p in parts)
+
+
 def kept(name):
     """Is this a session lead-keeper looks after: a lead, or '<lead> · <task>'?"""
     try:
         leads, excludes = read_leads()
     except (OSError, SystemExit):
         return False
-    return name not in excludes and any(name == l["name"] or name.startswith(l["name"] + " · ") for l in leads)
+    return not excluded(name, excludes) and any(name == l["name"] or name.startswith(l["name"] + " · ")
+                                                for l in leads)
 
 
 def trusted(cwd):

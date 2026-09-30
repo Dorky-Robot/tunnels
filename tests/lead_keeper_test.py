@@ -287,6 +287,20 @@ class LeadKeeper(unittest.TestCase):
             self.run_()
         self.assertEqual(self.revivals(), [])
 
+    def test_throwaways_and_excluded_globs_are_never_revived(self):
+        open(os.path.join(self.d, "leads.conf"), "a").write("exclude | scratch*\nlk-throwaway-9 | %s\n" % self.cwd)
+        self.add("lk-throwaway-9", "9a9a0001", alive=False)           # even when listed as a lead
+        self.add("Mesh · lk-throwaway-2", "9a9a0002", alive=False)
+        self.add("Monica · scratch 2", "9a9a0003", alive=False)
+        self.add("claude-update probe", "9a9a0004", alive=False)
+        self.run_()
+        self.run_()
+        for _ in range(3):
+            self.run_()
+        self.assertEqual(self.revivals(), [])
+        self.assertEqual(Ntfy.alerts, [])
+        self.assertNotIn("throwaway", self.run_("--dry-run"))
+
     def test_a_lead_note_in_the_config_is_used(self):
         self.run_()
         self.kill("bbbb0002")

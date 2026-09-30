@@ -54,7 +54,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from claude_bg import (CLAUDE, HOME, agents, box, flush, grant_path, job, load_env, load_json,  # noqa: E402
+from claude_bg import (CLAUDE, HOME, agents, box, excluded, flush, grant_path, job, load_env, load_json,  # noqa: E402
                        memory_tight, now, parse, pid_alive, plain, rc_link, read_leads, retired, run,
                        save_json, stamp, transcript, trust_stall, trusted, BG_ID)
 
@@ -117,11 +117,11 @@ def targets(listing, leads, excludes):
         if n:
             by_name.setdefault(n, []).append(e)
     out = [(lead["name"], lead, by_name.get(lead["name"], [])) for lead in leads
-           if lead["name"] not in excludes]
+           if not excluded(lead["name"], excludes)]
     workers = []
     for n, es in by_name.items():
         for lead in leads:
-            if n.startswith(lead["name"] + DOT) and n not in excludes:
+            if n.startswith(lead["name"] + DOT) and not excluded(n, excludes):
                 workers.append((n, lead, es))
                 break
     return out + sorted(workers, key=lambda t: t[0])
