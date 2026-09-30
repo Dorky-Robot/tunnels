@@ -29,7 +29,16 @@ Nothing is listed by hand that can be derived.
   a Cloudflare error page, is not an error or placeholder page by its title
   (502, "Welcome to nginx", "no healthy upstream"…), and contains the `expect`
   text if one is set.
-  A sign-in redirect therefore passes only if the sign-in page itself answers.
+  A redirect to sign-in at `id.<domain>` or `id-dev.<domain>` ends the check
+  as a pass: the app answered. The id host is its own check, and following
+  every app there would hit Pocket ID several times a run from one address,
+  which it answers with 429. A 429 anywhere counts as up.
+- **Every hostname Cloudflare really serves through a tunnel**, asked hourly
+  (`tunnels cf get`: every tunnel's ingress and every tunnel CNAME, read-only).
+  A live hostname the fleet file does not list is checked anyway. When two
+  fetches in a row see the fleet and Cloudflare disagree, either way round,
+  that is one low-priority note (`monitor:drift`), since nothing is down
+  because of it. A failed fetch reports nothing: unknown is not missing.
 - **Every machine in `mesh/machines`**: `tailscale ping`, `ssh <name> true`,
   and `ssh cloudflare-<name> true` where it has a tunnel. That last one is the
   check for the `ssh-*` routes. Not the agent's `:7630`, which the mac2019
@@ -75,6 +84,7 @@ Under `~/.local/state/mesh-watch/` on dorkyrobot2 (heartbeat files on the mini):
   what an uptime board wants. Kept for good.
 - `state.json`: open incidents, streaks, alerts waiting to be sent.
 - `fleet.json`: the last fleet that could be read.
+- `drift.json`: the last two hourly reads of what Cloudflare serves.
 - `last-run`: the heartbeat, `<time> ok` or `<time> offline <since>`.
 
 ## Alerts
