@@ -8,7 +8,11 @@ is it the right page? It reports. It fixes nothing.
 | where | what | job |
 |---|---|---|
 | dorkyrobot2 | every 5 min: every hostname, every machine | `mesh/com.dorkyrobot.mesh-watch.plist` |
-| mini | every 5 min: did dorkyrobot2's monitor run in the last 15 min? | `mesh/com.dorkyrobot.mesh-watch-heartbeat.plist` |
+| mini | every 5 min: did dorkyrobot2's monitor run in the last 11 min? | `mesh/com.dorkyrobot.mesh-watch-heartbeat.plist` |
+
+The two watch each other: the monitor also checks that the mini's heartbeat
+has run lately (`MESH_WATCH_PEER=mini`), and checks the mini itself like any
+other machine.
 
 dorkyrobot2 was the least loaded of the always-on boxes when this was set up
 (2026-09-30: load 1.3 on 12 cores, 74% memory free, 0.5 of 2 GB swap used;
@@ -37,25 +41,39 @@ Nothing is listed by hand that can be derived.
 
 A failing check is retried twice, 15 s apart, in the same run. An incident
 opens after two failing runs in a row (so within about ten minutes) and is
-alerted once. Its recovery is alerted once. Everything that opens in one run
-is one message. If the monitor cannot reach `www.cloudflare.com` it judges
-nothing that run: a dead uplink on dorkyrobot2 is not forty dead sites. An
-alert that cannot be sent waits and goes with the next run.
+alerted once. It closes after two passing runs in a row, alerted once with
+how long it was down, so a host that flaps stays one incident instead of an
+alert every few minutes. Everything that opens in one run is one message,
+grouped by the machine that serves it; when every check on a machine fails,
+the message says the machine looks down instead of listing forty sites. Each
+line says what failed and since when, and each machine gets its three ways in.
+
+If the monitor cannot reach `www.cloudflare.com` it judges nothing that run:
+a dead uplink on dorkyrobot2 is not forty dead sites. It writes that into its
+heartbeat, and if it lasts past 11 minutes the heartbeat tells Felix, in one
+message, that dorkyrobot2 is running but blind. An alert that cannot be sent
+waits and goes with the next run.
+
+If `tunnels fleet show` fails, the monitor checks the last fleet it could
+read (`fleet.json`) and reports `monitor:fleet` as an incident of its own.
 
 The heartbeat reads `~/.local/state/mesh-watch/last-run` on dorkyrobot2 over
-the tailnet, then over Cloudflare, and treats the monitor as stopped when
-neither path answers or the last run is older than 15 minutes.
+the tailnet, then over Cloudflare. A heartbeat older than 11 minutes (two
+missed runs) or missing is alerted at once: a monitor that dies is known
+within about 12 minutes. Not reaching dorkyrobot2 by either path is alerted
+after two runs, since the fault may be the mini's.
 
 ## History
 
 Under `~/.local/state/mesh-watch/` on dorkyrobot2 (heartbeat files on the mini):
 
 - `checks-YYYY-MM.jsonl`: one line per check per run (`ts id ok code ms tries detail`).
-  About 15,000 lines (2 MB) a day, so about 60 MB a month.
+  About 15,000 lines (2 MB) a day, so about 60 MB a month; six months are kept.
 - `incidents.jsonl`: `opened`, `recovered` and `retired` events, which is
-  what an uptime board wants.
+  what an uptime board wants. Kept for good.
 - `state.json`: open incidents, streaks, alerts waiting to be sent.
-- `last-run`: the heartbeat.
+- `fleet.json`: the last fleet that could be read.
+- `last-run`: the heartbeat, `<time> ok` or `<time> offline <since>`.
 
 ## Alerts
 
@@ -90,5 +108,7 @@ repo, so landing on main and pulling updates them. To run one now:
 
 Everything runs against servers on 127.0.0.1: one alert per incident, one on
 recovery, a blip is not an incident, a wrong page fails, many failures are
-one message, an offline monitor judges nothing, an unsent alert waits, and
-the heartbeat alerts once when the monitor cannot be reached.
+one message, a flapping host is one incident, an unreadable fleet falls back
+and says so, an offline monitor judges nothing and says so in its heartbeat,
+an unsent alert waits, old history is pruned, and the heartbeat alerts once
+for a monitor that is stale, blind or unreachable.
