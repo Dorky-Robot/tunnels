@@ -1,0 +1,94 @@
+# mesh-watch: the mesh seen from outside
+
+The tunnel-watchdog on each box asks launchd whether a job is loaded. That is
+the inside view, and a tunnel can be loaded, running and serving 530s.
+`scripts/mesh-watch.py` asks what a visitor asks: does the page come back, and
+is it the right page? It reports. It fixes nothing.
+
+| where | what | job |
+|---|---|---|
+| dorkyrobot2 | every 5 min: every hostname, every machine | `mesh/com.dorkyrobot.mesh-watch.plist` |
+| mini | every 5 min: did dorkyrobot2's monitor run in the last 15 min? | `mesh/com.dorkyrobot.mesh-watch-heartbeat.plist` |
+
+dorkyrobot2 was the least loaded of the always-on boxes when this was set up
+(2026-09-30: load 1.3 on 12 cores, 74% memory free, 0.5 of 2 GB swap used;
+the mini had load 1.9 on 8 cores, 8 GB of RAM, 4.9 of 6 GB swap used).
+dorkyrobot1 is production and stays clean; mac2019 is being retired;
+doug-mini is Doug's.
+
+## What it checks
+
+Nothing is listed by hand that can be derived.
+
+- **Every route in the fleet file** (`tunnels fleet show --json`): `https://<host>/`,
+  redirects followed. It passes on a 2xx final page that is not empty, is not
+  a Cloudflare error page, and contains the `expect` text if one is set.
+  A sign-in redirect therefore passes only if the sign-in page itself answers.
+- **Every machine in `mesh/machines`**: `tailscale ping`, `ssh <name> true`,
+  and `ssh cloudflare-<name> true` where it has a tunnel. That last one is the
+  check for the `ssh-*` routes. Not the agent's `:7630`, which the mac2019
+  and doug-mini firewalls do not answer.
+- **`mesh/watch.conf`** adds what neither file knows: hosts to skip and why,
+  public sites outside the tunnels, and text a page must contain.
+
+`scripts/mesh-watch.py --list` prints every check and every skip with its reason.
+
+## Incidents
+
+A failing check is retried twice, 15 s apart, in the same run. An incident
+opens after two failing runs in a row (so within about ten minutes) and is
+alerted once. Its recovery is alerted once. Everything that opens in one run
+is one message. If the monitor cannot reach `www.cloudflare.com` it judges
+nothing that run: a dead uplink on dorkyrobot2 is not forty dead sites. An
+alert that cannot be sent waits and goes with the next run.
+
+The heartbeat reads `~/.local/state/mesh-watch/last-run` on dorkyrobot2 over
+the tailnet, then over Cloudflare, and treats the monitor as stopped when
+neither path answers or the last run is older than 15 minutes.
+
+## History
+
+Under `~/.local/state/mesh-watch/` on dorkyrobot2 (heartbeat files on the mini):
+
+- `checks-YYYY-MM.jsonl`: one line per check per run (`ts id ok code ms tries detail`).
+  About 15,000 lines (2 MB) a day, so about 60 MB a month.
+- `incidents.jsonl`: `opened`, `recovered` and `retired` events, which is
+  what an uptime board wants.
+- `state.json`: open incidents, streaks, alerts waiting to be sent.
+- `last-run`: the heartbeat.
+
+## Alerts
+
+Alerts go to ntfy: `MESH_WATCH_NTFY=https://ntfy.sh/<topic>` in
+`~/.config/mesh-watch/env` (mode 600) on both boxes. The topic is the only
+secret, and it is not in git. Without it, alerts are logged as waiting and
+nothing leaves the box. ntfy.sh is outside the mesh, so an alert about the
+mesh does not depend on the mesh; Felix gets it on his phone through the ntfy
+app, subscribed to that topic.
+
+## Install (sudo, on each box)
+
+Not done until the box choice and the channel are approved.
+
+    # dorkyrobot2
+    sudo cp mesh/com.dorkyrobot.mesh-watch.plist /Library/LaunchDaemons/
+    sudo launchctl bootstrap system /Library/LaunchDaemons/com.dorkyrobot.mesh-watch.plist
+
+    # mini
+    sudo cp mesh/com.dorkyrobot.mesh-watch-heartbeat.plist /Library/LaunchDaemons/
+    sudo launchctl bootstrap system /Library/LaunchDaemons/com.dorkyrobot.mesh-watch-heartbeat.plist
+
+They are LaunchDaemons so they run after a power cut with nobody logged in,
+and they run as the box's user (`UserName`) because the checks are that
+user's ssh keys. Both run the script from the box's main checkout of this
+repo, so landing on main and pulling updates them. To run one now:
+`sudo launchctl kickstart system/com.dorkyrobot.mesh-watch`.
+
+## Test
+
+    /usr/bin/python3 tests/mesh_watch_test.py
+
+Everything runs against servers on 127.0.0.1: one alert per incident, one on
+recovery, a blip is not an incident, a wrong page fails, many failures are
+one message, an offline monitor judges nothing, an unsent alert waits, and
+the heartbeat alerts once when the monitor cannot be reached.
