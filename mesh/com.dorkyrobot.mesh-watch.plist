@@ -13,6 +13,8 @@
   </array>
   <key>EnvironmentVariables</key><dict>
     <key>HOME</key><string>/Users/dorkyrobot2</string>
+    <!-- The mini runs the heartbeat that watches this; this watches it back. -->
+    <key>MESH_WATCH_PEER</key><string>mini</string>
   </dict>
   <!-- By the clock, not StartInterval: after the macOS 27 upgrade
        (2026-09-23) only StartCalendarInterval jobs ran. Two minutes past
