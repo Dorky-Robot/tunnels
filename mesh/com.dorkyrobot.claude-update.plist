@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.dorkyrobot.claude-update</string>
+  <!-- Claude Code's update, once a week and on purpose, now that
+       auto-update is off: docs/lead-keeper.md. A user LaunchAgent on
+       dorkyrobot2, beside lead-keeper, for the same reason: the install,
+       the supervisor and the sessions are all this user's. -->
+  <key>ProgramArguments</key><array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/dorkyrobot2/Projects/dorky_robot/tunnels/scripts/claude-update.py</string>
+  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>HOME</key><string>/Users/dorkyrobot2</string>
+  </dict>
+  <!-- Sunday 04:31 local: nobody is working, and it sits between
+       lead-keeper's passes at :29 and :34, which pause for as long as the
+       update holds its lock anyway. -->
+  <key>StartCalendarInterval</key><dict>
+    <key>Weekday</key><integer>0</integer>
+    <key>Hour</key><integer>4</integer>
+    <key>Minute</key><integer>31</integer>
+  </dict>
+  <key>StandardOutPath</key><string>/Users/dorkyrobot2/Library/Logs/claude-update.log</string>
+  <key>StandardErrorPath</key><string>/Users/dorkyrobot2/Library/Logs/claude-update.log</string>
+</dict></plist>
