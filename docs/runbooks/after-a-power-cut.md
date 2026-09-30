@@ -128,18 +128,8 @@ watchdog brings it back; by hand it is
 
 ## 5. Prove it from outside
 
-From a different box, every hostname the fleet routes, grouped by the box
-that serves it:
-
-```sh
-tunnels route list --json | python3 -c 'import json,sys
-for r in json.load(sys.stdin):
-    if r["active"]: print(r["machine"], r["host"])' | sort -u | while read m h; do
-  printf '%-12s %-45s %s\n' "$m" "$h" "$(curl -s -o /dev/null -m 10 -w '%{http_code}' "https://$h/")"
-done
-```
-
-Done when the box's rows are 200/30x, as they were before. 502 or 530 on
+From a different box, run the "does every public hostname answer" loop in
+the [index](README.md). Done when the box's rows are 200/30x, as they were before. 502 or 530 on
 one host means its app (step 4) is down; every host on a box failing means
 the tunnel. Then all three ways in:
 

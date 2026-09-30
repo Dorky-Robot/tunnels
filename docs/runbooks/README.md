@@ -50,17 +50,19 @@ for c in json.load(sys.stdin)["connectors"]:
 `False` means it is dead (rotated away); `None` means unknown (no API token
 here reaches that account).
 
-**Does every public hostname answer**, from any box:
+**Does every public hostname answer**, from any box, grouped by the box that
+serves it (add `| grep '^<box> '` for one box):
 
 ```sh
 tunnels route list --json | python3 -c 'import json,sys
-for r in json.load(sys.stdin)["routes"]: print(r["host"])' | while read h; do
-  printf '%-45s %s\n' "$h" "$(curl -s -o /dev/null -m 10 -w '%{http_code}' "https://$h/")"
+for r in json.load(sys.stdin):
+    if r["active"]: print(r["machine"], r["host"])' | sort -u | while read m h; do
+  printf '%-12s %-45s %s\n' "$m" "$h" "$(curl -s -o /dev/null -m 10 -w '%{http_code}' "https://$h/")"
 done
 ```
 
-`ssh-*` hosts answer 200 to a browser request too; a 530 or 502 is a tunnel
-or its origin down; 000 is no answer at all. `scripts/mesh-watch.py` does
+200 or a 30x redirect (to sign-in) is up; `ssh-*` hosts answer 200 too. 502
+or 530 is a tunnel or its app down; 000 is no answer at all. `scripts/mesh-watch.py` does
 this properly (expected text, retries); the loop is the 3am version.
 
 ## When a runbook is wrong
