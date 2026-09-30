@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.dorkyrobot.lead-keeper</string>
+  <!-- Brings back the lead sessions in mesh/leads.conf when they die:
+       docs/lead-keeper.md. A user LaunchAgent in ~/Library/LaunchAgents on
+       dorkyrobot2, not a daemon: Claude Code's background supervisor is
+       this user's, in this user's login session, and so are the leads.
+       Full paths throughout; launchd gives /usr/bin:/bin only. -->
+  <key>ProgramArguments</key><array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/dorkyrobot2/Projects/dorky_robot/tunnels/scripts/lead-keeper.py</string>
+  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>HOME</key><string>/Users/dorkyrobot2</string>
+  </dict>
+  <!-- By the clock, not StartInterval: after the macOS 27 upgrade
+       (2026-09-23) only StartCalendarInterval jobs ran. Four minutes past
+       the tunnel-watchdog and two past mesh-watch, so the three never
+       start together. -->
+  <key>StartCalendarInterval</key><array>
+    <dict><key>Minute</key><integer>4</integer></dict><dict><key>Minute</key><integer>9</integer></dict><dict><key>Minute</key><integer>14</integer></dict><dict><key>Minute</key><integer>19</integer></dict><dict><key>Minute</key><integer>24</integer></dict><dict><key>Minute</key><integer>29</integer></dict><dict><key>Minute</key><integer>34</integer></dict><dict><key>Minute</key><integer>39</integer></dict><dict><key>Minute</key><integer>44</integer></dict><dict><key>Minute</key><integer>49</integer></dict><dict><key>Minute</key><integer>54</integer></dict><dict><key>Minute</key><integer>59</integer></dict>
+  </array>
+  <key>StandardOutPath</key><string>/Users/dorkyrobot2/Library/Logs/lead-keeper.log</string>
+  <key>StandardErrorPath</key><string>/Users/dorkyrobot2/Library/Logs/lead-keeper.log</string>
+</dict></plist>
