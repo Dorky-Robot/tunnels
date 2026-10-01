@@ -103,6 +103,33 @@ nothing leaves the box. ntfy.sh is outside the mesh, so an alert about the
 mesh does not depend on the mesh; Felix gets it on his phone through the ntfy
 app, subscribed to that topic.
 
+Outages are also emailed to Felix's Gmail, through the path tao already uses:
+`tao notify` on the mini, which sends with himalaya over Gmail SMTP. Its
+credentials (a Gmail app password) stay in `~/.tao/mail/<address>/` on the
+mini; nothing here holds one. Both boxes get one more line in
+`~/.config/mesh-watch/env`, a shell command with `{subject}` standing for the
+quoted subject and the body on stdin:
+
+    # on the mini (heartbeat)
+    MESH_WATCH_MAIL_CMD=/Users/felixflores/.cargo/bin/tao notify <address> --subject {subject}
+    # on dorkyrobot2 (watch): the same, through the mini
+    MESH_WATCH_MAIL_CMD=ssh macmini "/Users/felixflores/.cargo/bin/tao notify <address> --subject {subject}"
+
+What is emailed: incident opened, recovered, and monitor-dead / watching
+again from the heartbeat. Not the low-priority notes (drift). Subjects start
+`[mesh-watch]`, so one Gmail filter ("never send to spam", star, important)
+makes them reliable; tao sends from the address to itself, so without a
+filter Gmail may keep them out of the inbox view. The body is the same
+alert text as ntfy. Gmail allows about 500 SMTP messages a day; alerts are
+already grouped and debounced, so that is far away.
+
+Each channel keeps its own place. If the mail path fails the alert waits for
+the next run (every five minutes) and ntfy is not held back or repeated; a
+mail still failing after six hours is dropped, so a night of old outages does
+not arrive at once. Mail is the weaker channel: it depends on the mini. If
+the mini is down, dorkyrobot2 cannot send mail and only ntfy reaches Felix;
+the heartbeat on the mini is silent too. ntfy stays the primary.
+
 ## Bridges
 
 A bridge is a service outside the mesh that the mesh depends on. Each is
@@ -110,6 +137,7 @@ named, with what it carries and why it is outside.
 
 | bridge | carries | why it is outside the mesh |
 |---|---|---|
+| **Gmail SMTP, via tao on the mini** | the same alert text, outages only | email reaches Felix's phone whatever app he has; credentials stay with tao |
 | **ntfy.sh** | alert text only: which checks failed, since when, the ways in. No page content, no tokens | an alert about the mesh must arrive when the mesh is down |
 | **Healthchecks.io** (planned) | a ping with no body, from the monitor and the heartbeat | the dead man's switch: it notices silence, which nothing inside a dead mesh can |
 | **Cloudflare** | every public hostname, and the `cloudflare-<name>` ssh path | the checks are what a visitor sees, and visitors come through it |
@@ -147,3 +175,7 @@ and says so, an offline monitor judges nothing and says so in its heartbeat,
 an unsent alert waits, old history is pruned, an expect keyed by URL beats
 the host's, a page on a routed host is filed under its machine, and the
 heartbeat alerts once for a monitor that is stale, blind or unreachable.
+Email has its own tests with a fake sender: outage and recovery once each,
+low-priority notes never, a dead mail path holds back nothing and catches up,
+a mail failing for hours is dropped, a hostile subject stays one argument,
+and the heartbeat emails a dead monitor.

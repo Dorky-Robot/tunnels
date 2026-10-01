@@ -43,6 +43,11 @@ History, for an uptime board later, under $MESH_WATCH_STATE
 Alerts go to $MESH_WATCH_NTFY (a full ntfy URL, topic included), read from
 ~/.config/mesh-watch/env. The topic is the secret: it never goes in git. With
 none set, alerts are logged as unsent and nothing leaves the box.
+
+Outages (opened, recovered, monitor-dead; never the low-priority notes) are
+also emailed when MESH_WATCH_MAIL_CMD is set in the same file: a shell command
+that reads the body on stdin, with {subject} for the subject. It holds no
+credentials; tao keeps those on the mini. See docs/mesh-watch.md.
 """
 import concurrent.futures as cf
 import datetime as dt
@@ -50,6 +55,7 @@ import glob
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -489,14 +495,10 @@ def prune(t):
             os.remove(p)
 
 
-def send(msg, dry):
-    """Send one alert. True if it left the box (or was printed, when dry)."""
-    if dry:
-        print("ALERT %s\n%s\n" % (msg["title"], msg["body"]))
-        return True
+def send_ntfy(msg):
     url = os.environ.get("MESH_WATCH_NTFY")
     if not url:
-        return False
+        return None
     rc, out, err = run(["curl", "-sS", "-f", "-m", "20", "-H", "Title: " + msg["title"],
                         "-H", "Tags: " + msg.get("tags", "rotating_light"),
                         "-H", "Priority: " + msg.get("priority", "high"),
@@ -504,11 +506,62 @@ def send(msg, dry):
     return rc == 0
 
 
+def send_mail(msg):
+    """Outages only, by whatever MESH_WATCH_MAIL_CMD runs: the body on stdin and
+    {subject} replaced by the quoted subject. That is how tao sends mail, on
+    the mini; from another box the command is an ssh to the mini."""
+    cmd = os.environ.get("MESH_WATCH_MAIL_CMD")
+    if not cmd or msg.get("priority") == "low":
+        return None
+    subject = re.sub(r"[^\w .:,+/@()\[\]-]", " ", "[mesh-watch] " + msg["title"])  # survives an ssh's second shell
+    try:
+        p = subprocess.run(["/bin/sh", "-c", cmd.replace("{subject}", shlex.quote(subject))], input=msg["body"],
+                           capture_output=True, text=True, timeout=60)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return p.returncode == 0
+
+
+CHANNELS = (("ntfy", send_ntfy), ("mail", send_mail))
+# An email that has failed this long is history, not news: drop it rather
+# than send a night of old outages when the sender comes back.
+MAIL_GIVE_UP = 6 * 3600
+
+
 def flush(state, dry):
-    """Send what is waiting, oldest first; keep whatever did not go."""
+    """Send what is waiting, oldest first, on each channel; keep what did not go.
+    A channel that fails holds back only itself, so a dead mail path never
+    delays an ntfy."""
+    if dry:
+        for a in state["pending"]:
+            print("ALERT %s\n%s\n" % (a["title"], a["body"]))
+        state["pending"] = []
+        return
+    t = now()
+    stuck = set()
     left = []
     for a in state["pending"]:
-        if left or not send(a, dry):
+        a.setdefault("at", stamp(t))
+        done = a.setdefault("done", [])
+        want = []
+        for name, fn in CHANNELS:
+            if name in done:
+                continue
+            if name in stuck and not (name == "mail" and a.get("priority") == "low"):
+                want.append(name)
+                continue
+            r = fn(a)
+            if r is None:
+                continue
+            want.append(name)
+            if r:
+                done.append(name)
+            elif name == "mail" and (t - parse(a["at"])).total_seconds() > MAIL_GIVE_UP:
+                print("mesh-watch: giving up on emailing %r" % a["title"], file=sys.stderr)
+                done.append(name)
+            else:
+                stuck.add(name)
+        if not done or any(n not in done for n in want):
             left.append(a)
     state["pending"] = left
 

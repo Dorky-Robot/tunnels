@@ -314,5 +314,115 @@ class MeshWatch(unittest.TestCase):
         self.assertEqual(len(notes), 1)
         self.assertIn("not in the fleet file", notes[0]["body"])
 
+    # ---- email: the same outages, a second channel -------------------------
+
+    def fake_mailer(self, ok=True):
+        """A sender that files what tao would send: subject as $1, body on stdin."""
+        self.mails = os.path.join(self.dir, "mails")
+        os.makedirs(self.mails, exist_ok=True)
+        script = os.path.join(self.dir, "fake-tao")
+        with open(script, "w") as f:
+            f.write("#!/bin/sh\n[ -f '%s/broken' ] && exit 1\n"
+                    "n=$(ls '%s' | wc -l | tr -d ' '); { echo \"$1\"; cat; } > '%s'/m$n\n" % ((self.mails,) * 3))
+        os.chmod(script, 0o755)
+        self.env["MESH_WATCH_MAIL_CMD"] = script + " {subject}"
+
+    def sent(self):
+        out = []
+        for n in sorted(os.listdir(self.mails)):
+            if n.startswith("m"):
+                subject, _, body = open(os.path.join(self.mails, n)).read().partition("\n")
+                out.append((subject, body))
+        return out
+
+    def test_an_outage_and_its_recovery_are_emailed_once_each(self):
+        self.fake_mailer()
+        Site.status["/flaky"] = 502
+        self.watch(); self.watch(); self.watch()
+        self.assertEqual(len(self.sent()), 1)
+        subject, body = self.sent()[0]
+        self.assertTrue(subject.startswith("[mesh-watch] down:"), subject)
+        self.assertIn("HTTP 502", body)
+        Site.status["/flaky"] = 200
+        self.watch(); self.watch(); self.watch()
+        self.assertEqual(len(self.sent()), 2)
+        self.assertTrue(self.sent()[1][0].startswith("[mesh-watch] back:"))
+        self.assertEqual(len(Site.alerts), 2)               # ntfy is unchanged
+
+    def test_a_dead_mail_path_never_holds_back_ntfy_and_mail_catches_up(self):
+        self.fake_mailer()
+        open(os.path.join(self.mails, "broken"), "w").close()
+        Site.status["/flaky"] = 502
+        self.watch()
+        out = self.watch()
+        self.assertEqual(len(Site.alerts), 1)
+        self.assertIn("1 alert(s) waiting", out)            # kept for the mail
+        self.watch()
+        self.assertEqual(len(Site.alerts), 1)               # ntfy is not sent again
+        os.remove(os.path.join(self.mails, "broken"))
+        out = self.watch()
+        self.assertIn("0 alert(s) waiting", out)
+        self.assertEqual(len(self.sent()), 1)
+        self.assertEqual(len(Site.alerts), 1)
+
+    def test_mail_alone_is_enough_and_waits_when_it_fails(self):
+        self.fake_mailer()
+        del self.env["MESH_WATCH_NTFY"]
+        Site.status["/flaky"] = 502
+        self.watch(); self.watch()
+        self.assertEqual(len(self.sent()), 1)
+
+    def test_a_mail_that_has_failed_for_hours_is_dropped_not_sent_late(self):
+        self.fake_mailer()
+        open(os.path.join(self.mails, "broken"), "w").close()
+        Site.status["/flaky"] = 502
+        self.watch(); self.watch()
+        st = os.path.join(self.dir, "state/state.json")
+        d = json.load(open(st)); d["pending"][0]["at"] = "2000-01-01T00:00:00Z"; json.dump(d, open(st, "w"))
+        out = self.watch()                                  # still broken, but too old to matter
+        self.assertIn("0 alert(s) waiting", out)
+        os.remove(os.path.join(self.mails, "broken"))
+        self.watch()
+        self.assertEqual(self.sent(), [])
+
+    def test_a_quiet_note_is_not_emailed_and_does_not_wait(self):
+        self.fake_mailer()
+        live = os.path.join(self.dir, "live.json")
+        json.dump({"ssh-x.example": "t", self.base.split("//")[1]: "t"}, open(live, "w"))
+        self.env.update(MESH_WATCH_DRIFT_MIN="60", MESH_WATCH_LIVE=live)
+        with open(self.env["MESH_WATCH_CONF"], "a") as f:
+            f.write("skip %s test server has no https\n" % self.base.split("//")[1])
+        drift = os.path.join(self.dir, "state/drift.json")
+        self.watch()
+        for _ in range(3):
+            d = json.load(open(drift)); d["fetched"] = "2000-01-01T00:00:00Z"; json.dump(d, open(drift, "w"))
+            out = self.watch()
+        self.assertEqual(len([a for a in Site.alerts if a["title"].startswith("note:")]), 1)
+        self.assertEqual(self.sent(), [])
+        self.assertIn("0 alert(s) waiting", out)
+
+    def test_a_subject_cannot_break_out_of_the_command(self):
+        self.fake_mailer()
+        with open(self.env["MESH_WATCH_CONF"], "a") as f:
+            f.write("extra %s/odd   it's \"odd\"; touch %s/pwned\n" % (self.base, self.dir))
+        Site.status["/odd"] = 500
+        self.watch(); self.watch()
+        self.assertEqual(len(self.sent()), 1)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "pwned")))
+
+    def test_heartbeat_emails_a_dead_monitor(self):
+        self.fake_mailer()
+        self.env.update(MESH_WATCH_RETRIES="0")
+        bin_ = os.path.join(self.dir, "bin")
+        os.makedirs(bin_)
+        with open(os.path.join(bin_, "ssh"), "w") as f:
+            f.write("#!/bin/sh\necho 'ssh: connect: Operation timed out' >&2\nexit 255\n")
+        os.chmod(os.path.join(bin_, "ssh"), 0o755)
+        env = dict(self.env, PATH=bin_ + ":/usr/bin:/bin")
+        for _ in range(3):
+            subprocess.run([SCRIPT, "heartbeat", "dorkyrobot2"], env=env, capture_output=True, text=True)
+        self.assertEqual(len(self.sent()), 1)
+        self.assertIn("is not watching", self.sent()[0][0])
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
