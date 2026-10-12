@@ -1,0 +1,24 @@
+# The machines cabled together over Thunderbolt, and the address each one
+# holds on its Thunderbolt Bridge. `mesh/build` turns every line into a
+# `<name>-tb` host in mesh.conf and pins the address in mesh_known_hosts.
+#
+#   name     as in mesh/machines
+#   address  fixed, on 192.168.2.0/24 — the subnet macOS Internet Sharing
+#            hands out, and .1 is the box that would do the sharing
+#
+# The cable is a chain, not a switch: mac2019 — dorkyrobot1 — dorkyrobot2 —
+# mini. Each Mac bridges its Thunderbolt ports, so the ends reach each other
+# through the middle two, and a middle box that is off splits the chain.
+#
+# The address is not installed from here; it is set once on the machine:
+#
+#   networksetup -setmanual "Thunderbolt Bridge" <address> 255.255.255.0
+#
+# No router on purpose: this is a path between these machines, and a router
+# here would offer the cable as a way out to the internet.
+
+# name       address
+dorkyrobot2  192.168.2.1
+dorkyrobot1  192.168.2.11
+mini         192.168.2.12
+mac2019      192.168.2.19
