@@ -111,7 +111,7 @@ do_list() {
 mesh_hosts() {
   local f="$HOME/.ssh/config.d/mesh.conf" i
   [ -r "$f" ] || return 0
-  awk '$1=="Host"{for(i=2;i<=NF;i++) if($i !~ /^cloudflare-/ && $i !~ /-lan$/ && $i !~ /\.local$/){print $i; break}}' "$f"
+  awk '$1=="Host"{for(i=2;i<=NF;i++) if($i !~ /^cloudflare-/ && $i !~ /-lan$/ && $i !~ /-tb$/ && $i !~ /\.local$/){print $i; break}}' "$f"
 }
 
 do_list_unknown() {
