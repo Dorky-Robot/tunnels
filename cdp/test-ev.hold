@@ -1,15 +1,16 @@
-hold      src/consent src/bin/optouts.rs tests/optouts.rs src/thread/sms.rs src/thread/files.rs src/thread/prune.rs docs/messaging.md docs/a2p-campaign.md
-hold      src/words/talk.rs src/words/people.rs tests/acts/golden.txt
-hold      KITA_REV tests/acts.rs src/bin/migrate.rs src/import.rs src/bin/import.rs src/bin/unbundle.rs src/bin/together.rs src/bin/transcripts.rs
-hold      src/bin/twilio_leftovers.rs src/bin/scrub.rs
-hold      .env* run.sh release.sh ship.sh smoke.sh check.sh src/auth.rs src/push.rs assets
-holdline  * may_text|may_automate|may_ask|text_wall|twilio_wall|twilio-blocked|consent-by|TCPA
-holdline  src/** opt-?out|\bSTOP\b|\bHELP\b
-holdline  docs/messaging.md opt-?out|\bSTOP\b|\bHELP\b
-holdline  docs/a2p-campaign.md opt-?out|\bSTOP\b|\bHELP\b
-holdline  * pub const SAYS|consent_ask_text
-holdline  * retract\(|untag\(|unmake
-holdline  * EV_SEND_FILES|EV_TWILIO_PRUNE|EV_SUGGEST_DEMO|EV_USAGE|EV_PUSH_ALLOW|EV_TWILIO_ALLOW|EV_STAGING_WIRE|EV_DEV_STAFF|EV_PUBLIC_URL|EV_INTAKE_KEY|EV_COOKIE_KEY
-holdline  *.sh DELETE |DROP |rm -rf
-holdline  Cargo.toml ^kita *=
-holdline  Cargo.lock kita
+hold      consent: src/consent src/bin/optouts.rs tests/optouts.rs src/thread/sms.rs src/thread/files.rs src/thread/prune.rs docs/messaging.md docs/a2p-campaign.md
+holdline  consent: * may_text|may_automate|may_ask|text_wall|twilio_wall|twilio-blocked|consent-by|TCPA
+holdline  consent: src/** opt-?out|\bSTOP\b|\bHELP\b
+holdline  consent: docs/messaging.md opt-?out|\bSTOP\b|\bHELP\b
+holdline  consent: docs/a2p-campaign.md opt-?out|\bSTOP\b|\bHELP\b
+hold      wording: src/words/talk.rs src/words/people.rs
+holdline  wording: * pub const SAYS|consent_ask_text
+hold      acts: KITA_REV tests/acts/golden.txt tests/acts.rs src/bin/migrate.rs src/import.rs src/bin/import.rs src/bin/unbundle.rs src/bin/together.rs src/bin/transcripts.rs
+holdline  acts: Cargo.toml ^kita *=
+holdline  acts: Cargo.lock kita
+hold      delete: src/bin/twilio_leftovers.rs src/bin/scrub.rs
+holdline  delete: * retract\(|untag\(|unmake
+holdline  delete: *.sh DELETE |DROP |rm -rf
+holdline  flags: * EV_SEND_FILES|EV_TWILIO_PRUNE|EV_SUGGEST_DEMO|EV_USAGE|EV_PUSH_ALLOW|EV_TWILIO_ALLOW|EV_STAGING_WIRE|EV_DEV_STAFF|EV_PUBLIC_URL|EV_INTAKE_KEY|EV_COOKIE_KEY
+hold      flags: .env* src/auth.rs src/push.rs assets
+hold      deploy: run.sh release.sh ship.sh smoke.sh check.sh
