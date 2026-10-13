@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.dorkyrobot.cdp</string>
+  <!-- Continuous deployment on dorkyrobot2: cdp/cdp.sh, policy in
+       mesh-lead/cd/policy.md. A user LaunchAgent, because the gate and the
+       ship need this user's ssh keys, cargo and checkouts. NOT installed by
+       mesh/install.sh yet: Felix approves the policy first. -->
+  <key>ProgramArguments</key><array>
+    <string>/bin/sh</string>
+    <string>/Users/dorkyrobot2/Projects/dorky_robot/tunnels/cdp/cdp.sh</string>
+    <string>tick</string>
+  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>HOME</key><string>/Users/dorkyrobot2</string>
+    <key>PATH</key><string>/Users/dorkyrobot2/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <!-- By the clock, every minute: after the macOS 27 upgrade (2026-09-23)
+       only StartCalendarInterval jobs ran. An empty dict is "every minute".
+       A tick that finds nothing new costs one git fetch per product and one
+       sample of its signals; a tick that finds a running one for the same
+       product (a gate takes minutes) says so and leaves. -->
+  <key>StartCalendarInterval</key><dict/>
+  <key>StandardOutPath</key><string>/Users/dorkyrobot2/Library/Logs/cdp.log</string>
+  <key>StandardErrorPath</key><string>/Users/dorkyrobot2/Library/Logs/cdp.log</string>
+</dict></plist>
