@@ -349,6 +349,20 @@ class MeshWatch(unittest.TestCase):
         self.assertTrue(self.sent()[1][0].startswith("[mesh-watch] back:"))
         self.assertEqual(len(Site.alerts), 2)               # ntfy is unchanged
 
+    def test_a_mail_command_in_the_env_file_keeps_the_quote_it_ends_with(self):
+        # dorkyrobot2 mails through the mini: ssh macmini "tao notify … {subject}".
+        # Stripping quotes off the ends of the value cut that command in half.
+        self.fake_mailer()
+        cmd = self.env.pop("MESH_WATCH_MAIL_CMD").replace(" {subject}", "")
+        with open(self.env["MESH_WATCH_ENV"], "w") as f:
+            f.write('MESH_WATCH_NTFY="%s/topic"\nMESH_WATCH_MAIL_CMD=/bin/sh -c "%s {subject}"\n' % (self.base, cmd))
+        self.env.pop("MESH_WATCH_NTFY", None)
+        Site.status["/flaky"] = 502
+        self.watch(); self.watch(); self.watch()
+        self.assertEqual(len(self.sent()), 1)
+        self.assertTrue(self.sent()[0][0].startswith("[mesh-watch] down:"), self.sent())
+        self.assertEqual(len(Site.alerts), 1)               # and a quoted pair is still taken off
+
     def test_a_dead_mail_path_never_holds_back_ntfy_and_mail_catches_up(self):
         self.fake_mailer()
         open(os.path.join(self.mails, "broken"), "w").close()

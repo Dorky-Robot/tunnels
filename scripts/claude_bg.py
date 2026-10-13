@@ -64,7 +64,12 @@ def load_env():
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 k, v = line.split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+                v = v.strip()
+                # Only a pair around the whole value is quoting. A command
+                # that ends in a quote (ssh macmini "…") keeps it.
+                if len(v) > 1 and v[0] == v[-1] and v[0] in "'\"":
+                    v = v[1:-1]
+                os.environ.setdefault(k.strip(), v)
 
 
 def run(argv, timeout, cwd=None):
