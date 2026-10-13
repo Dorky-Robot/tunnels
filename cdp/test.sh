@@ -45,6 +45,8 @@ commit() { git add -A; git commit -qm "$1"; git push -q origin HEAD:main 2>/dev/
 live() { cat "$CD_STATE/demo.shipped"; }
 floor() { cat "$CD_STATE/demo.floor"; }
 prodok() { grep -q '"ok":true' "$T/prod/health"; }
+# prod has main's tree (its sha is main's until the first ship past a hold, then a deploy-ref commit)
+onmain() { [ "$(git rev-parse "$(live)^{tree}")" = "$(git rev-parse "HEAD^{tree}")" ]; }
 ships() { grep -c . "$CD_STATE/demo.ships" 2>/dev/null || echo 0; }
 
 echo "1 kill switch on: proven but not shipped"
@@ -54,7 +56,7 @@ Ready: demo/one"
 $CDP tick demo 2>&1 | grep -q "kill switch is on" && [ "$(live)" = "$LIVE" ] && ok "gate+smoke ran, nothing shipped" || no "stop"
 echo "2 switch off: a good commit ships, and the line says what the swap felt like"
 $CDP go >/dev/null; out=$($CDP tick demo 2>&1)
-[ "$(live)" = "$(git rev-parse HEAD)" ] && [ "$(cat "$T/prod/app.txt")" = v2 ] && ok "shipped v2" || { no "good ship"; echo "$out"; }
+onmain && [ "$(cat "$T/prod/app.txt")" = v2 ] && ok "shipped v2" || { no "good ship"; echo "$out"; }
 echo "$out" | grep -q "shipped demo .* (1 commits) · blip: 0 failed, 0 slow of [1-9][0-9]* probes" && ok "the ship line counts the blip: none" || { no "blip line"; echo "$out"; }
 [ ! -e "$T/offlist" ] && ok "tagged commit: not on the off-list" || no "offlist"
 echo "3 bad deploy: prod answers ok:false, auto-rollback in seconds"
@@ -68,12 +70,12 @@ echo "4 the fix takes the same route; a failing gate does not ship"
 echo '{"ok":true}' > health.json; echo 'exit 1' > gate.sh; commit "v4 fix, gate red"
 $CDP tick demo 2>&1 | grep -q "gate failed" && [ "$(live)" = "$GOOD" ] && ok "gate red: nothing shipped" || no "gate"
 echo 'exit 0' > gate.sh; commit "v5 gate green"
-$CDP tick demo >/dev/null 2>&1; [ "$(live)" = "$(git rev-parse HEAD)" ] && [ "$(cat "$T/prod/app.txt")" = v3 ] && ok "the fix shipped through gate, smoke, prod and watch" || no "v5"
+$CDP tick demo >/dev/null 2>&1; onmain && [ "$(cat "$T/prod/app.txt")" = v3 ] && ok "the fix shipped through gate, smoke, prod and watch" || no "v5"
 echo "5 holds"
 echo x > migrations/001.sql; commit "add a migration"
 $CDP tick demo 2>&1 | grep -q "held demo .*: migrations/001.sql touches 'migrations'. Release: cdp ship demo" && ok "migration path holds" || no "hold"
 $CDP tick demo 2>&1 | grep -q . && no "held twice" || ok "told once"
-before=$(live); $CDP ship demo "$(git rev-parse HEAD)" >/dev/null 2>&1; [ "$(live)" = "$(git rev-parse HEAD)" ] && ok "cdp ship releases the hold" || no "release hold"
+before=$(live); $CDP ship demo "$(git rev-parse HEAD)" >/dev/null 2>&1; onmain && ok "cdp ship releases the hold" || no "release hold"
 echo 2 > app.txt; commit "tiny change
 
 Hold: flag turns on a client-visible thing"
@@ -106,9 +108,11 @@ $CDP tick demo 2>&1 | grep -q . && no "a second tick did something" || ok "a sec
 echo past2 > app.txt; commit "D4: another independent one"; out=$($CDP tick demo 2>&1)
 echo "$out" | grep -q "shipped demo .* (1 commits)" && [ "$(cat "$T/prod/app.txt")" = past2 ] && ok "D4 ships past H too" || { no "D4"; echo "$out"; }
 echo "$out" | grep -q "held demo" && no "H announced again" || ok "H is not announced again"
-out=$($CDP ship demo "$H" 2>&1)
-[ "$(live)" = "$(git rev-parse HEAD)" ] && [ "$(floor)" = "$(git rev-parse HEAD)" ] && git cat-file -e "$(live):other.txt" \
-  && echo "$out" | grep -q "shipped demo .* (3 commits)" && ok "releasing H ships H, D2 and D3 as main itself; the floor catches up" || { no "release"; echo "$out"; }
+out=$($CDP ship demo "$H" 2>&1); M=$(git rev-parse HEAD)
+[ "$(git rev-parse "$(live)^{tree}")" = "$(git rev-parse "$M^{tree}")" ] && [ "$(git rev-parse "$(live)^2")" = "$M" ] && [ "$(floor)" = "$M" ] \
+  && echo "$out" | grep -q "shipped demo .* (3 commits)" && ok "releasing H ships H, D2 and D3: main's tree, main as a parent, the floor catches up" || { no "release"; echo "$out"; }
+git -C "$T/origin.git" merge-base --is-ancestor "$C" "$(live)" && ok "prod only ever fast-forwards along refs/cd/demo" || no "ff"
+echo k > app.txt; commit "on main again"; $CDP tick demo >/dev/null 2>&1; onmain && [ "$(git rev-parse "$(live)^2")" = "$(git rev-parse HEAD)" ] && ok "with nothing waiting, the next ship is main's tree with main as a parent" || no "back on main"
 echo "7 hold groups: each is its own switch, and the switch itself holds"
 cat >> .cd <<'CFG'
 hold      words: src/words
@@ -120,20 +124,20 @@ echo "off words" >> .cd; commit "turn the words group off"
 $CDP tick demo 2>&1 | grep -q "held demo .*: .cd touches '.cd'" && ok "turning a group off holds for Felix" || no "off holds"
 $CDP ship demo "$(git rev-parse HEAD)" >/dev/null 2>&1
 echo e >> src/words/talk.txt; echo 'pub const SAYS' >> app.txt; commit "wording edit with the group off"
-out=$($CDP tick demo 2>&1); [ "$(live)" = "$(git rev-parse HEAD)" ] && ok "with the group off, its path and line rules are off" || { no "group off"; echo "$out"; }
+out=$($CDP tick demo 2>&1); onmain && ok "with the group off, its path and line rules are off" || { no "group off"; echo "$out"; }
 echo f >> migrations/001.sql; commit "a migration with words off"; $CDP tick demo 2>&1 | grep -q "held demo" && ok "the other groups still hold" || no "other groups"
 $CDP ship demo "$(git rev-parse HEAD)" >/dev/null 2>&1
 echo "off nosuch" >> .cd; commit "off for a group that does not exist"; $CDP ship demo "$(git rev-parse HEAD)" >/dev/null 2>&1
 echo g > app.txt; commit "harmless"; $CDP tick demo 2>&1 | grep -q "held demo .*off rule 'nosuch' names no hold group" && ok "an off that names no group holds the line" || no "dead off"
 sed -i.b '/off nosuch/d' .cd; rm .cd.b; echo "off builtin" >> .cd; commit "builtin off"; $CDP ship demo "$(git rev-parse HEAD)" >/dev/null 2>&1
-echo p > x.plist; commit "a plist"; out=$($CDP tick demo 2>&1); [ "$(live)" = "$(git rev-parse HEAD)" ] && ok "builtin off: a plist ships" || { no "builtin off"; echo "$out"; }
+echo p > x.plist; commit "a plist"; out=$($CDP tick demo 2>&1); onmain && ok "builtin off: a plist ships" || { no "builtin off"; echo "$out"; }
 echo "8 signals: an anomaly rolls back; two rollbacks pause the product"
 GOOD=$(live); printf 'cp health.json %s/prod/health; echo 9 > %s/prod/errors\n' "$T" "$T" > prod.sh; commit "a build that errors"
 out=$($CDP tick demo 2>&1); echo "$out" | grep -q "ROLLED BACK demo .* in [0-9]*s: errors is '9', not max 5, 2 in a row" && [ "$(live)" = "$GOOD" ] && ok "errors over max: rolled back" || { no "errors"; echo "$out"; }
 echo "$out" | grep -q "PAUSED demo: 2 rollbacks today" && [ -e "$CD_HOME/STOP.demo" ] && ok "second rollback of the day: paused, one alert" || { no "breaker"; echo "$out"; }
 printf 'cp health.json %s/prod/health; cp app.txt %s/prod/app.txt\n' "$T" "$T" > prod.sh; commit "a good build"
 $CDP tick demo 2>&1 | grep -q "proven on staging; not shipped: kill switch is on" && [ "$(live)" = "$GOOD" ] && ok "paused: proven, not shipped" || no "paused"
-$CDP go demo >/dev/null; out=$($CDP tick demo 2>&1); [ "$(live)" = "$(git rev-parse HEAD)" ] && ok "cdp go <product> lets it ship" || { no "go product"; echo "$out"; }
+$CDP go demo >/dev/null; out=$($CDP tick demo 2>&1); onmain && ok "cdp go <product> lets it ship" || { no "go product"; echo "$out"; }
 GOOD=$(live); printf 'cp health.json %s/prod/health; echo 3 > %s/prod/asks\n' "$T" "$T" > prod.sh; commit "a build that loses asks"
 out=$($CDP tick demo 2>&1); echo "$out" | grep -q "ROLLED BACK demo .*: asks is '3', not at least 0.5 × 10" && [ "$(live)" = "$GOOD" ] && ok "asks under half the baseline: rolled back" || { no "baseline"; echo "$out"; }
 echo "$out" | grep -q "PAUSED demo: 3 rollbacks today" && [ -e "$CD_HOME/STOP.demo" ] && ok "a third rollback after a go pauses again" || { no "paused again"; echo "$out"; }; $CDP go demo >/dev/null
@@ -143,9 +147,9 @@ PREV=$(cat "$CD_STATE/demo.previous"); echo 9 > "$T/prod/errors"
 out=$($CDP tick demo 2>&1); echo "$out" | grep -q . && { no "one bad sample acted"; echo "$out"; } || ok "one bad sample is noise"
 out=$($CDP tick demo 2>&1); echo "$out" | grep -q "ROLLED BACK demo .*: errors is '9', not max 5, 2 in a row, [0-9]*s after the ship. Back on $(echo "$PREV" | cut -c1-8)" \
   && [ "$(live)" = "$PREV" ] && ok "two in a row inside the undo window: the last ship is rolled back" || { no "late rollback"; echo "$out"; }
-$CDP go demo >/dev/null; echo h > app.txt; commit "after the late rollback"; out=$($CDP tick demo 2>&1); [ "$(live)" = "$(git rev-parse HEAD)" ] && ok "the line goes on from there" || { no "after late"; echo "$out"; }
+$CDP go demo >/dev/null; echo h > app.txt; commit "after the late rollback"; out=$($CDP tick demo 2>&1); onmain && ok "the line goes on from there" || { no "after late"; echo "$out"; }
 sed -i.b '$s/ [0-9]*$/ 1000/' "$CD_STATE/demo.ships"; rm "$CD_STATE/demo.ships.b"; echo 9 > "$T/prod/errors"; $CDP tick demo >/dev/null 2>&1
-out=$($CDP tick demo 2>&1); echo "$out" | grep -q "PAUSED demo: errors is '9'.*not the suspect" && [ -e "$CD_HOME/STOP.demo" ] && [ "$(live)" = "$(git rev-parse HEAD)" ] \
+out=$($CDP tick demo 2>&1); echo "$out" | grep -q "PAUSED demo: errors is '9'.*not the suspect" && [ -e "$CD_HOME/STOP.demo" ] && onmain \
   && ok "outside the window: paused, not rolled back" || { no "old ship"; echo "$out"; }
 out=$($CDP tick demo 2>&1); echo "$out" | grep -q PAUSED && { no "alerted twice"; echo "$out"; } || ok "told once"; echo 0 > "$T/prod/errors"; $CDP go demo >/dev/null
 echo "10 the blip probe sees a swap that drops the face"
@@ -154,8 +158,8 @@ $CDP tick demo 2>&1 | grep -q "blip: [1-9][0-9]* failed, 0 slow of [0-9]* probes
 printf 'cp health.json %s/prod/health; cp app.txt %s/prod/app.txt\n' "$T" "$T" > prod.sh; commit "atomic again"; $CDP tick demo >/dev/null 2>&1
 echo "11 one tick at a time per product"
 mkdir "$CD_STATE/demo.lock"; echo $$ > "$CD_STATE/demo.lock/pid"; echo i > app.txt; commit "while a tick runs"
-$CDP tick demo 2>&1 | grep -q "a tick is still running" && [ "$(live)" != "$(git rev-parse HEAD)" ] && ok "a live tick keeps the next one out" || no "lock"
-echo 99999999 > "$CD_STATE/demo.lock/pid"; out=$($CDP tick demo 2>&1); [ "$(live)" = "$(git rev-parse HEAD)" ] && ok "a dead tick's lock is taken over" || { no "stale lock"; echo "$out"; }
+$CDP tick demo 2>&1 | grep -q "a tick is still running" && ! onmain && ok "a live tick keeps the next one out" || no "lock"
+echo 99999999 > "$CD_STATE/demo.lock/pid"; out=$($CDP tick demo 2>&1); onmain && ok "a dead tick's lock is taken over" || { no "stale lock"; echo "$out"; }
 echo 'sleep 2; exit 0' > gate.sh; echo j > app.txt; commit "slow gate"; n=$(ships)
 $CDP tick demo > "$T/t1" 2>&1 & sleep 0.5; $CDP tick demo > "$T/t2" 2>&1; wait
 grep -q "a tick is still running" "$T/t2" && [ "$(ships)" = $((n+1)) ] && ok "two ticks a minute apart: one ship, no overlap" || { no "overlap"; cat "$T/t1" "$T/t2"; }

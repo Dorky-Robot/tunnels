@@ -25,10 +25,11 @@
 #
 # Ship-past: every commit of main since the floor is judged on its own diff.
 # A commit that holds, and every later commit that touches one of its files
-# (or says `Needs: <sha>`), is withheld; the rest ship as one candidate: main
-# with the withheld commits reverted on top, gated and proven as its own tree
-# and pushed to refs/cd/<product> so the desk's own release path can fetch
-# it. When nothing is withheld the candidate is main itself.
+# (or says `Needs: <sha>`), is withheld; the rest ship as one candidate, a
+# fast-forward of what is live: the non-withheld commits cherry-picked onto
+# it, gated and proven as its own tree and pushed to refs/cd/<product>, which
+# prod follows like a branch. When nothing waits the candidate is main
+# itself, or a catch-up merge whose tree is main's.
 set -u
 CD_HOME=${CD_HOME:-$HOME/.config/cdp}
 CD_STATE=${CD_STATE:-$HOME/.local/state/cdp}
@@ -124,7 +125,7 @@ hold_reason() { FROM=$1; TO=$2
 # WAITS (one line per commit that waits behind another). A commit waits when
 # it holds on its own diff (unless Felix released it), says `Needs: <sha>` of
 # a waiting commit, or touches a file a waiting commit touched. Main is
-# walked by first parent, so a merge is one unit, reverted with -m 1.
+# walked by first parent, so a merge is one unit, picked with -m 1.
 judge() { WITHHELD=; FIRSTHELD=; WAITS=; wf=$CD_STATE/$P.wfiles; : > "$wf"
   for c in $(git -C "$DIR" rev-list --first-parent --reverse "$FLOOR..$TARGET"); do
     cf=$(git -c core.quotePath=false -C "$DIR" diff --no-renames --name-only "$c^" "$c" 2>/dev/null)
@@ -148,19 +149,32 @@ judge() { WITHHELD=; FIRSTHELD=; WAITS=; wf=$CD_STATE/$P.wfiles; : > "$wf"
     esac
   done
 }
-# Main with the withheld commits reverted, newest first, as a commit whose sha
-# is the same each tick (fixed author, dates and message), so a candidate is
-# gated once and a failed one is not retried. Prints the sha; nothing if a
-# revert does not apply, in which case the whole line waits.
+# The candidate: what prod moves to next, always a fast-forward of what is
+# live, so a desk whose release path is `merge --ff-only` can follow
+# refs/cd/<product> like a branch. With nothing withheld it is main itself
+# (or, when prod is off main, a catch-up merge whose tree is main's, with
+# main as its second parent). With something withheld it is LIVE plus the
+# non-withheld commits not yet in it, cherry-picked in main's order. Fixed
+# committer and dates make the sha the same each tick, so a candidate is
+# gated once and a failed one is not retried. Prints the sha; nothing when
+# a pick does not apply, in which case the whole line waits.
 candidate() {
-  [ -n "$WITHHELD" ] || { echo "$TARGET"; return; }
-  git -C "$W" checkout -q --detach "$TARGET" || return
-  d=$(git -C "$DIR" log -1 --format=%cI "$TARGET")
-  for w in $(echo "$WITHHELD" | tr ' ' '\n' | grep . | sed '1!G;h;$!d'); do
-    m=; [ "$(git -C "$DIR" rev-list --parents -n1 "$w" | wc -w)" -le 2 ] || m="-m 1"
-    GIT_AUTHOR_DATE=$d GIT_COMMITTER_DATE=$d git -C "$W" -c user.name=cdp -c user.email=cdp@mesh \
-      revert --no-edit $m "$w" >/dev/null 2>&1 || { git -C "$W" revert --abort 2>/dev/null; git -C "$W" checkout -q --detach "$TARGET"
-        say "$P: the revert of $(short "$w") does not apply on main; the line waits" >&2; return; }
+  export GIT_AUTHOR_NAME=cdp GIT_AUTHOR_EMAIL=cdp@mesh GIT_COMMITTER_NAME=cdp GIT_COMMITTER_EMAIL=cdp@mesh
+  GIT_COMMITTER_DATE=$(git -C "$DIR" log -1 --format=%cI "$TARGET"); export GIT_COMMITTER_DATE; export GIT_AUTHOR_DATE=$GIT_COMMITTER_DATE
+  if [ -z "$WITHHELD" ]; then
+    if git -C "$DIR" merge-base --is-ancestor "$LIVE" "$TARGET"; then echo "$TARGET"
+    elif [ "$(git -C "$DIR" rev-parse "$LIVE^{tree}")" = "$(git -C "$DIR" rev-parse "$TARGET^{tree}")" ]; then echo "$LIVE"
+    else git -C "$DIR" commit-tree "$TARGET^{tree}" -p "$LIVE" -p "$TARGET" -m "cd: main at $(short "$TARGET"), nothing waits"; fi
+    return
+  fi
+  git -C "$W" checkout -q --detach "$LIVE" || return
+  was=" $(st included | tr '\n' ' ') "
+  for c in $(git -C "$DIR" rev-list --first-parent --reverse "$FLOOR..$TARGET"); do
+    case " $WITHHELD " in *" $c "*) continue ;; esac
+    case "$was" in *" $c "*) continue ;; esac
+    m=; [ "$(git -C "$DIR" rev-list --parents -n1 "$c" | wc -w)" -le 2 ] || m="-m 1"
+    git -C "$W" cherry-pick --allow-empty $m "$c" >/dev/null 2>&1 || { git -C "$W" cherry-pick --abort 2>/dev/null; git -C "$W" checkout -q --detach "$LIVE"
+      say "$P: $(short "$c") does not apply on what is live without what waits; the line waits" >&2; return; }
   done
   git -C "$W" rev-parse HEAD
 }
@@ -283,7 +297,7 @@ watch_between() {
   prev=$(st previous)
   if [ -n "$last" ] && [ -n "$prev" ] && [ $(( $(now_s) - last )) -lt "$u" ] && [ "$prev" != "$LIVE" ]; then
     short=$(short "$LIVE"); CAND=$LIVE
-    roll "$a, $(( $(now_s) - last ))s after the ship" "$prev" && { put shipped "$prev"; put floor "$(st pfloor)"; }
+    roll "$a, $(( $(now_s) - last ))s after the ship" "$prev" && { put shipped "$prev"; put floor "$(st pfloor)"; put included "$(st pincluded)"; }
   else
     has alerted "${a%% *}" || { printf '%s\n' "${a%% *}" >> "$CD_STATE/$P.alerted"; touch "$CD_HOME/STOP.$P"
       ntfy "PAUSED $P: $a, and the last ship is older than ${u}s, so it is not the suspect. Nothing new ships until: cdp go $P"; }
@@ -321,7 +335,8 @@ record_ship() {
     for c in $srcs; do set -- "$@" --source "commit $P@$c"; done
     "${CD_ORG:-$HOME/Projects/dorky_robot/org-kita/target/debug/org}" "$@" >/dev/null 2>&1 || say "org log write failed (not blocking)"
   fi
-  put previous "$LIVE"; put pfloor "$FLOOR"; put included "$(echo "$srcs" | tr ' ' '\n')"
+  put previous "$LIVE"; put pfloor "$FLOOR"; put pincluded "$(st included)"
+  put included "$(echo "$srcs" | tr ' ' '\n')"
   date +"%F %T $CAND $(now_s)" >> "$CD_STATE/$P.ships"; put shipped "$CAND"; put floor "$(new_floor)"
   w=$(echo "$WITHHELD" | wc -w | tr -d ' '); behind=; [ "$w" = 0 ] || behind=" · $w wait behind $(short "$FIRSTHELD")"
   ntfy "shipped $P $short ($n commits) · blip: $BLIP$behind · rollback: $(cfg rollback | head -c 60)"
