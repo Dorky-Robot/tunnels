@@ -17,7 +17,8 @@
 # State (CD_STATE, default ~/.local/state/cdp): per product, the last shipped
 # sha, the held and failed sha, and a line per prod deploy (for the daily cap).
 # Each repo's own <checkout>/.cd says how to gate, stage, smoke, ship, roll
-# back and watch it. It is read from the LIVE commit, so a commit cannot
+# back and watch it, and what holds for Felix (`hold <globs>`, `holdline <glob>
+# <ERE>`; both may repeat). It is read from the LIVE commit, so a commit cannot
 # loosen the rules it is itself judged by.
 set -u
 CD_HOME=${CD_HOME:-$HOME/.config/cdp}
@@ -38,16 +39,42 @@ cfgall() { git -C "$DIR" show "$LIVE:.cd" 2>/dev/null | sed -n "s/^$1[[:space:]]
 sub() { printf '%s' "$1" | sed "s/{sha}/$2/g"; }
 
 # ── policy checks ──
-# a path or a commit message that needs Felix's yes; empty when nothing does
+# The paths on stdin that glob $1 covers. sh `case` globs, which let * cross
+# a /; a name counts at any depth and a directory covers what is under it.
+covered() { g=${1%/}; g=${g%/\*\*}; while IFS= read -r f; do
+  # shellcheck disable=SC2254
+  case "$f" in $g|$g/*|*/$g|*/$g/*) printf '%s\n' "$f" ;; esac
+done; }
+# the lines a diff on stdin adds or removes, without their + or -
+changed() { awk '/^diff --git/{h=1} /^@@/{h=0;next} !h && /^[+-]/{print substr($0,2)}'; }
+# `holdline <glob> <ERE>`: hold when a line added or removed in a file the
+# glob covers matches. For what has no path of its own: a word, a flag, a pin.
+hold_lines() {
+  cfgall holdline | while read -r g re; do
+    [ -n "$re" ] && { echo | grep -qE -- "$re"; [ $? -le 1 ]; } || { echo "hold rule '$g $re' is not a pattern grep can read"; exit; }
+    [ -n "$(echo "$tracked" | covered "$g" | head -1)" ] || { echo "hold rule '$g $re' matches no file"; exit; }
+    fs=$(echo "$files" | covered "$g"); [ -n "$fs" ] || continue
+    hit=$(echo "$fs" | tr '\n' '\0' | xargs -0 git --literal-pathspecs -C "$DIR" diff --no-renames -U0 "$LIVE" "$TARGET" -- | changed | grep -E -m1 -- "$re")
+    [ -z "$hit" ] || { echo "a changed line matches holdline '$g': $(printf '%s' "$hit" | cut -c1-80)"; exit; }
+  done
+}
+# a path, a line or a commit message that needs Felix's yes; empty when nothing does
 hold_reason() {
-  files=$(git -C "$DIR" diff --name-only "$LIVE" "$TARGET" 2>/dev/null) || { echo "cannot read the diff"; return; }
+  set -f   # we are inside $( ): keep every glob a pattern, never the cwd's files
+  # --no-renames: a held file that moves must still show under its held name
+  files=$(git -c core.quotePath=false -C "$DIR" diff --no-renames --name-only "$LIVE" "$TARGET" 2>/dev/null) || { echo "cannot read the diff"; return; }
   [ -n "$files" ] || { echo "empty diff"; return; }
-  # sh `case` globs, which let * cross a /; the defaults hold for everything
-  globs="$(cfgall hold) .cd *.plist *migrat* *schema* *consent* *optout* *opt-out* *stop_gate* *tcpa* *dns* *billing* *payment*"
-  for f in $files; do for g in $globs; do
-    # shellcheck disable=SC2254
-    case "$f" in $g|$g/*|*/$g|*/$g/*) echo "$f touches '$g'"; return ;; esac
-  done; done
+  # A rule that matches nothing protects nothing: a typo or a moved file would
+  # let the very change it was written for ship. Rules and files both from LIVE.
+  tracked=$(git -c core.quotePath=false -C "$DIR" ls-tree -r --name-only "$LIVE") || { echo "cannot list the live files"; return; }
+  for g in $(cfgall hold); do
+    [ -n "$(echo "$tracked" | covered "$g" | head -1)" ] || { echo "hold rule '$g' matches no file"; return; }
+  done
+  # the defaults hold for every product, whether or not it has such a file
+  for g in $(cfgall hold) .cd *.plist *migrat* *schema* *consent* *optout* *opt-out* *stop_gate* *tcpa* *dns* *billing* *payment*; do
+    f=$(echo "$files" | covered "$g" | head -1); [ -z "$f" ] || { echo "$f touches '$g'"; return; }
+  done
+  r=$(hold_lines); [ -z "$r" ] || { echo "$r"; return; }
   git -C "$DIR" log --format=%B "$LIVE..$TARGET" | grep -qi '^Hold:' && { echo "a commit says Hold:"; return; }
   # only the LIVE commit must have a .cd at all: no rules, no shipping
   cfg prod >/dev/null || true
