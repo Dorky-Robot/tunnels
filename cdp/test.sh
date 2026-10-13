@@ -104,6 +104,7 @@ evheld "opt-outs: src/bin/optouts.rs"         add src/bin/optouts.rs "// x"
 evheld "consent moved out of src/consent"     git mv src/consent/legal.rs src/desk/legal.rs
 evheld "may_text called from the desk"        add src/desk/mod.rs "if may_text(c) { send() }"
 evheld "the word STOP in a string"            add src/day/mod.rs 'let s = "Reply STOP to end";'
+evheld "STOP added to docs/messaging.md"      add docs/messaging.md "Reply STOP to end"
 evheld "wording: src/words/talk.rs"           add src/words/talk.rs "// x"
 evheld "wording: consent_ask_text elsewhere"  add src/desk/mod.rs "let t = consent_ask_text(p);"
 evheld "what an act means: golden.txt"        add tests/acts/golden.txt "act"
@@ -119,6 +120,7 @@ evheld "the deploy path: release.sh"          add release.sh "# x"
 evheld "the service worker: assets/"          add assets/sw.js "// x"
 echo "8 Everyday Vet: ordinary work still ships"
 evships "desk code and a doc"                 eval 'add src/desk/mod.rs "fn stopped() {} // STOPPED, helpful"; add docs/desk.md "more"'
+evships "STOP, HELP and opt-out in a handoff"  eval 'add HANDOFF.md "STOP and HELP replies, the opt-out list"; add docs/desk.md "Reply STOP to opt out"'
 evships "a dependency that is not kita"       swap Cargo.toml 1.0.1 1.0.2
 echo "9 a hold rule that matches no file holds the line"
 add .cd "hold      src/optout* migrations/"; commit "rules for files this repo does not have"
