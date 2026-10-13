@@ -24,7 +24,8 @@ FIXTURES = os.path.join(REPO, "tests/fixtures")
 
 # world.json: "agents" as `claude agents --json --all` shows them, plus
 # "rc" (does a started session reach Remote Control), "broken" (does the
-# list fail) and "flags" (respawnFlags a revived session is saved with).
+# list fail), "flags" (respawnFlags a revived session is saved with) and
+# "deaf" (does a note sent by name fail to arrive).
 FAKE_CLAUDE = r'''#!/usr/bin/python3
 import json, os, sys, random, subprocess
 W = os.environ["FAKE_WORLD"]; JOBS = os.environ["CLAUDE_JOBS"]
@@ -56,12 +57,17 @@ if a[:1] == ["respawn"]:
     for e in w["agents"]:
         if e.get("id") == a[1]: e["pid"] = proc()
     save(); print("respawned " + a[1]); sys.exit(0)
+if a[:1] == ["-p"]:                    # the one-shot that SendMessages a note by name
+    print("FAILED: no session by that name" if w.get("deaf") else "SENT"); sys.exit(0)
 if a[:2] == ["--bg", "--resume"]:
     sid, rest = a[2], a[3:]
-    job = [e for e in w["agents"] if e.get("sessionId") == sid and e.get("kind") == "background"]
-    if job and len(rest) == 1:          # no flags: wake in place
-        job[0]["pid"] = proc(); job[0]["startedAt"] += 1
-        save(); print("note: woke session %s with its saved options.\nbackgrounded \x1b[36m·\x1b[0m %s · %s" % (job[0]["id"], job[0]["id"], job[0]["name"])); sys.exit(0)
+    if "-n" not in rest:
+        # The flaw: no flags and a prompt can start a NEW session under a
+        # name of its own instead of waking the old one. Nothing may do this.
+        nid = "%08x" % random.getrandbits(32)
+        w["agents"].append({"pid": proc(), "id": nid, "kind": "background", "startedAt": 9e12,
+                            "sessionId": nid + "-new", "name": "projects-%s" % nid[:2], "cwd": os.getcwd()})
+        save(); print("backgrounded · %s · projects-%s" % (nid, nid[:2])); sys.exit(0)
     name = rest[rest.index("-n") + 1]
     nid = "%08x" % random.getrandbits(32)
     w["agents"].append({"pid": proc(), "id": nid, "kind": "background", "startedAt": 9e12,
@@ -224,14 +230,18 @@ class LeadKeeper(unittest.TestCase):
         self.kill("aaaa0001")
         self.assertEqual(self.run_(), "")              # one pass could be a respawn
         self.assertEqual(self.revivals(), [])
+        names = sorted(e["name"] for e in self.world()["agents"])
         out = self.run_()
-        wake = self.calls("--bg")
-        self.assertEqual(len(wake), 1)
-        # no flags: flags would start a copy instead of waking this one
-        self.assertEqual(wake[0]["argv"][:3], ["--bg", "--resume", "aaaa0001-0000-4000-8000-000000000000"])
-        self.assertEqual(len(wake[0]["argv"]), 4)
-        self.assertIn('SendMessage CTO: "Mesh back"', wake[0]["argv"][3])
+        # woken in place, by id and with no text: text can start a new session
+        self.assertEqual(self.calls("--bg"), [])
+        wake = self.calls("respawn")
+        self.assertEqual([c["argv"] for c in wake], [["respawn", "aaaa0001"]])
         self.assertEqual(wake[0]["cwd"], self.cwd)
+        self.assertEqual(sorted(e["name"] for e in self.world()["agents"]), names)   # nobody new, nobody renamed
+        told = self.calls("-p")
+        self.assertEqual(len(told), 1)                 # the note goes separately, by name
+        self.assertIn('session named "Mesh"', told[0]["argv"][1])
+        self.assertIn('SendMessage CTO: "Mesh back"', told[0]["argv"][1])
         self.assertEqual(len(out.strip().splitlines()), 1)  # one line per revival
         self.assertIn("revived Mesh by wake", out)
         self.assertEqual(Ntfy.alerts + self.kapwa(), [])    # a revival that works is not news
@@ -242,16 +252,57 @@ class LeadKeeper(unittest.TestCase):
         self.kill("cccc0003")
         self.run_()
         self.run_()
-        wake = self.calls("--bg")[0]
+        wake = self.calls("respawn")[0]
         self.assertEqual(wake["cwd"], self.wcwd)
-        self.assertIn('SendMessage "Monica" that you are back', wake["argv"][3])
+        told = self.calls("-p")[0]["argv"][1]
+        self.assertIn('session named "Monica · daily briefs site"', told)
+        self.assertIn('SendMessage "Monica" that you are back', told)
+
+    def test_no_revival_command_ever_carries_prompt_text(self):
+        # `claude --bg --resume <id> "<note>"` can start a new session under a
+        # new name. Every way back is an id, flags, or nothing: died, idle
+        # retire, saved without RC, lost RC.
+        self.add("Mesh · probe", "abab0007", alive=False, rc=False)
+        self.add("Mesh · worker", "abab0008", rc=False)
+        self.run_()
+        self.kill("aaaa0001")
+        self.kill("cccc0003")
+        open(os.path.join(self.d, "daemon.log"), "a").write(
+            "[2026-09-30T16:08:19.438Z] [bg] bg retire cccc0003: idle-prompt, idle 8h\n")
+        for _ in range(3):
+            self.run_()
+        self.assertEqual(len(self.calls("respawn")), 2)
+        self.assertEqual(len(self.calls("--bg")), 2)
+        for c in self.revivals():
+            for arg in c["argv"]:
+                self.assertNotIn(" ", arg.replace("Mesh · ", ""), c["argv"])   # only a name has spaces
+            if c["argv"][0] == "--bg":
+                self.assertEqual(c["argv"][3:5], ["--remote-control", "-n"])
+                self.assertEqual(len(c["argv"]), 6)
+        ours = ("Mesh", "Monica")
+        self.assertEqual([e["name"] for e in self.world()["agents"] if not e["name"].startswith(ours)], [])
+        self.assertEqual(len(self.calls("-p")), 3)     # all but the idle retire are told, by name
+
+    def test_a_note_that_cannot_be_sent_is_tried_three_times_and_the_revival_stands(self):
+        self.run_()
+        self.kill("aaaa0001")
+        w = self.world(); w["deaf"] = True; self.world(w)
+        self.run_()
+        self.assertIn("revived Mesh by wake", self.run_())
+        self.assertEqual(self.run_(), "")
+        self.assertIn("could not tell Mesh", self.run_())
+        for _ in range(2):
+            self.assertEqual(self.run_(), "")
+        self.assertEqual(len(self.calls("-p")), 3)
+        self.assertEqual(len(self.calls("respawn")), 1)
+        self.assertEqual(Ntfy.alerts + self.kapwa(), [])
 
     def test_a_stale_pid_in_the_list_is_dead(self):
         self.run_()
         self.kill("aaaa0001", forget_pid=False, status="blocked")   # listed pid, no process
         self.run_()
         self.run_()
-        self.assertEqual(len(self.calls("--bg")), 1)
+        self.assertEqual(len(self.calls("respawn")), 1)
 
     def test_a_removed_session_never_comes_back(self):
         self.run_()
@@ -275,9 +326,9 @@ class LeadKeeper(unittest.TestCase):
         self.kill("aaaa0001")
         self.run_()
         self.run_()
-        wake = self.calls("--bg")
+        wake = self.calls("respawn")
         self.assertEqual(len(wake), 1)
-        self.assertEqual(wake[0]["argv"][2], "aaaa0001-0000-4000-8000-000000000000")
+        self.assertEqual(wake[0]["argv"], ["respawn", "aaaa0001"])
 
     def test_names_that_are_not_ours_or_are_excluded_are_never_touched(self):
         self.add("Meshy", "dddd0004", alive=False)
@@ -306,7 +357,8 @@ class LeadKeeper(unittest.TestCase):
         self.kill("bbbb0002")
         self.run_()
         self.run_()
-        self.assertEqual(self.calls("--bg")[0]["argv"][3], "wake up, Monica")
+        self.assertEqual(self.calls("--bg"), [])
+        self.assertTrue(self.calls("-p")[0]["argv"][1].endswith("\n\nwake up, Monica"))
 
     # ---- how -----------------------------------------------------------------
 
@@ -317,7 +369,7 @@ class LeadKeeper(unittest.TestCase):
             "[2026-09-30T16:08:19.438Z] [bg] bg retire cccc0003: idle-prompt, idle 8h\n")
         self.run_()
         out = self.run_()
-        self.assertEqual(self.calls("--bg"), [])
+        self.assertEqual(self.calls("--bg") + self.calls("-p"), [])
         self.assertEqual(self.calls("respawn")[0]["argv"], ["respawn", "cccc0003"])
         self.assertIn("revived Monica · daily briefs site by respawn", out)
 
@@ -329,8 +381,8 @@ class LeadKeeper(unittest.TestCase):
             "[2026-09-30T10:40:18.949Z] [bg] bg retire aaaa0001: idle-prompt, idle 8h\n")
         self.run_()
         self.run_()
-        self.assertEqual(self.calls("respawn"), [])
-        self.assertEqual(len(self.calls("--bg")), 1)
+        self.assertEqual(len(self.calls("respawn")), 1)
+        self.assertEqual(len(self.calls("-p")), 1)       # it died, so it is told; an idle retire is not
 
     def test_a_session_saved_without_rc_comes_back_as_a_copy_with_it(self):
         self.add("Mesh · probe", "abab0007", alive=False, rc=False)
@@ -355,7 +407,8 @@ class LeadKeeper(unittest.TestCase):
         self.assertEqual(self.calls("stop")[0]["argv"], ["stop", "abab0008"])
         argv = self.calls("--bg")[0]["argv"]
         self.assertEqual(argv[3:6], ["--remote-control", "-n", "Mesh · worker"])
-        self.assertIn("Remote Control had dropped", argv[6])
+        self.assertEqual(len(argv), 6)
+        self.assertIn("Remote Control had dropped", self.calls("-p")[0]["argv"][1])
         self.assertIn("by rc", out)
         for _ in range(3):                                   # the copy is the newest now
             self.run_()
@@ -452,10 +505,10 @@ class LeadKeeper(unittest.TestCase):
         self.kill("aaaa0001")
         self.run_(LEAD_KEEPER_PRESSURE_LEVEL="0")
         out = self.run_(LEAD_KEEPER_PRESSURE_LEVEL="0")
-        self.assertEqual([c["argv"][2][:8] for c in self.calls("--bg")], ["aaaa0001"])
+        self.assertEqual([c["argv"][1] for c in self.calls("respawn")], ["aaaa0001"])
         self.assertIn("deferred Monica · daily briefs site", out)
         self.run_()
-        self.assertEqual(len(self.calls("--bg")), 2)
+        self.assertEqual(len(self.calls("respawn")), 2)
 
     def test_update_in_progress_pauses_it(self):
         self.run_()
@@ -467,7 +520,7 @@ class LeadKeeper(unittest.TestCase):
         os.remove(os.path.join(self.d, "update-running"))
         self.run_()
         self.run_()
-        self.assertEqual(len(self.calls("--bg")), 1)
+        self.assertEqual(len(self.calls("respawn")), 1)
 
     def test_untrusted_cwd_is_not_tried(self):
         json.dump({"projects": {}}, open(os.path.join(self.home, ".claude.json"), "w"))
@@ -490,13 +543,13 @@ class LeadKeeper(unittest.TestCase):
         self.run_()
         out = self.run_()
         self.assertIn("revival FAILED Mesh", out)
-        self.assertEqual(len(self.calls("--bg")), 1)          # the worker was not tried: it would hang too
+        self.assertEqual(len(self.calls("respawn")), 1)          # the worker was not tried: it would hang too
         self.assertEqual(self.calls("stop")[0]["argv"], ["stop", "aaaa0001"])
         self.assertEqual(self.titles(), ["grant Full Disk Access to Claude"])
         self.assertIn(os.path.join(self.d, "claude"), Ntfy.alerts[0]["body"])
         for _ in range(3):                                     # no loop
             self.run_(LEAD_KEEPER_RETRY_HOURS="0")
-        self.assertEqual(len(self.calls("--bg")), 1)
+        self.assertEqual(len(self.calls("respawn")), 1)
         self.assertEqual(len(Ntfy.alerts), 1)
         # a new binary lifts the hold
         w = self.world()
@@ -506,7 +559,7 @@ class LeadKeeper(unittest.TestCase):
         os.symlink(os.path.join(self.d, "claude2"), os.path.join(self.d, "claude"))
         out = self.run_()
         self.assertIn("hold lifted", out)
-        self.assertEqual(len(self.calls("--bg")), 3)
+        self.assertEqual(len(self.calls("respawn")), 3)
 
     def test_clear_lifts_the_hold(self):
         self.run_()
@@ -520,11 +573,11 @@ class LeadKeeper(unittest.TestCase):
         w["rc"] = True
         self.world(w)
         self.run_()
-        self.assertEqual(len(self.calls("--bg")), 1)
+        self.assertEqual(len(self.calls("respawn")), 1)
         self.assertIn("cleared everything", self.run_("--clear"))
         self.run_()
         self.run_()
-        self.assertEqual(len(self.calls("--bg")), 2)
+        self.assertEqual(len(self.calls("respawn")), 2)
 
     def test_a_failed_command_is_said_once_retried_later_and_its_recovery_closes_the_item(self):
         self.run_()
@@ -533,7 +586,7 @@ class LeadKeeper(unittest.TestCase):
                   open(os.path.join(self.home, ".claude.json"), "w"))
         os.rename(os.path.join(self.d, "claude"), os.path.join(self.d, "claude.real"))
         open(os.path.join(self.d, "claude"), "w").write(
-            "#!/bin/sh\n[ \"$1\" = --bg ] && { echo 'Error: refused'; exit 1; }\nexec %s \"$@\"\n"
+            "#!/bin/sh\n[ \"$1\" = respawn ] && { echo 'Error: refused'; exit 1; }\nexec %s \"$@\"\n"
             % os.path.join(self.d, "claude.real"))
         os.chmod(os.path.join(self.d, "claude"), 0o755)
         self.run_()
@@ -556,7 +609,7 @@ class LeadKeeper(unittest.TestCase):
             self.run_()
             self.run_()
             self.run_()
-        self.assertEqual(len(self.calls("--bg")), 3)
+        self.assertEqual(len(self.calls("respawn")), 3)
         self.assertEqual(self.titles(), ["lead Mesh died twice in 24h"])
 
     def test_unreadable_list_judges_nothing_and_says_so_once(self):

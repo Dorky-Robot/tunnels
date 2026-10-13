@@ -43,10 +43,10 @@ plist is in `~/Library/LaunchAgents`, a `last-run` older than 11 minutes
 - A session is dead when its `claude agents --json --all` entry has no pid,
   or has a pid whose process is gone.
 - `claude --bg --resume <sessionId> "<note>"`, with **no other flags**,
-  wakes a dead background session in place: the same id, the same
-  conversation, its saved `--remote-control` and `-n`, the same claude.ai
-  link, and the note as its next prompt ("woke session … with its saved
-  options").
+  usually wakes a dead background session in place ("woke session … with
+  its saved options"). Not always: it can start a **new session under a new
+  name** instead, which no other session can then reach by the old name.
+  So nothing here passes prompt text to a revival.
 - The same command **with** flags starts a copy with a new id, and leaves
   the old entry behind as a dead duplicate ("keeps its own saved options,
   so the flags you passed started a copy").
@@ -59,7 +59,9 @@ plist is in `~/Library/LaunchAgents`, a `last-run` older than 11 minutes
   link scrolls out of the logs, so it is only a test for a fresh start.
 - A promptless `claude --bg --remote-control -n <name>` shows its RC link
   in seconds and spends no tokens, which makes it a free probe of a binary.
-- There is no CLI way to send a prompt to a live session.
+- There is no CLI way to send a prompt to a live session. A one-shot
+  `claude -p` can SendMessage one by name, though (tried on 2.1.293), and
+  that is how a revived session gets its note.
 
 ## lead-keeper
 
@@ -88,9 +90,16 @@ It also does nothing while claude-update holds its lock.
 | found | run | note |
 |---|---|---|
 | retired for idling (the daemon log says so) | `claude respawn <id>` | none: nothing was in flight, so no model turn |
-| died | `claude --bg --resume <sessionId> "<note>"` | tells a worker to SendMessage its lead, and a lead to tell CTO, that it is back |
-| lost RC, or saved without it | `claude stop <id>`, then `claude --bg --resume <sessionId> --remote-control -n <name> "<note>"` | a copy with a new id and the same conversation |
-| an interactive lead (CTO) gone from the list | the same flagged `--resume`, from its last session id | |
+| died | `claude respawn <id>` | sent afterwards: tells a worker to SendMessage its lead, and a lead to tell CTO, that it is back |
+| lost RC, or saved without it | `claude stop <id>`, then `claude --bg --resume <sessionId> --remote-control -n <name>` | a copy with a new id, the same name and the same conversation; the note is sent afterwards |
+| an interactive lead (CTO) gone from the list | the same flagged `--resume`, from its last session id | sent afterwards |
+
+No revival command carries the note. Once the session shows its Remote
+Control link, the note goes to it by name: `claude -p "<send this to
+<name> with SendMessage>" --model haiku --allowedTools
+SendMessage,ToolSearch`. If that fails it is tried again on the next two
+passes and then dropped with one log line. The session is up either way;
+it only has not been told why.
 
 Leads come first. While the kernel reports memory pressure
 (`kern.memorystatus_vm_pressure_level` of 2 or higher), only leads are
@@ -118,8 +127,9 @@ someone runs `scripts/lead-keeper.py --clear`. If the command itself fails,
 that one session is retried every 6h.
 
 **Cost.** While everything is up, one pass is one `claude agents` call:
-0.11 s, and no model turns. A revival costs one turn (the note), except an
-idle retire, which costs none.
+0.11 s, and no model turns. A revival costs one turn in the revived session
+(the note) and one small Haiku turn to send it, except an idle retire,
+which costs none.
 
 ### What Felix hears
 

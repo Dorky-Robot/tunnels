@@ -31,13 +31,17 @@ How, from the session's own cwd (else its lead's):
   retired idle   claude respawn <id>
                  nothing was in flight, so no note and no model turn; the
                  same id and RC link.
-  died           claude --bg --resume <sessionId> "<note>"
-                 no other flags, so the same entry wakes with its saved
-                 options, and the note tells it to SendMessage its lead
-                 (a lead tells CTO) that it is back.
+  died           claude respawn <id>
+                 the same entry wakes with its saved options. Then the note.
   lost RC        claude stop <id>, then
-                 claude --bg --resume <sessionId> --remote-control -n <name> "<note>"
-                 a copy with the same conversation and a new id.
+                 claude --bg --resume <sessionId> --remote-control -n <name>
+                 a copy with the same conversation and a new id. Then the note.
+No revival command carries prompt text: `--bg --resume <id> "<note>"` can
+start a new session under a new name instead of waking the old one. The
+note (SendMessage your lead, a lead tells CTO, that you are back) goes
+separately, by name, once the session is up: a one-shot `claude -p` whose
+only job is one SendMessage. A note that cannot be delivered is tried
+again on the next two passes and then dropped; the revival stands either way.
 Leads first, then workers; while memory is tight only the leads.
 
 A revival counts once `claude logs <id>` shows a claude.ai/code link within
@@ -83,6 +87,12 @@ NOTE_LEAD = ("You were restarted by lead-keeper ({why}). Check your ledger and a
              "you had, then SendMessage CTO: \"{name} back\".")
 NOTE_WORKER = ("You were restarted by lead-keeper ({why}). SendMessage \"{lead}\" that you "
                "are back and what you were doing, then carry on.")
+# The note goes by name through a one-shot headless session: the CLI cannot
+# prompt a live session, and SendMessage can. Haiku, one tool call.
+TELL = ("Send the message below to the Claude session named \"{name}\" with the SendMessage tool "
+        "(load it with ToolSearch if it is deferred). Send it once, word for word, and do nothing "
+        "else. Then answer with one line: SENT, or FAILED and why.\n\n{note}")
+TELL_TRIES = int(os.environ.get("LEAD_KEEPER_TELL_TRIES", "3"))
 DOWN = ("failed", "cannot", "hung", "removed", "trust")   # alerts that say it is down, answered by "back"
 
 
@@ -151,13 +161,14 @@ def back(st, ss, name, e):
 
 def plan(name, lead, e, ss, why, alive):
     """How to bring back `name`, whose newest entry is e (None if it is no
-    longer listed): (method, [argvs], cwd) or (None, reason, None)."""
+    longer listed): (method, [argvs], cwd, note) or (None, reason, None, None).
+    The note is never part of a command: tell() sends it once it is up."""
     is_lead = name == lead["name"]
     if e is None:
         # Only an interactive lead (CTO, run by Remote Control rather than
         # the supervisor) can vanish from the list without being removed.
         if not (is_lead and ss.get("kind") == "interactive" and ss.get("session_id")):
-            return None, "removed", None
+            return None, "removed", None, None
         sid, cwd, flags = ss["session_id"], lead["cwd"], []
     else:
         sid = e.get("sessionId")
@@ -166,21 +177,39 @@ def plan(name, lead, e, ss, why, alive):
     if not os.path.isdir(cwd):
         cwd = lead["cwd"]
     if not os.path.isdir(cwd):
-        return None, "its cwd %s does not exist" % cwd, None
+        return None, "its cwd %s does not exist" % cwd, None, None
     if trusted(cwd) is False:
-        return None, "Claude does not trust %s, so a session there refuses to start" % cwd, None
+        return None, "Claude does not trust %s, so a session there refuses to start" % cwd, None, None
     if is_lead and lead["note"]:
         note = lead["note"]
     else:
         note = (NOTE_LEAD if is_lead else NOTE_WORKER).format(name=name, lead=lead["name"], why=why)
-    copy = [CLAUDE, "--bg", "--resume", sid, "--remote-control", "-n", name, note]
+    copy = [CLAUDE, "--bg", "--resume", sid, "--remote-control", "-n", name]
     if alive:
-        return "rc", [[CLAUDE, "stop", e["id"]], copy], cwd
+        return "rc", [[CLAUDE, "stop", e["id"]], copy], cwd, note
     if e is None or e.get("kind") != "background" or not e.get("id") or "--remote-control" not in flags:
-        return "copy", [copy], cwd
+        return "copy", [copy], cwd, note
     if retired(e["id"], e.get("startedAt")):
-        return "respawn", [[CLAUDE, "respawn", e["id"]]], cwd
-    return "wake", [[CLAUDE, "--bg", "--resume", sid, note]], cwd
+        return "respawn", [[CLAUDE, "respawn", e["id"]]], cwd, None
+    return "wake", [[CLAUDE, "respawn", e["id"]]], cwd, note
+
+
+def tell(ss, name, cwd):
+    """Send a revived session the note it is owed, by name. Best effort: the
+    session is up whether or not it hears why."""
+    owed = ss.get("owed")
+    if not owed:
+        return
+    rc, out, err = run([CLAUDE, "-p", TELL.format(name=name, note=owed["note"]), "--model", "haiku",
+                        "--allowedTools", "SendMessage,ToolSearch"], 180, cwd=cwd)
+    if rc == 0 and "SENT" in out:
+        ss.pop("owed")
+        return
+    owed["tries"] = owed.get("tries", 0) + 1
+    if owed["tries"] >= TELL_TRIES:
+        last = plain(out + err).strip().splitlines()
+        log("could not tell %s it was revived (%d tries): %s" % (name, owed["tries"], last[-1][:200] if last else rc))
+        ss.pop("owed")
 
 
 def gone(short_id):
@@ -193,11 +222,13 @@ def gone(short_id):
     return False
 
 
-def revive(st, ss, name, is_lead, method, argvs, cwd, dry):
+def revive(st, ss, name, is_lead, method, argvs, cwd, dry, note=None):
     """Run the plan. True if it came back with Remote Control."""
     if dry:
         for argv in argvs:
             print("  would run, from %s:\n    %s" % (cwd, " ".join(a if " " not in a else repr(a) for a in argv)))
+        if note:
+            print("  then SendMessage it, by name:\n    %s" % note)
         return True
     new_id, text, rc = None, "", 0
     for argv in argvs:
@@ -218,6 +249,9 @@ def revive(st, ss, name, is_lead, method, argvs, cwd, dry):
     if link:
         log("revived %s by %s: %s -> %s %s" % (name, method, ss.get("id") or "-", new_id, link))
         ss.update({"id": new_id, "failed_at": None, "runs": 0, "revived_at": stamp()})
+        if note:
+            ss["owed"] = {"note": note, "cwd": cwd}
+            tell(ss, name, cwd)
         return True
     if rc != 0 or not new_id:
         why = "the command failed (%s): %s" % (rc, text.strip().splitlines()[-1][:200] if text.strip() else "no output")
@@ -329,6 +363,8 @@ def main():
                               e.get("status"), "; RC lost, repaired once it is idle" if lost_rc else ""))
                     elif set(ss.get("said", [])) & set(DOWN):
                         back(st, ss, name, e)
+                    if ss.get("owed") and not dry:
+                        tell(ss, name, ss["owed"].get("cwd") or lead["cwd"])
                     ss.update({"session_id": e.get("sessionId"), "id": e.get("id"), "pid": e["pid"],
                                "kind": e.get("kind"), "seen": stamp(), "runs": 0, "hung_runs": 0, "said": []})
                     continue
@@ -353,7 +389,7 @@ def main():
                     print("%-30s -       not listed and never seen: nothing to revive" % name)
                 continue
             ss["runs"] = ss.get("runs", 0) + 1
-            method, argvs, cwd = plan(name, lead, e, ss, why, bool(live))
+            method, argvs, cwd, note = plan(name, lead, e, ss, why, bool(live))
             if dry:
                 print("%-30s %s (%d of %d passes)%s" % (name, "RC LOST" if live else "DEAD   ", ss["runs"], CONFIRM_RUNS,
                       "" if method else ": will not revive: " + ("removed with claude rm" if argvs == "removed" else argvs)))
@@ -391,7 +427,7 @@ def main():
                         log("deferred %s: memory is tight" % name)
                     continue
             ss.pop("deferred", None)
-            ok = revive(st, ss, name, is_lead, method, argvs, cwd, dry)
+            ok = revive(st, ss, name, is_lead, method, argvs, cwd, dry, note)
             if not ok and st.get("hold"):
                 hold = st["hold"]            # the rest would hang the same way
             day = [d for d in ss.get("deaths", []) if (now() - parse(d)).total_seconds() < 86400]

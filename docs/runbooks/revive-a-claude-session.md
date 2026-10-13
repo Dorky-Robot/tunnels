@@ -54,9 +54,11 @@ characters of its id: retired for idleness. Nothing: it may have crashed;
 ## 3. Bring it back, with its conversation
 
 If it is dead (listed with no pid) and was started with `--remote-control`,
-wake it in place instead: `cd <its cwd> && claude --bg --resume <sessionId>
-"<note>"` with **no other flags** keeps its id, its saved options and its
-claude.ai link, and delivers the note. Flags are what make the copy below.
+wake it in place instead: `cd <its cwd> && claude respawn <id>` keeps its
+id, its saved options and its claude.ai link. Give it no prompt text:
+`claude --bg --resume <sessionId> "<note>"` can start a new session under a
+new name. Tell it why with SendMessage, by name, once it is up. Flags are
+what make the copy below.
 `scripts/lead-keeper.py` does all of this by itself (docs/lead-keeper.md).
 
 If it still shows in `claude agents` but has no Remote Control, stop it
@@ -69,7 +71,7 @@ claude stop <id>
 Then:
 
 ```sh
-cd <its cwd> && claude --bg --resume <sessionId> --remote-control -n "<its exact name>" "<one line: why you revived it>"
+cd <its cwd> && claude --bg --resume <sessionId> --remote-control -n "<its exact name>"
 ```
 
 **Check:** it prints an id; within ~30 s the job lister above shows it
