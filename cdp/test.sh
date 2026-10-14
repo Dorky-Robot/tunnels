@@ -6,8 +6,10 @@
 # shipping past a held one while dependent ones wait, hold groups and their
 # off switch, signals (max and baseline) rolling a ship back, the circuit
 # breaker after two rollbacks, an anomaly between ships, the blip probe
-# counting a swap that drops the face, one tick at a time per product, and
-# Everyday Vet's own hold rules (test-ev.hold).
+# counting a swap that drops the face, one tick at a time per product,
+# Everyday Vet's own hold rules (test-ev.hold), and the rollback contract of
+# `ship.sh --undo {sha}`: 0 held, 1 refused and kept, 2 paged and paused,
+# anything else paged, and nothing shipped between an anomaly and its undo.
 set -u
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 export CD_HOME=$T/home CD_STATE=$T/state CD_OFFLIST=$T/offlist CD_ORG=/nonexistent CD_NTFY= MESH_WATCH_NTFY=
@@ -48,6 +50,7 @@ prodok() { grep -q '"ok":true' "$T/prod/health"; }
 # prod has main's tree (its sha is main's until the first ship past a hold, then a deploy-ref commit)
 onmain() { [ "$(git rev-parse "$(live)^{tree}")" = "$(git rev-parse "HEAD^{tree}")" ]; }
 ships() { grep -c . "$CD_STATE/demo.ships" 2>/dev/null || echo 0; }
+short() { echo "$1" | cut -c1-8; }
 
 echo "1 kill switch on: proven but not shipped"
 echo v2 > app.txt; commit "v2
@@ -234,4 +237,82 @@ out=$($CDP tick ev 2>&1); echo "$out" | grep -q "hold rule 'nosuch/\*.rs secret'
 # the fixture is a copy; say so when Everyday Vet's own .cd has moved on
 theirs=$(git -C "$HERE/../../dev/everyday-vet-admin" show main:.cd 2>/dev/null | grep -E '^hold') || true
 [ -z "$theirs" ] || [ "$theirs" = "$(cat "$HERE/test-ev.hold")" ] || echo "  ! test-ev.hold differs from everyday-vet-admin's .cd: copy its hold lines here"
+# ── the rollback contract: `ship.sh --undo {sha}` answers 0, 1 or 2 ──
+# A fake ship.sh that keeps one release back, as Everyday Vet's does: --undo
+# refuses (1) unless {sha} is the release before the newest, and a second
+# undo has nothing kept to go back to. $T/u/rc says how an undo ends.
+U=$T/u; mkdir -p "$U"; echo '{"ok":true}' > "$U/health"; git init -q --bare "$T/undo.git"; git clone -q "$T/undo.git" "$T/uapp" 2>/dev/null
+cd "$T/uapp"; git config user.email t@t; git config user.name t
+cat > .cd <<CFG
+product   undo
+prod      sh ship.sh {sha}
+rollback  sh ship.sh --undo {sha}
+health    file://$U/health
+watch     2
+undo      3600
+CFG
+cat > ship.sh <<SH
+[ ! -e $U/prodfail ] || [ "\$1" = --undo ] || exit 1
+if [ "\$1" = --undo ]; then echo "\$2" >> $U/undos; rc=\$(cat $U/rc 2>/dev/null || echo 0)
+  [ -f $U/was ] && [ "\$(cat $U/was)" = "\$2" ] || exit 1
+  case \$rc in 0) mv $U/was $U/live; mv $U/health.was $U/health ;; 2) mv $U/was $U/live; rm $U/health.was ;; esac; exit \$rc; fi
+cp $U/live $U/was 2>/dev/null; cp $U/health $U/health.was; echo "\$1" > $U/live; cp health.json $U/health; echo "\$1" >> $U/ships
+SH
+echo '{"ok":true}' > health.json; git add -A; git commit -qm "u1"; git push -q origin HEAD:main 2>/dev/null
+git rev-parse HEAD > "$U/live"; echo "undo $T/uapp" >> "$CD_HOME/repos"; $CDP init undo "$(cat "$U/live")" >/dev/null
+ulive() { cat "$CD_STATE/undo.shipped"; }; uships() { grep -c . "$U/ships" 2>/dev/null || echo 0; }; undos() { grep -c . "$U/undos" 2>/dev/null || echo 0; }
+ugood() { echo '{"ok":true}' > health.json; echo "$1" >> notes.txt; commit "$1"; }
+ubad() { echo '{"ok":false}' > health.json; echo "$1" >> notes.txt; commit "$1"; }
+ugood "u2"; $CDP tick undo >/dev/null 2>&1; [ "$(ulive)" = "$(git rev-parse HEAD)" ] && ok "a good ship on the scratch desk" || no "u2"
+echo "15 exit 0: rolled back and smoked; the undone sha is held for good"
+G=$(ulive); ubad "u3 breaks health"; B=$(git rev-parse HEAD)
+out=$($CDP tick undo 2>&1); echo "$out" | grep -q "ROLLED BACK undo $(short "$B") in [0-9]*s: health1 is 'fail'.*Back on $(short "$G")" && [ "$(ulive)" = "$G" ] && [ "$(cat "$U/live")" = "$G" ] \
+  && ok "ship.sh --undo {sha} got the commit it goes back to, and prod is there" || { no "exit 0"; echo "$out"; cat "$U/undos"; }
+grep -qx "$B" "$CD_STATE/undo.undone" && ok "the undone sha is held" || no "undone not held"
+n=$(uships); u=$(undos); $CDP tick undo >/dev/null 2>&1; $CDP tick undo >/dev/null 2>&1
+[ "$(uships)" = "$n" ] && [ "$(undos)" = "$u" ] && ok "never retried, never undone twice" || no "retried"
+echo bad > "$CD_STATE/undo.failed"; $CDP tick undo >/dev/null 2>&1
+[ "$(uships)" = "$n" ] && ok "held by the undone list even when 'failed' has moved on" || no "undone list"
+ugood "u4 the fix"; $CDP tick undo >/dev/null 2>&1; [ "$(ulive)" = "$(git rev-parse HEAD)" ] && ok "the fix ships by the same route" || no "u4"
+echo "16 exit 1: refused, nothing moved; nothing ships over the suspect until a person clears it"
+echo 1 > "$U/rc"; ubad "u5 breaks health"; B=$(git rev-parse HEAD)
+out=$($CDP tick undo 2>&1); echo "$out" | grep -q "ROLLBACK REFUSED undo $(short "$B"): health1.*Nothing moved; $(short "$B") is live. Nothing ships until a person looks: cdp go undo" \
+  && [ -e "$CD_STATE/undo.anomaly" ] && ok "refused: alerted, the anomaly kept" || { no "exit 1"; echo "$out"; }
+[ "$(ulive)" = "$B" ] && [ "$(cat "$U/live")" = "$B" ] && ok "the record says what really runs: the suspect" || no "refused state"
+echo "$out" | grep -q "^.*\[urgent\]" && no "a refusal paged" || ok "a refusal alerts, it does not page"
+ugood "u6 a good commit lands"; n=$(uships); u=$(undos)
+out=$($CDP tick undo 2>&1); echo "$out" | grep -q "not shipped: undo has an anomaly a person has not cleared" && [ "$(uships)" = "$n" ] && ok "a newer commit is proven, not shipped" || { no "shipped over"; echo "$out"; }
+out=$($CDP tick undo 2>&1); [ "$(uships)" = "$n" ] && [ "$(undos)" = "$u" ] && ! echo "$out" | grep -q . && ok "and the next tick is quiet: no ship, no second undo, no second alert" || { no "quiet"; echo "$out"; }
+$CDP status | grep -q "^undo .*ANOMALY: rollback of $(short "$B") refused" && ok "status shows the anomaly" || no "status"
+echo 0 > "$U/rc"; $CDP go undo >/dev/null; [ ! -e "$CD_STATE/undo.anomaly" ] && ok "cdp go undo clears it" || no "go"
+out=$($CDP tick undo 2>&1); [ "$(uships)" = "$n" ] && echo "$out" | grep -q "a signal read bad on its last sample; not shipping" && ok "still unwell: the tick looks before it ships, and waits" || { no "looked"; echo "$out"; }
+out=$($CDP tick undo 2>&1); echo "$out" | grep -q "ROLLED BACK undo $(short "$B")" && [ "$(uships)" = "$n" ] && [ "$(cat "$U/live")" = "$(cat "$CD_STATE/undo.previous")" ] \
+  && ok "two bad: the suspect is rolled back first, nothing shipped in between" || { no "roll before ship"; echo "$out"; }
+$CDP go undo >/dev/null; out=$($CDP tick undo 2>&1); [ "$(ulive)" = "$(git rev-parse HEAD)" ] && ok "then the good commit ships" || { no "u6"; echo "$out"; }
+echo "17 exit 2: rolled back, but a face does not answer: page and pause"
+echo 2 > "$U/rc"; G=$(ulive); ubad "u7 breaks health"; B=$(git rev-parse HEAD)
+out=$($CDP tick undo 2>&1); echo "$out" | grep -q "\[urgent\] ROLLED BACK undo $(short "$B") in [0-9]*s, and a face or the smoke does not answer on $(short "$G").*undo is paused" \
+  && [ -e "$CD_HOME/STOP.undo" ] && [ -e "$CD_STATE/undo.anomaly" ] && ok "paged, paused" || { no "exit 2"; echo "$out"; }
+[ "$(ulive)" = "$G" ] && grep -qx "$B" "$CD_STATE/undo.undone" && ok "the record is back on $(short "$G") and the undone sha is held" || no "exit 2 state"
+echo 0 > "$U/rc"; echo '{"ok":true}' > "$U/health"; ugood "u8"; n=$(uships)
+$CDP tick undo >/dev/null 2>&1; $CDP tick undo >/dev/null 2>&1; [ "$(uships)" = "$n" ] && ok "paused: nothing ships" || no "shipped while paused"
+$CDP go undo >/dev/null; $CDP tick undo >/dev/null 2>&1; [ "$(ulive)" = "$(git rev-parse HEAD)" ] && ok "cdp go undo, and it ships" || no "after go"
+echo "18 any other exit (3, ssh's 255): what is live is unknown: page and pause"
+echo 3 > "$U/rc"; ubad "u9 breaks health"; B=$(git rev-parse HEAD); n=$(uships)
+out=$($CDP tick undo 2>&1); echo "$out" | grep -q "\[urgent\] ROLLBACK FAILED undo $(short "$B") (exit 3).*What is live is unknown" && [ -e "$CD_HOME/STOP.undo" ] \
+  && grep -qx "$B" "$CD_STATE/undo.undone" && ok "paged, paused, the suspect never retried" || { no "exit 3"; echo "$out"; }
+echo "19 between ships: one bad sample and a new commit; the live ship is rolled back before anything ships"
+# the person: puts the desk back on what the record says, by hand, then go
+cp "$CD_STATE/undo.shipped" "$U/live"; rm -f "$U/was"; echo 0 > "$U/rc"; echo '{"ok":true}' > "$U/health"; $CDP go undo >/dev/null
+ugood "u10"; $CDP tick undo >/dev/null 2>&1
+L=$(ulive); P0=$(cat "$CD_STATE/undo.previous"); echo '{"ok":false}' > "$U/health"; $CDP tick undo >/dev/null 2>&1
+echo '{"ok":false}' > "$U/health"; ugood "u11 lands on an unwell box"; n=$(uships)
+out=$($CDP tick undo 2>&1); [ "$(uships)" = "$n" ] && echo "$out" | grep -q "ROLLED BACK undo $(short "$L")" && [ "$(cat "$U/live")" = "$P0" ] \
+  && ok "the young ship is undone to $(short "$P0"), and u11 did not ship over it" || { no "one back"; echo "$out"; }
+echo "20 a prod step that fails, and an undo that is refused: the record stays on what ran before"
+echo '{"ok":true}' > "$U/health"; $CDP go undo >/dev/null; $CDP tick undo >/dev/null 2>&1; $CDP tick undo >/dev/null 2>&1; L=$(ulive); [ "$(cat "$U/live")" = "$L" ] || no "20 setup"
+touch "$U/prodfail"; ugood "u12 its prod step fails"; out=$($CDP tick undo 2>&1)
+echo "$out" | grep -q "ROLLBACK REFUSED undo .*: prod step failed. Nothing moved; $(short "$L") is live" && [ "$(ulive)" = "$L" ] && [ -e "$CD_STATE/undo.anomaly" ] \
+  && ok "refused after a failed prod step: the record stays on $(short "$L"), and a person is asked" || { no "prod fail"; echo "$out"; }
+rm "$U/prodfail"; ugood "u13"; n=$(uships); $CDP tick undo >/dev/null 2>&1; [ "$(uships)" = "$n" ] && ok "and nothing ships until they clear it" || no "shipped past a refusal"
 [ $fail = 0 ] && echo PASS || { echo FAIL; exit 1; }
