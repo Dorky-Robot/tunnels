@@ -13,11 +13,25 @@
 #   STOP, STOP.<product>  the kill switch. While one exists nothing of that
 #            product reaches prod; the gate, staging and smoke still run, so a
 #            `go` finds a proven candidate. STOP.<product> is also what the
-#            circuit breaker sets after two rollbacks in a day.
+#            circuit breaker sets after two rollbacks in a day, and what a
+#            rollback that did not end clean sets beside <product>.anomaly.
 #   repos    one line per product: <product> <path to a checkout>
 # State (CD_STATE, default ~/.local/state/cdp): per product, what is live,
 # the floor, the held, released and failed shas, a line per ship and per
-# rollback, and the signal counters.
+# rollback, the signal counters, the shas rolled back (undone, never shipped
+# again) and <product>.anomaly: a rollback that was refused or did not end
+# clean. While it exists nothing ships and nothing is rolled back again;
+# `cdp go <product>` is a person saying they have looked.
+#
+# The rollback command answers by its exit code (Everyday Vet's
+# `ship.sh --undo {sha}`, {sha} the commit it goes back to):
+#   0  rolled back and the smoke passed: logged, the undone sha held
+#   1  refused, nothing moved: alert; the suspect stays live and nothing
+#      ships over it until a person clears it
+#   2  rolled back, but a face or the smoke does not answer: page, pause
+#   else (no command, 3, ssh's 255): what is live is unknown: page, pause.
+#      The person puts the desk and the record in step (`cdp init <product>
+#      <what runs>` if they differ) before `cdp go`.
 #
 # Each repo's own <checkout>/.cd says how to gate, stage, smoke, ship, roll
 # back and watch it, and what holds for Felix. It is read from the LIVE
@@ -38,9 +52,11 @@ mkdir -p "$CD_STATE"
 
 say() { printf '%s cdp: %s\n' "$(date +%H:%M:%S)" "$*"; }
 # ntfy: the same topic mesh-watch uses. Without one, the line is only printed.
-ntfy() { say "$*"
+ntfy() { say "${PRIO:+[$PRIO] }$*"
   url=${CD_NTFY:-${MESH_WATCH_NTFY:-$(cat "$CD_HOME/ntfy" 2>/dev/null)}}
-  [ -z "$url" ] || curl -sS -f -m 20 -H "Title: cdp" --data-binary "$*" "$url" >/dev/null 2>&1 || true; }
+  [ -z "$url" ] || curl -sS -f -m 20 -H "Title: cdp" -H "Priority: ${PRIO:-default}" --data-binary "$*" "$url" >/dev/null 2>&1 || true; }
+# a page: the same line at ntfy's top priority, which breaks through do-not-disturb
+page() { PRIO=urgent ntfy "$@"; }
 st() { cat "$CD_STATE/$P.$1" 2>/dev/null || true; }          # read state
 put() { printf '%s\n' "$2" > "$CD_STATE/$P.$1"; }            # write state
 has() { grep -qx "$2" "$CD_STATE/$P.$1" 2>/dev/null; }       # is $2 a line of state $1
@@ -228,7 +244,7 @@ blip_stop() { [ -n "${BLIPPID:-}" ] || { BLIP="no probe"; return; }
 
 shipped_today() { grep -c "^$(date +%F) " "$CD_STATE/$P.ships" 2>/dev/null || echo 0; }
 rolled_today() { grep -c "^$(date +%F) " "$CD_STATE/$P.rollbacks" 2>/dev/null || echo 0; }
-stopped() { [ -e "$CD_HOME/STOP" ] || [ -e "$CD_HOME/STOP.$P" ]; }
+stopped() { [ -e "$CD_HOME/STOP" ] || [ -e "$CD_HOME/STOP.$P" ] || [ -e "$CD_STATE/$P.anomaly" ]; }
 
 # ── one product, one tick ──
 tick() {
@@ -257,6 +273,7 @@ tick() {
   if [ "$CAND" = "$LIVE" ] || [ "$(git -C "$DIR" rev-parse "$CAND^{tree}")" = "$(git -C "$DIR" rev-parse "$LIVE^{tree}")" ]; then
     watch_between; unlock; return 0; fi                      # everything new waits
   [ "$(st failed)" != "$CAND" ] || { watch_between; unlock; return 0; }   # already failed: wait for a new commit
+  ! has undone "$CAND" || { watch_between; unlock; return 0; }           # rolled back once: never again
   short=$(short "$CAND"); export CD_SHA=$CAND CD_DIR=$W
   git -C "$W" checkout -q --detach "$CAND" || { unlock; return 1; }
   # off main: the desk's release path fetches origin, so the candidate must be there
@@ -270,7 +287,10 @@ tick() {
     done
     put proven "$CAND"
   fi
-  if stopped; then ntfy "$P $short proven on staging; not shipped: kill switch is on"; unlock; return 0; fi
+  if stopped; then
+    if [ -e "$CD_STATE/$P.anomaly" ]; then why="$P has an anomaly a person has not cleared ($(head -1 "$CD_STATE/$P.anomaly")); cdp go $P"; else why="kill switch is on"; fi
+    [ "$(st parked)" = "$CAND" ] || { put parked "$CAND"; ntfy "$P $short proven on staging; not shipped: $why"; }
+    watch_between; unlock; return 0; fi
 
   # ── prod, then watch ──
   say "$P $short: prod"
@@ -282,7 +302,7 @@ tick() {
   for_s=$(cfg watch); for_s=${for_s:-300}; elapsed=0
   while [ "$elapsed" -lt "$for_s" ]; do
     sleep "$WATCH_EVERY"; elapsed=$((elapsed+WATCH_EVERY))
-    a=$(sample watch); [ -z "$a" ] || { roll "$a" "$LIVE"; unlock; return 1; }
+    a=$(sample watch); [ -z "$a" ] || { roll "$a" "$LIVE" running; unlock; return 1; }
   done
   record_ship; unlock
 }
@@ -292,7 +312,10 @@ tick() {
 # so nothing new lands on a box that is unwell.
 watch_between() {
   [ -n "$(cfg health)$(cfgall signal)" ] || return 0
-  a=$(sample watch); [ -n "$a" ] || return 0
+  [ ! -e "$CD_STATE/$P.anomaly" ] || return 0          # a person has it; acting again could only make it worse
+  a=$(sample watch); [ -z "$a" ] || suspect "$a"; }
+# an anomaly ($1) with what is live: roll the young ship back, or pause
+suspect() { a=$1
   last=$(tail -1 "$CD_STATE/$P.ships" 2>/dev/null | awk '{print $4}'); u=$(cfg undo); u=${u:-3600}
   prev=$(st previous)
   if [ -n "$last" ] && [ -n "$prev" ] && [ $(( $(now_s) - last )) -lt "$u" ] && [ "$prev" != "$LIVE" ]; then
@@ -303,18 +326,28 @@ watch_between() {
       ntfy "PAUSED $P: $a, and the last ship is older than ${u}s, so it is not the suspect. Nothing new ships until: cdp go $P"; }
   fi
 }
-# the prod step, the watch or a later signal failed: put $2 back, and say how long it took
-roll() { put failed "$CAND"; rb=$(cfg rollback); t0=$(now_s)
-  if [ -n "$rb" ] && ( cd "$W" && sh -c "$(sub "$rb" "$2")" ) > "$CD_STATE/$P.rollback.log" 2>&1; then
-    i=0; while [ "$i" -lt 60 ]; do clear_bad; [ -n "$(sample once)" ] || break; sleep 1; i=$((i+1)); done
-    t=$(( $(now_s) - t0 )); date +"%F %T $CAND ${t}s" >> "$CD_STATE/$P.rollbacks"
+# The prod step, the watch or a later signal failed: put $2 back, and say how
+# long it took. $3 = running when the prod step finished, so the suspect is
+# what runs if the rollback is refused. Returns 0 when prod moved back.
+roll() { put failed "$CAND"; rb=$(cfg rollback); t0=$(now_s); rc=127
+  [ -z "$rb" ] || { ( cd "$W" && sh -c "$(sub "$rb" "$2")" ) > "$CD_STATE/$P.rollback.log" 2>&1; rc=$?; }
+  log="log: $CD_STATE/$P.rollback.log"
+  case $rc in
+  0) i=0; while [ "$i" -lt 60 ]; do clear_bad; [ -n "$(sample once)" ] || break; sleep 1; i=$((i+1)); done
+    t=$(( $(now_s) - t0 )); date +"%F %T $CAND ${t}s" >> "$CD_STATE/$P.rollbacks"; has undone "$CAND" || printf '%s\n' "$CAND" >> "$CD_STATE/$P.undone"
     ntfy "ROLLED BACK $P $short in ${t}s: $1. Back on $(short "$2")."
     [ "$(rolled_today)" -lt 2 ] || [ -e "$CD_HOME/STOP.$P" ] || { touch "$CD_HOME/STOP.$P"; ntfy "PAUSED $P: $(rolled_today) rollbacks today. Nothing ships until: cdp go $P"; }
-    clear_bad; return 0
-  else
-    touch "$CD_HOME/STOP.$P"; date +"%F %T $CAND failed" >> "$CD_STATE/$P.rollbacks"
-    ntfy "ROLLBACK FAILED $P $short: $1. $P is paused. Needs a person (log: $CD_STATE/$P.rollback.log)"; return 1
-  fi
+    clear_bad; return 0 ;;
+  1) printf 'rollback of %s refused: %s\n' "$short" "$1" > "$CD_STATE/$P.anomaly"
+    [ "${3:-}" != running ] || record_ship quiet          # it is what runs: the next rollback starts from it
+    ntfy "ROLLBACK REFUSED $P $short: $1. Nothing moved; $(short "$(st shipped)") is live. Nothing ships until a person looks: cdp go $P ($log)"; clear_bad; return 1 ;;
+  2) t=$(( $(now_s) - t0 )); date +"%F %T $CAND ${t}s unwell" >> "$CD_STATE/$P.rollbacks"; has undone "$CAND" || printf '%s\n' "$CAND" >> "$CD_STATE/$P.undone"
+    touch "$CD_HOME/STOP.$P"; printf 'rolled back %s, unwell: %s\n' "$short" "$1" > "$CD_STATE/$P.anomaly"
+    page "ROLLED BACK $P $short in ${t}s, and a face or the smoke does not answer on $(short "$2"): $1. $P is paused. Needs a person: cdp go $P ($log)"; clear_bad; return 0 ;;
+  *) date +"%F %T $CAND failed" >> "$CD_STATE/$P.rollbacks"; has undone "$CAND" || printf '%s\n' "$CAND" >> "$CD_STATE/$P.undone"
+    touch "$CD_HOME/STOP.$P"; printf 'rollback of %s failed (exit %s): %s\n' "$short" "$rc" "$1" > "$CD_STATE/$P.anomaly"
+    page "ROLLBACK FAILED $P $short (exit $rc): $1. What is live is unknown. $P is paused. Needs a person ($log)"; return 1 ;;
+  esac
 }
 record_ship() {
   n=0; tags=""; untagged=""; srcs=""; was=" $(st included | tr '\n' ' ') "
@@ -339,16 +372,16 @@ record_ship() {
   put included "$(echo "$srcs" | tr ' ' '\n')"
   date +"%F %T $CAND $(now_s)" >> "$CD_STATE/$P.ships"; put shipped "$CAND"; put floor "$(new_floor)"
   w=$(echo "$WITHHELD" | wc -w | tr -d ' '); behind=; [ "$w" = 0 ] || behind=" · $w wait behind $(short "$FIRSTHELD")"
-  ntfy "shipped $P $short ($n commits) · blip: $BLIP$behind · rollback: $(cfg rollback | head -c 60)"
+  [ "${1:-}" = quiet ] || ntfy "shipped $P $short ($n commits) · blip: $BLIP$behind · rollback: $(cfg rollback | head -c 60)"
 }
 
 case "${1:-tick}" in
   init)    P=$2; put shipped "$3"; put floor "$3"; say "$P baseline $3" ;;
   ship)    P=$2; has released "$3" || printf '%s\n' "$3" >> "$CD_STATE/$P.released"; tick "$2" ;;
   stop)    mkdir -p "$CD_HOME"; touch "$CD_HOME/STOP${2:+.$2}"; say "kill switch ON${2:+ for $2}" ;;
-  go)      rm -f "$CD_HOME/STOP${2:+.$2}"; say "kill switch off${2:+ for $2}" ;;
+  go)      rm -f "$CD_HOME/STOP${2:+.$2}"; [ -z "${2:-}" ] || rm -f "$CD_STATE/$2.anomaly"; say "kill switch off${2:+ for $2}" ;;
   status)  for f in "$CD_STATE"/*.shipped; do P=$(basename "$f" .shipped)
-             printf '%s live=%s floor=%s held=%s failed=%s today=%s rollbacks=%s%s\n' "$P" "$(short "$(st shipped)")" "$(short "$(st floor)")" "$(st held | grep -c .)" "$(short "$(st failed)")" "$(shipped_today)" "$(rolled_today)" "$([ -e "$CD_HOME/STOP.$P" ] && echo ' PAUSED')"; done
+             printf '%s live=%s floor=%s held=%s failed=%s today=%s rollbacks=%s%s\n' "$P" "$(short "$(st shipped)")" "$(short "$(st floor)")" "$(st held | grep -c .)" "$(short "$(st failed)")" "$(shipped_today)" "$(rolled_today)" "$([ -e "$CD_HOME/STOP.$P" ] && echo ' PAUSED')$([ -e "$CD_STATE/$P.anomaly" ] && echo " ANOMALY: $(head -1 "$CD_STATE/$P.anomaly")")"; done
            [ ! -e "$CD_HOME/STOP" ] || echo "kill switch: ON" ;;
   tick)    if [ -n "${2:-}" ]; then tick "$2"; else awk '!/^#/ && NF {print $1}' "$CD_HOME/repos" | while read -r p; do tick "$p"; done; fi ;;
   *) sed -n '2,10p' "$0"; exit 64 ;;
