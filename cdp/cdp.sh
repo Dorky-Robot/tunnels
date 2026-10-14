@@ -32,6 +32,8 @@
 #   else (no command, 3, ssh's 255): what is live is unknown: page, pause.
 #      The person puts the desk and the record in step (`cdp init <product>
 #      <what runs>` if they differ) before `cdp go`.
+# The desk keeps one release back, so nothing ships between an anomaly and
+# its rollback: a tick samples the signals before every prod step.
 #
 # Each repo's own <checkout>/.cd says how to gate, stage, smoke, ship, roll
 # back and watch it, and what holds for Felix. It is read from the LIVE
@@ -245,6 +247,7 @@ blip_stop() { [ -n "${BLIPPID:-}" ] || { BLIP="no probe"; return; }
 shipped_today() { grep -c "^$(date +%F) " "$CD_STATE/$P.ships" 2>/dev/null || echo 0; }
 rolled_today() { grep -c "^$(date +%F) " "$CD_STATE/$P.rollbacks" 2>/dev/null || echo 0; }
 stopped() { [ -e "$CD_HOME/STOP" ] || [ -e "$CD_HOME/STOP.$P" ] || [ -e "$CD_STATE/$P.anomaly" ]; }
+bad_now() { cat "$CD_STATE/$P".bad.* 2>/dev/null | grep -qvx 0; }     # a signal's last sample was bad
 
 # ── one product, one tick ──
 tick() {
@@ -291,6 +294,10 @@ tick() {
     if [ -e "$CD_STATE/$P.anomaly" ]; then why="$P has an anomaly a person has not cleared ($(head -1 "$CD_STATE/$P.anomaly")); cdp go $P"; else why="kill switch is on"; fi
     [ "$(st parked)" = "$CAND" ] || { put parked "$CAND"; ntfy "$P $short proven on staging; not shipped: $why"; }
     watch_between; unlock; return 0; fi
+  # One release back: the desk keeps only the build before the newest, so a
+  # ship over a bad signal would leave the suspect beyond reach. Look first.
+  a=$(sample watch); if [ -n "$a" ]; then suspect "$a"; unlock; return 0; fi
+  if bad_now; then say "$P $short: a signal read bad on its last sample; not shipping until it reads clean"; unlock; return 0; fi
 
   # ── prod, then watch ──
   say "$P $short: prod"
