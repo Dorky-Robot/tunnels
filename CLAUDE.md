@@ -141,3 +141,9 @@ a machine.
 For a mesh job (a box back after a power cut, a leaked tunnel token, a new machine, retiring a
 hostname, reviving a Claude lead), read `docs/runbooks/README.md` first and follow the runbook.
 When one turns out wrong, fix the step and add a line to its History.
+
+## Mesh handoff
+
+The Mesh lead was retired on 2026-10-14. Before you do any mesh work (backups, Immich, storage,
+cdp, safety install), read `docs/HANDOFF.md`: what is live, what is in flight, Felix's open asks
+and the traps that cost us.
