@@ -96,6 +96,9 @@ A yes for prod, deletions, DNS, money or sudo must be typed in the session that 
   - Delete by VersionId (every version and delete marker of the exact keys), or the space doesn't come back.
   - Name+size is not proof; use ETag or md5.
 - **Background sessions:** lead-keeper revives a `claude stop`'d session, so use `claude rm <id>` for a finished worker. Workers freeze silently on TCC: check each one within 30 minutes. runlog job classes have no "ops" or "code"; use feature or other.
+- **The global CLAUDE.md is not ours any more.** Since 10-15 every box's `~/.claude/CLAUDE.md` imports ecosystem-log's `claude/global.md`, and launchd `com.dorkyrobot.ecosystem-log-pull` keeps it current (ecosystem-log `claude/README.md`).
+  - install.sh's old step 6 (render `mesh/claude-global.md` + `claude-coordinator.md` between markers in that file) lives only in mac2024's 8 unpushed commits. When they are reconciled, drop step 6 and those two files; their text is already in the master. Run as-is, it would append the old block after the import.
+  - `claude -p` over plain ssh can't reach the login keychain on mac2024, the mini and dr1 ("Not logged in" / "OAuth session expired"). Run it as a one-shot `launchctl submit` job instead.
 - **PATH:** non-login ssh shells lack /opt/homebrew/bin (mac2019 uses /usr/local/bin). "Command not found" usually means PATH.
 
 ## Next READY items, in order
