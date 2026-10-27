@@ -1,13 +1,12 @@
 #!/usr/bin/python3
-"""scripts/lead-keeper.py against a fake `claude`, a fake `kapwa` and a fake ntfy.
+"""scripts/lead-keeper.py against a fake `claude` and a fake ntfy.
 
     /usr/bin/python3 tests/lead_keeper_test.py
 
 No real session is started, stopped or resumed and nothing leaves the
 machine: `claude` is a script that plays the supervisor from a JSON file
 (each "session" is a sleeping process named claude-fake, since a listed pid
-only counts when it is alive), `kapwa` records what it was asked, and ntfy
-is a server on 127.0.0.1.
+only counts when it is alive), and ntfy is a server on 127.0.0.1.
 """
 import http.server
 import json
@@ -77,13 +76,6 @@ if a[:2] == ["--bg", "--resume"]:
 print("fake claude: unexpected " + " ".join(a)); sys.exit(2)
 '''
 
-FAKE_KAPWA = r'''#!/usr/bin/python3
-import json, os, sys
-open(os.environ["FAKE_KAPWA_LOG"], "a").write(json.dumps(sys.argv[1:]) + "\n")
-print("said 4f2a9 on #mesh" if sys.argv[1] == "say" and len(sys.argv) > 2 else "ok")
-'''
-
-
 class Ntfy(http.server.BaseHTTPRequestHandler):
     alerts = []
 
@@ -125,7 +117,7 @@ class LeadKeeper(unittest.TestCase):
         os.makedirs(self.wcwd)
         json.dump({"projects": {self.cwd: {"hasTrustDialogAccepted": True}}},
                   open(os.path.join(self.home, ".claude.json"), "w"))
-        for name, body in (("claude", FAKE_CLAUDE), ("kapwa", FAKE_KAPWA)):
+        for name, body in (("claude", FAKE_CLAUDE),):
             p = os.path.join(t, name)
             open(p, "w").write(body)
             os.chmod(p, 0o755)
@@ -192,17 +184,12 @@ class LeadKeeper(unittest.TestCase):
     def revivals(self):
         return self.calls("--bg") + self.calls("respawn") + self.calls("stop")
 
-    def kapwa(self):
-        p = os.path.join(self.d, "kapwa.log")
-        return [json.loads(l) for l in open(p)] if os.path.exists(p) else []
-
     def titles(self):
         return [a["title"].split(": ", 1)[1] for a in Ntfy.alerts]
 
     def run_(self, *args, **env):
         e = dict(os.environ, HOME=self.home, CLAUDE_BIN=os.path.join(self.d, "claude"),
-                 KAPWA_BIN=os.path.join(self.d, "kapwa"), FAKE_WORLD=os.path.join(self.d, "world.json"),
-                 FAKE_KAPWA_LOG=os.path.join(self.d, "kapwa.log"), MESH_WATCH_ENV=os.path.join(self.d, "env"),
+                 FAKE_WORLD=os.path.join(self.d, "world.json"), MESH_WATCH_ENV=os.path.join(self.d, "env"),
                  LEAD_KEEPER_CONF=os.path.join(self.d, "leads.conf"), CLAUDE_JOBS=os.path.join(self.d, "jobs"),
                  CLAUDE_DAEMON_LOG=os.path.join(self.d, "daemon.log"),
                  LEAD_KEEPER_STATE=os.path.join(self.d, "state"), LEAD_KEEPER_RC_WAIT="0",
@@ -221,7 +208,7 @@ class LeadKeeper(unittest.TestCase):
     def test_all_up_does_nothing_but_look(self):
         self.assertEqual(self.run_(), "")
         self.assertEqual([c["argv"] for c in self.calls()], [["agents", "--json", "--all"]])
-        self.assertEqual(Ntfy.alerts + self.kapwa(), [])
+        self.assertEqual(Ntfy.alerts, [])
 
     # ---- who it keeps ------------------------------------------------------
 
@@ -244,7 +231,7 @@ class LeadKeeper(unittest.TestCase):
         self.assertIn('SendMessage CTO: "Mesh back"', told[0]["argv"][1])
         self.assertEqual(len(out.strip().splitlines()), 1)  # one line per revival
         self.assertIn("revived Mesh by wake", out)
-        self.assertEqual(Ntfy.alerts + self.kapwa(), [])    # a revival that works is not news
+        self.assertEqual(Ntfy.alerts, [])    # a revival that works is not news
         self.assertEqual(self.run_(), "")
 
     def test_a_dead_worker_comes_back_in_its_own_cwd_and_tells_its_lead(self):
@@ -295,7 +282,7 @@ class LeadKeeper(unittest.TestCase):
             self.assertEqual(self.run_(), "")
         self.assertEqual(len(self.calls("-p")), 3)
         self.assertEqual(len(self.calls("respawn")), 1)
-        self.assertEqual(Ntfy.alerts + self.kapwa(), [])
+        self.assertEqual(Ntfy.alerts, [])
 
     def test_a_stale_pid_in_the_list_is_dead(self):
         self.run_()
@@ -454,14 +441,12 @@ class LeadKeeper(unittest.TestCase):
         self.assertIn("since 2026-09-30T17:09:29Z", body)
         self.assertIn("without EnterWorktree", body)
         self.assertIn("2 messages queued", body)
-        self.assertEqual(len([k for k in self.kapwa() if k[0] == "say" and "--t" in k]), 1)
-        # restarted by someone and moving again: one "back", and the item is closed
+        # restarted by someone and moving again: one "back"
         open(path, "a").write(json.dumps({"type": "assistant", "timestamp": "2026-09-30T18:00:00Z",
                                           "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}}) + "\n")
         self.run_()
         self.run_()
         self.assertEqual(self.titles()[1:], ["Monica - daily briefs site is back"])
-        self.assertEqual([k[1] for k in self.kapwa() if k[0] == "done"], ["4f2a9"])
 
     def test_a_long_tool_call_is_not_a_stall(self):
         self.stuck("cccc0003", "long-tool-call.jsonl", status="busy")
@@ -598,9 +583,6 @@ class LeadKeeper(unittest.TestCase):
         self.run_(LEAD_KEEPER_RETRY_HOURS="0")
         self.run_()
         self.assertEqual(self.titles(), ["Mesh did not come back", "Mesh is back"])
-        done = [k for k in self.kapwa() if k[0] == "done"]
-        self.assertEqual(done[0][1], "4f2a9")                  # closes the item it opened
-        self.assertEqual(len([k for k in self.kapwa() if k[0] == "say" and "--t" in k]), 1)
 
     def test_a_lead_dying_twice_in_a_day_is_said_once(self):
         self.run_()

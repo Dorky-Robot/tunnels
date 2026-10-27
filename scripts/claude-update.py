@@ -45,7 +45,6 @@ RC_WAIT = float(os.environ.get("CLAUDE_UPDATE_RC_WAIT", "90"))
 BUSY_WAIT = float(os.environ.get("CLAUDE_UPDATE_BUSY_WAIT", "1800"))
 LSOF = os.environ.get("CLAUDE_UPDATE_LSOF", "/usr/sbin/lsof")
 FAIL_WEEKS = int(os.environ.get("CLAUDE_UPDATE_FAIL_RUNS", "2"))
-TAG = "claude-update"
 
 
 def log(msg):
@@ -241,7 +240,7 @@ def main():
             os.remove(LOCK)
         except OSError:
             pass
-        st["pending"], _ = flush(st["pending"], False, TAG)
+        st["pending"], _ = flush(st["pending"], False)
         st["last_run"] = stamp()
         save_json(path, st)
         with open(os.path.join(STATE, "last-run"), "w") as f:   # mesh-watch reads this

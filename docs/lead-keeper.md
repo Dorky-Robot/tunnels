@@ -26,7 +26,7 @@ plist is in `~/Library/LaunchAgents`, a `last-run` older than 11 minutes
 - **What it serves.** The org's Claude sessions on dorkyrobot2 (the leads
   and their workers) and the mesh that depends on them.
 - **Where the data stays.** On machines we own. The state and logs stay on
-  dorkyrobot2, and the kapwa notes stay on our own kapwa nodes. Nothing
+  dorkyrobot2. Nothing
   reads or copies a conversation: a revival only asks Claude to resume
   one, where it already lives.
 - **Peer-to-peer, no center.** Each box keeps its own sessions and needs
@@ -134,8 +134,7 @@ which costs none.
 ### What Felix hears
 
 A revival is one line in `~/Library/Logs/lead-keeper.log` and nothing else.
-Felix gets an ntfy alert, plus one kapwa item on `#mesh` signed
-`lead-keeper`, only when:
+Felix gets an ntfy alert only when:
 
 - a revival hung without Remote Control (once, with the path to grant),
 - a lead cannot be revived (untrusted cwd, missing cwd), a lead was
@@ -146,9 +145,9 @@ Felix gets an ntfy alert, plus one kapwa item on `#mesh` signed
 - `claude agents` has been unreadable for 30 minutes.
 
 Each of these is said once. When a lead that was reported down comes back,
-that is one low-priority ntfy, and the kapwa item is closed with `done`, not
-answered with a new one. An alert that cannot be sent waits for the next
-pass, for up to a day.
+that is one low-priority ntfy. (Until 2026-10-27 each alert was also a
+kapwa item on `#mesh`; the old board is retired.) An alert that cannot be
+sent waits for the next pass, for up to a day.
 
 Alerts use mesh-watch's channel: `MESH_WATCH_NTFY` in
 `~/.config/mesh-watch/env`. If that is not set, the ntfy half waits.
@@ -222,5 +221,5 @@ restart anything that carries ssh.
     /usr/bin/python3 tests/lead_keeper_test.py
     /usr/bin/python3 tests/claude_update_test.py
 
-Both run against a fake `claude`, a fake `kapwa` and a local ntfy, and
+Both run against a fake `claude` and a local ntfy, and
 start, stop and resume nothing real.

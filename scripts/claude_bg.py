@@ -31,7 +31,6 @@ import time
 
 HOME = os.path.expanduser("~")
 CLAUDE = os.environ.get("CLAUDE_BIN", os.path.join(HOME, ".local/bin/claude"))
-KAPWA = os.environ.get("KAPWA_BIN", os.path.join(HOME, ".local/bin/kapwa"))
 # mesh-watch's alert channel: one topic, one env file, the topic never in git.
 ENVFILE = os.environ.get("MESH_WATCH_ENV", os.path.join(HOME, ".config/mesh-watch/env"))
 PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -340,36 +339,10 @@ def ntfy(title, body, dry, priority="high", tags="rotating_light"):
     return rc == 0
 
 
-def kapwa(headline, detail, tag, dry, done=None):
-    """One item on #mesh: the headline is its name forever, so it is short
-    and the detail goes in a note on it. With done=<id>, close that item
-    instead of opening one: the recovery answers the alert where it was
-    raised. The item's id (or True) once it is on the board, else None."""
-    if dry:
-        print("KAPWA #mesh %s%s\n  %s\n" % ("done %s: " % done if done else "", headline, detail))
-        return True
-    if not os.path.exists(KAPWA):
-        return None
-    if done:
-        rc, _, _ = run([KAPWA, "done", done, headline + ". " + detail, "--tag", tag], 60)
-        return done if rc == 0 else None
-    rc, out, _ = run([KAPWA, "say", headline, "--t", "mesh", "--tag", tag], 60)
-    if rc != 0:
-        return None
-    # kapwa ids are short hex; one with a digit in it, so a word like
-    # "added" in the output is not mistaken for one.
-    m = re.search(r"\b((?=[0-9a-f]*[0-9])[0-9a-f]{5,12})\b", plain(out))
-    if not m:
-        return True
-    if detail:
-        run([KAPWA, "say", m.group(1), detail, "--tag", tag], 60)
-    return m.group(1)
-
-
-def flush(pending, dry, tag):
+def flush(pending, dry):
     """Send what is waiting, oldest first. Returns (what did not go, what
-    did). An alert is ntfy and kapwa both, each half retried on its own;
-    a sent alert carries its kapwa item id in "kapwa_sent"."""
+    did). An alert is an ntfy push, retried until it goes. (It was also a
+    kapwa item on #mesh until the old board was retired, 2026-10-27.)"""
     left, sent = [], []
     for a in pending:
         if "at" in a and (now() - parse(a["at"])).total_seconds() > 86400:
@@ -377,9 +350,7 @@ def flush(pending, dry, tag):
         if not a.get("ntfy_sent"):
             a["ntfy_sent"] = ntfy(a["title"], a["body"], dry, a.get("priority", "high"),
                                   a.get("tags", "rotating_light"))
-        if not a.get("kapwa_sent"):
-            a["kapwa_sent"] = kapwa(a["title"], a["body"], tag, dry, a.get("kapwa_done"))
-        (sent if a["ntfy_sent"] and a["kapwa_sent"] else left).append(a)
+        (sent if a["ntfy_sent"] else left).append(a)
     return left, sent
 
 

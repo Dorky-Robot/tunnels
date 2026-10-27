@@ -46,7 +46,7 @@ Leads first, then workers; while memory is tight only the leads.
 
 A revival counts once `claude logs <id>` shows a claude.ai/code link within
 60 s. One that never shows it is the privacy-prompt hang: the attempt is
-stopped, Felix hears once (ntfy, and one kapwa item on #mesh) which path
+stopped, Felix hears once (ntfy) which path
 needs Full Disk Access, and nothing is revived again until the Claude
 binary changes or someone runs --clear. Otherwise it is quiet: a revival is
 one log line. Felix also hears when a lead cannot be revived, or dies twice
@@ -81,7 +81,6 @@ HUNG_RUNS = int(os.environ.get("LEAD_KEEPER_HUNG_RUNS", "3"))
 TRUST_MIN = float(os.environ.get("LEAD_KEEPER_TRUST_MIN", "15"))
 UNREADABLE_RUNS = int(os.environ.get("LEAD_KEEPER_UNREADABLE_RUNS", "6"))
 DOT = " · "
-TAG = "lead-keeper"
 
 NOTE_LEAD = ("You were restarted by lead-keeper ({why}). Check your ledger and any workers "
              "you had, then SendMessage CTO: \"{name} back\".")
@@ -149,13 +148,11 @@ def alert(st, ss, key, title, body, name=None):
 
 
 def back(st, ss, name, e):
-    """Something Felix was told is down is up again: say so once, and close
-    the kapwa item that said it was down rather than opening another."""
-    item = ss.pop("kapwa_item", None)
+    """Something Felix was told is down is up again: say so once."""
+    ss.pop("kapwa_item", None)       # left by the retired kapwa board
     st["pending"].append({"at": stamp(), "title": "%s: %s is back" % (box(), name),
                           "body": "%s is up again as %s (pid %s)." % (name, e.get("id") or e.get("kind"), e.get("pid")),
-                          "priority": "default", "tags": "white_check_mark",
-                          "kapwa_done": item, "kapwa_sent": None if item else True})
+                          "priority": "default", "tags": "white_check_mark"})
     log("BACK %s" % name)
 
 
@@ -445,10 +442,7 @@ def main():
         for a in st["pending"]:
             print("waiting to be sent: %s" % a["title"])
         return 0
-    st["pending"], sent = flush(st["pending"], False, TAG)
-    for a in sent:  # remember where trouble was raised, to close it there
-        if a.get("down") and a.get("lead") in st["sessions"] and isinstance(a["kapwa_sent"], str):
-            st["sessions"][a["lead"]]["kapwa_item"] = a["kapwa_sent"]
+    st["pending"], _ = flush(st["pending"], False)
     save_json(path, st)
     with open(os.path.join(STATE, "last-run"), "w") as f:
         f.write(stamp() + "\n")

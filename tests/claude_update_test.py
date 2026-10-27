@@ -144,7 +144,7 @@ class ClaudeUpdate(unittest.TestCase):
 
     def run_(self, *args, **env):
         t = self.d
-        e = dict(os.environ, HOME=t, CLAUDE_BIN=os.path.join(t, "bin/claude"), KAPWA_BIN=os.path.join(t, "no-kapwa"),
+        e = dict(os.environ, HOME=t, CLAUDE_BIN=os.path.join(t, "bin/claude"),
                  FAKE_WORLD=os.path.join(t, "world.json"), MESH_WATCH_ENV=os.path.join(t, "env"),
                  CLAUDE_UPDATE_STATE=os.path.join(t, "state"), CLAUDE_UPDATE_LOCK=os.path.join(t, "state/running"),
                  CLAUDE_JOBS=os.path.join(t, "jobs"), CLAUDE_BUNDLE=os.path.join(t, "ClaudeCode.app"),
