@@ -63,8 +63,17 @@ fi
 
 # ---- one machine ------------------------------------------------------------
 # run <machine> <command>: here, or over the mesh
+# Tailscale SSH (the tailnet path to every box but this one since 2026-10-28)
+# reports every remote command as a success (tailscale/tailscale#18256), so the
+# far side prints its own status last and that line decides. No line at all
+# (ssh could not connect, or the session died) is a failure.
 run() {
-  if [ "$1" = "$first" ]; then sh -c "$2"; else ssh -o BatchMode=yes -o ConnectTimeout=15 "$1" "$2"; fi
+  if [ "$1" = "$first" ]; then sh -c "$2"; return; fi
+  _rf=$(mktemp)
+  ssh -o BatchMode=yes -o ConnectTimeout=15 "$1" "{ $2
+}; echo __rc=\$?" | tee "$_rf" | grep -v '^__rc=[0-9]*$'
+  _rc=$(sed -n 's/^__rc=\([0-9]*\)$/\1/p' "$_rf" | tail -1); rm -f "$_rf"
+  [ "${_rc:-255}" = 0 ]
 }
 KGS='"$HOME/.local/bin/github-key-setup"'
 summary=; keys=
