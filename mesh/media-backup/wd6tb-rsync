@@ -1,0 +1,47 @@
+#!/usr/bin/python3
+"""The photo backup's rsync on dorkyrobot1: every path anchored at /Volumes/WD6TB.
+
+Installed at ~/.local/bin/wd6tb-rsync on dorkyrobot1. dorkyrobot2's
+~/Services/media-backup/backup.sh names it with --rsync-path.
+
+Why it exists. Until 2026-10-28 the backup's key on dr1 carried the forced
+command `rrsync /Volumes/WD6TB`, so whatever dr2 asked for, rsync only ever saw
+paths inside that drive and refused `..`. Since then the tailnet ssh to dr1 is
+Tailscale SSH, which never reads authorized_keys: the forced command is gone
+and the client runs whatever it names. Felix, 11-05: "we should make sure
+everything works with tailscale", so the backup stays on the tailnet and asks
+for this wrapper itself. It rebuilds the command line rrsync expects in
+SSH_ORIGINAL_COMMAND (sshd's format, args backslash-escaped) and hands over to
+the same rrsync, so the WD6TB-only rules, option checks and refusals are
+exactly the ones the forced key had.
+
+What it is and is not. It keeps a mistake in backup.sh (a wrong path, an
+absolute one, a `..`) from ever writing outside WD6TB. It is not a lock
+against someone on dr2: Tailscale SSH gives any dr2 login a full shell on dr1,
+whatever this file says. That is the tailnet ssh policy's job, not the
+backup's.
+
+Over the -lan or cloudflare- path the old key's forced command still applies,
+and it runs rrsync directly; backup.sh must not name this wrapper there.
+
+Failure is loud without the ssh exit status (which Tailscale SSH on macOS
+loses, tailscale/tailscale#18256): rrsync refusing closes the stream before the
+rsync protocol finishes, and the client rsync on dr2 exits non-zero by itself.
+"""
+import os
+import re
+import sys
+
+ROOT = "/Volumes/WD6TB"
+RRSYNC = os.path.expanduser("~/.local/bin/rrsync")
+
+# rrsync splits SSH_ORIGINAL_COMMAND on unescaped whitespace and strips the
+# backslashes (braceexpand), as rsync's own client escapes for a remote shell.
+def esc(arg):
+    return re.sub(r"([^A-Za-z0-9._,+:/=@%^-])", r"\\\1", arg)
+
+if sys.argv[1:2] != ["--server"]:
+    sys.exit("wd6tb-rsync: only rsync --server, as rsync's --rsync-path runs it")
+
+os.environ["SSH_ORIGINAL_COMMAND"] = "rsync " + " ".join(esc(a) for a in sys.argv[1:])
+os.execv("/usr/bin/python3", ["/usr/bin/python3", RRSYNC, ROOT])

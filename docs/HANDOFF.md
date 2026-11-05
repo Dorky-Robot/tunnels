@@ -92,6 +92,7 @@ A yes for prod, deletions, DNS, money or sudo must be typed in the session that 
   - It anchors `/` at the WD6TB root and refuses `..`.
   - `--backup-dir` must exist first (`--mkpath`).
   - Test through tests/rrsync-dr1, never a local destination.
+  - Since 11-05 the run goes over Tailscale SSH, which skips the key's forced command, so backup.sh names `--rsync-path=~/.local/bin/wd6tb-rsync` (source `mesh/media-backup/wd6tb-rsync`), which hands each call to the same rrsync. Without it the marker fetch fails (rc 23) and the night ABORTs. A failed night pushes to ntfy (dr2 `~/.local/bin/media-backup.sh`).
 - **S3:** sara-photo-shoots is versioned.
   - Delete by VersionId (every version and delete marker of the exact keys), or the space doesn't come back.
   - Name+size is not proof; use ETag or md5.
