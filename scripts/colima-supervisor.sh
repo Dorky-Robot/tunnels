@@ -28,7 +28,13 @@
 #   COLIMA_REQUIRE     paths that must be readable before the VM starts, e.g.
 #                      "/Volumes/T7/nextcloud/data/.ncdata"
 #   COLIMA_HOP_KEY     an ssh key; when set, the mount and `colima start` run
-#                      through `ssh localhost` instead of in this job
+#                      through `ssh localhost` instead of in this job. Unset, it
+#                      defaults to ~/.ssh/id_localhost_colima when that key
+#                      exists, so a machine can turn the hop on by installing
+#                      the key and the script: launchd keeps a loaded job's
+#                      environment, and `kickstart -k` does not re-read the
+#                      plist (tested 2026-11-05), so an env change means a
+#                      bootout, which doug-mini's rules forbid over ssh.
 #
 # WHY THE HOP (2026-09-29): a launchd job may not read an external volume
 # (TCC), and neither may anything it starts. doug-mini's nightly replica
@@ -61,6 +67,7 @@ VOLUMES=${COLIMA_VOLUMES:-}
 CONTAINERS=${COLIMA_CONTAINERS:-}
 REQUIRE=${COLIMA_REQUIRE:-}
 HOP_KEY=${COLIMA_HOP_KEY:-}
+[ -z "$HOP_KEY" ] && [ -r "$HOME/.ssh/id_localhost_colima" ] && HOP_KEY="$HOME/.ssh/id_localhost_colima"
 MODE=${1:-}
 
 # Pin the Docker endpoint. Bare `docker` resolves through currentContext in
