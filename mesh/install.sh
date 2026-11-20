@@ -23,8 +23,7 @@
 #                                       tunnels too old to have an agent, the old
 #                                       tunnel-watchdog.sh does that last part instead.
 #   com.dorkyrobot.taildrop-inbox       files sent by `tailscale file cp` land in ~/Projects/inbox
-#   ~/.claude/CLAUDE.md                 the mesh block: mesh/claude-global.md, and
-#                                       mesh/claude-coordinator.md where it applies
+#   ~/.claude/CLAUDE.md                 nothing: it only removes the old mesh block
 #
 # What it does NOT do, because it cannot be done from one machine:
 #   - make this machine's mesh key or GitHub key (docs/remote-access.md,
@@ -177,29 +176,21 @@ if ! cmp -s "$here/com.dorkyrobot.taildrop-inbox.plist" "$P" || ! launchctl prin
   launchctl bootstrap "gui/$(id -u)" "$P"
 fi
 
-# ---- 6. Claude: Taildrop is how agents move files --------------------------
-# mesh/claude-global.md goes between markers at the end of ~/.claude/CLAUDE.md;
-# the rest of the file is left as it was. (Not mesh/claude.md: on a Mac that
-# is also mesh/CLAUDE.md, and Claude would load it as this directory's own.)
-# The permission that lets agents run `tailscale file cp` without asking is
-# added by a person, not by this script: agents may not grant themselves one.
-#
-# mesh/claude-coordinator.md follows it in the same block: sessions act as a
-# coordinator that staffs subagent teams. Felix's way of working, so not on a
-# box someone else uses as their own.
-cfiles=$here/claude-global.md
-case $H in dougs-mac-mini-2024) ;; *) cfiles="$cfiles $here/claude-coordinator.md" ;; esac
-C=$HOME/.claude; mkdir -p "$C"
-cm=$C/CLAUDE.md; [ -f "$cm" ] || : > "$cm"
+# ---- 6. Claude: no block of ours in ~/.claude/CLAUDE.md --------------------
+# Every box's global instructions come from ecosystem-log's claude/global.md
+# (Felix, 10-15: one master). This step used to write mesh/claude-global.md and
+# claude-coordinator.md between markers here, and those older words ("hand the
+# work to subagents (Agent tool)") contradict the master. On 2026-11-20 a
+# rollout put the block back on five boxes. So now it only takes an old block
+# out, and never writes one; the two .md files here are history.
+cm=$HOME/.claude/CLAUDE.md
 cbegin='<!-- >>> mesh — managed by tunnels/mesh/install.sh; edit mesh/claude-global.md, not this >>> -->'
 cend='<!-- <<< mesh <<< -->'
-{
+if [ -f "$cm" ] && grep -qxF "$cbegin" "$cm"; then
   awk -v b="$cbegin" -v e="$cend" '$0 == b { skip = 1; next } $0 == e { skip = 0; next } !skip' "$cm" \
-    | awk '{ l[NR] = $0 } NF { n = NR } END { for (i = 1; i <= n; i++) print l[i] }'
-  printf '\n%s\n' "$cbegin"; awk 'FNR == 1 && NR > 1 { print "" } 1' $cfiles; echo "$cend"
-} > "$cm.new"
-if cmp -s "$cm.new" "$cm"; then rm -f "$cm.new"
-else cp "$cm" "$C/CLAUDE.md.bak.$stamp"; mv "$cm.new" "$cm"; echo "· ~/.claude/CLAUDE.md: mesh block"; fi
+    | awk '{ l[NR] = $0 } NF { n = NR } END { for (i = 1; i <= n; i++) print l[i] }' > "$cm.new"
+  cp "$cm" "$HOME/.claude/CLAUDE.md.bak.$stamp"; mv "$cm.new" "$cm"; echo "· ~/.claude/CLAUDE.md: old mesh block removed"
+fi
 
 h() { shasum -a 256 "$1" | cut -c1-12; }
 printf '%s  mesh.conf %s  known_hosts %s  github.conf %s  %s\n' "$H" \
