@@ -201,7 +201,7 @@ fn handle(shared: Shared, mut req: Request) {
     }
     // machine-to-machine endpoints are for peers on the tailnet, never for a
     // browser through Cloudflare, admin or not
-    let peer_only = matches!(path, "/api/cf-forward" | "/api/relay-exec" | "/api/notify");
+    let peer_only = matches!(path, "/api/cf-forward" | "/api/connector-token" | "/api/relay-exec" | "/api/notify");
     if who.via_cloudflare && peer_only {
         reply_err(req, 403, "not through Cloudflare");
         return;
@@ -578,6 +578,37 @@ fn handle(shared: Shared, mut req: Request) {
             match crate::api::call(c, &config, &fleet, &me) {
                 Ok(out) => reply_json(req, 200, &out),
                 Err(e) => reply_err(req, 400, &format!("{e:#}")),
+            }
+        }
+        (Method::Post, "/api/connector-token") => {
+            // a peer with no API token for a tunnel's account asks for the
+            // connector token of a tunnel the fleet says it runs. The API
+            // token stays here; the hand-over is logged here, with who asked.
+            #[derive(Deserialize)]
+            struct X {
+                tunnel: String,
+                requested_by: String,
+            }
+            let remote = req.remote_addr().map(|a| a.ip());
+            let Ok(x) = serde_json::from_str::<X>(&body) else { return reply_err(req, 400, "want {tunnel, requested_by}") };
+            let fleet = Fleet::load().ok().flatten().unwrap_or_default();
+            if let Err(why) = may_forward(&fleet, &x.requested_by, remote) {
+                return reply_err(req, 403, &why);
+            }
+            let (account_id, tunnel_id) = match crate::api::connector_grant(&fleet, &x.requested_by, &x.tunnel) {
+                Ok(g) => g,
+                Err(why) => return reply_err(req, 403, &why),
+            };
+            let config = Config::load().unwrap_or_default();
+            let Some(client) = crate::api::directory(&config).client_for_account(&account_id) else {
+                return reply_err(req, 409, "no token here for that");
+            };
+            match client.connector_token(&account_id, &tunnel_id) {
+                Ok(token) => {
+                    eprintln!("{} web: gave {} the connector token for {}", util::now_rfc3339(), x.requested_by, x.tunnel);
+                    reply_json(req, 200, &serde_json::json!({ "token": token }))
+                }
+                Err(e) => reply_err(req, 400, &format!("{e}")),
             }
         }
         (Method::Post, "/api/notify") => {

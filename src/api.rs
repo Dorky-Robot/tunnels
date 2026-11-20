@@ -637,6 +637,66 @@ fn forward(c: &Call, fleet: &Fleet, me: &str) -> Result<Outcome> {
     )
 }
 
+// ------------------------------------------------------------------ connector tokens from a peer
+
+/// Which tunnel's connector token a peer may be given: one the fleet says
+/// `from` runs, in an account the fleet knows. Returns (account id, tunnel
+/// id). The caller has already checked that `from` is who it says and is on
+/// `policy.remote_from`; this is the second half, so a trusted machine still
+/// gets only the tokens for its own tunnels.
+pub fn connector_grant(fleet: &Fleet, from: &str, tunnel: &str) -> Result<(String, String), String> {
+    let (alias, t) = fleet.find_tunnel(tunnel).ok_or_else(|| format!("no tunnel `{tunnel}` in the fleet"))?;
+    if t.machine.as_deref() != Some(from) {
+        return Err(format!("the fleet does not say {from} runs {alias}"));
+    }
+    let a = fleet.accounts.get(&t.account).ok_or_else(|| format!("{alias}'s account `{}` is not in the fleet", t.account))?;
+    Ok((a.id.clone(), t.id.clone()))
+}
+
+/// The connector token for a tunnel this machine runs, from a peer, when no
+/// API token here reaches its account. A new box needs only its place in the
+/// fleet: no API token of its own, and nobody pasting a secret on a web page.
+/// Only machines on `policy.remote_from` are asked; each gives it only to the
+/// machine the fleet assigns the tunnel to, calling from that machine's
+/// tailnet address, and logs that it did. The token is checked to be for
+/// that tunnel before it is used. Returns the token and the peer that gave it.
+pub fn peer_connector_token(fleet: &Fleet, me: &str, tunnel: &str) -> Result<(String, String)> {
+    let (_, want_id) = connector_grant(fleet, me, tunnel).map_err(|e| anyhow!(e))?;
+    let port = fleet.policy.web_port;
+    let body = serde_json::json!({ "tunnel": tunnel, "requested_by": me });
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(40)))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut refusals = Vec::new();
+    for (name, m) in fleet.machines.iter().filter(|(n, _)| n.as_str() != me && fleet.trusts(n)) {
+        let Ok(mut resp) = agent
+            .post(&format!("http://{}:{port}/api/connector-token", m.host))
+            .header("X-Tunnels", "1")
+            .send_json(&body)
+        else {
+            refusals.push(format!("{name}: not answering"));
+            continue;
+        };
+        let status = resp.status().as_u16();
+        let v: Value = resp.body_mut().read_json().unwrap_or(Value::Null);
+        if status != 200 {
+            refusals.push(format!("{name}: {}", v["error"].as_str().unwrap_or("refused")));
+            continue;
+        }
+        let Some(token) = v["token"].as_str() else {
+            refusals.push(format!("{name}: no token in its answer"));
+            continue;
+        };
+        match crate::config::decode_token(token) {
+            Ok(p) if p.tunnel_id.eq_ignore_ascii_case(&want_id) => return Ok((token.to_string(), name.clone())),
+            _ => refusals.push(format!("{name}: gave a token that is not for {tunnel}")),
+        }
+    }
+    bail!("no peer gave it:\n  {}", refusals.join("\n  "))
+}
+
 // ------------------------------------------------------------------ the log
 
 pub fn log_dir() -> PathBuf {
@@ -704,6 +764,19 @@ pub fn diff(before: Option<&Value>, after: Option<&Value>) -> Vec<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_machine_is_granted_the_connector_token_only_for_a_tunnel_it_runs() {
+        let f = crate::fleet::tests::sample();
+        assert_eq!(
+            connector_grant(&f, "dr1", "vet-prod"),
+            Ok(("acct-vet".to_string(), "6da56f03-7687-46a4-b023-7557decbc04b".to_string()))
+        );
+        // dr2 is in the fleet and runs the standby, but vet-prod is dr1's
+        assert!(connector_grant(&f, "dr2", "vet-prod").unwrap_err().contains("does not say dr2 runs vet-prod"));
+        assert!(connector_grant(&f, "dr1", "nope").is_err());
+        assert!(connector_grant(&f, "stranger", "vet-prod").is_err());
+    }
 
     #[test]
     fn a_patch_is_undone_with_just_the_fields_it_changed() {

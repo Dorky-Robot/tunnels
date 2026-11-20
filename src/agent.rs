@@ -194,13 +194,23 @@ fn tick(shared: &Shared) -> Result<Tick> {
         sync::notify(&fleet, &me);
     }
 
-    // 3a. a rotated tunnel: fetch the new connector token
+    // 3a. a rotated tunnel: fetch the new connector token (from a peer, for
+    // a machine with no API token of its own)
     for alias in &mine {
         let t = &fleet.tunnels[alias];
         let Some(local_t) = config.tunnel_by_id(&t.id).cloned() else { continue };
-        let Some(obs) = snap.tunnel(&t.id) else { continue };
-        let Some(client) = snap.client_for_account(&obs.account_id) else { continue };
-        let Ok(fresh) = client.connector_token(&obs.account_id, &t.id) else { continue };
+        let own = snap.tunnel(&t.id).and_then(|obs| snap.client_for_account(&obs.account_id).map(|c| (c, obs.account_id.clone())));
+        let fresh = match own {
+            Some((client, acct)) => match client.connector_token(&acct, &t.id) {
+                Ok(f) => f,
+                Err(_) => continue,
+            },
+            None if peer_check_due(alias) => match crate::api::peer_connector_token(&fleet, &me, alias) {
+                Ok((f, _)) => f,
+                Err(_) => continue,
+            },
+            None => continue,
+        };
         let old_secret = crate::config::decode_token(&local_t.token).map(|p| p.secret).unwrap_or_default();
         let new_secret = crate::config::decode_token(&fresh).map(|p| p.secret).unwrap_or_default();
         if !new_secret.is_empty() && old_secret != new_secret {
@@ -367,3 +377,18 @@ fn failover(fleet: &Fleet, snap: &observe::Snapshot, me: &str, shared: &Shared) 
         }
     }
 }
+
+/// Asking a peer for a connector token costs it a Cloudflare call, so a
+/// machine with no API token of its own looks for a rotation every 15
+/// minutes, not every pass.
+fn peer_check_due(alias: &str) -> bool {
+    static LAST: Mutex<BTreeMap<String, i64>> = Mutex::new(BTreeMap::new());
+    let now = util::now_epoch();
+    let mut last = LAST.lock().unwrap();
+    if last.get(alias).is_some_and(|t| now - t < 900) {
+        return false;
+    }
+    last.insert(alias.to_string(), now);
+    true
+}
+

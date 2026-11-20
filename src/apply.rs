@@ -148,6 +148,14 @@ pub fn apply(plan: &Plan, snap: &Snapshot, config: &mut Config, opts: &Options) 
     report
 }
 
+/// A connector token from a peer, for a Mac with no API token for its
+/// account (`api::peer_connector_token`).
+fn from_a_peer(config: &Config, tunnel: &str) -> Result<String> {
+    let fleet = crate::fleet::Fleet::load()?.ok_or_else(|| anyhow!("no fleet file here"))?;
+    let me = crate::fleet::this_machine(config, Some(&fleet));
+    Ok(crate::api::peer_connector_token(&fleet, &me, tunnel)?.0)
+}
+
 fn client_for_account(snap: &Snapshot, account_id: &str) -> Result<Client> {
     snap.client_for_account(account_id)
         .ok_or_else(|| anyhow!("no API token here can reach account {account_id}"))
@@ -237,10 +245,12 @@ fn step(a: &Action, snap: &Snapshot, config: &mut Config, opts: &Options, undo: 
             let (name, token) = match local_name.as_ref().and_then(|n| config.tunnel_by_name(n)) {
                 Some(t) => (t.name.clone(), t.token.clone()),
                 None => {
-                    let c = client_for_account(snap, account_id).context(
-                        "this Mac has no connector token for it, and no API token that could fetch one",
-                    )?;
-                    let token = c.connector_token(account_id, tunnel_id).context("fetching the connector token")?;
+                    let token = match snap.client_for_account(account_id) {
+                        Some(c) => c.connector_token(account_id, tunnel_id).context("fetching the connector token")?,
+                        None => from_a_peer(config, tunnel).context(
+                            "this Mac has no connector token for it and no API token that could fetch one, and no peer gave one",
+                        )?,
+                    };
                     config.upsert_tunnel(tunnel, &token)?;
                     (tunnel.clone(), token)
                 }
