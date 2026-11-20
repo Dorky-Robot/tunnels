@@ -592,6 +592,11 @@ fn handle(shared: Shared, mut req: Request) {
             let remote = req.remote_addr().map(|a| a.ip());
             let Ok(x) = serde_json::from_str::<X>(&body) else { return reply_err(req, 400, "want {tunnel, requested_by}") };
             let fleet = Fleet::load().ok().flatten().unwrap_or_default();
+            // a secret goes only to the asker's own tailnet address: loopback
+            // would let any process here claim to be any machine
+            if remote.is_some_and(|ip| ip.is_loopback()) {
+                return reply_err(req, 403, "not from loopback: a machine never asks itself");
+            }
             if let Err(why) = may_forward(&fleet, &x.requested_by, remote) {
                 return reply_err(req, 403, &why);
             }

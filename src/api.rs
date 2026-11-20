@@ -664,8 +664,11 @@ pub fn peer_connector_token(fleet: &Fleet, me: &str, tunnel: &str) -> Result<(St
     let (_, want_id) = connector_grant(fleet, me, tunnel).map_err(|e| anyhow!(e))?;
     let port = fleet.policy.web_port;
     let body = serde_json::json!({ "tunnel": tunnel, "requested_by": me });
+    // short: this runs inside the agent's pass, and a sleeping peer must not
+    // hold up failover and repairs on this machine
     let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(40)))
+        .timeout_connect(Some(std::time::Duration::from_secs(3)))
+        .timeout_global(Some(std::time::Duration::from_secs(10)))
         .http_status_as_error(false)
         .build()
         .into();

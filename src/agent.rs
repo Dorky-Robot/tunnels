@@ -205,7 +205,9 @@ fn tick(shared: &Shared) -> Result<Tick> {
                 Ok(f) => f,
                 Err(_) => continue,
             },
-            None if peer_check_due(alias) => match crate::api::peer_connector_token(&fleet, &me, alias) {
+            // only when no API token here reaches the account: a tunnel this
+            // pass failed to observe is unknown, not missing
+            None if no_token_for(&fleet, &snap, &t.account) && peer_check_due(alias) => match crate::api::peer_connector_token(&fleet, &me, alias) {
                 Ok((f, _)) => f,
                 Err(_) => continue,
             },
@@ -376,6 +378,11 @@ fn failover(fleet: &Fleet, snap: &observe::Snapshot, me: &str, shared: &Shared) 
             None
         }
     }
+}
+
+/// No API token on this machine reaches the fleet account `account`.
+fn no_token_for(fleet: &Fleet, snap: &observe::Snapshot, account: &str) -> bool {
+    fleet.accounts.get(account).is_some_and(|a| snap.client_for_account(&a.id).is_none())
 }
 
 /// Asking a peer for a connector token costs it a Cloudflare call, so a
