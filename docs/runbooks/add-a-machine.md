@@ -95,7 +95,8 @@ Pick two names before you start: `<name>`, the short one everybody types
 
    ```sh
    tunnels fleet edit    # add [machines.<name>] host = "<host>"; add "<name>"
-                         # to remote_from only if it should publish the fleet
+                         # to remote_from if it should publish the fleet or take
+                         # its connector tokens from a peer (step 7)
    ```
 
    Then on the new box:
@@ -109,8 +110,11 @@ Pick two names before you start: `<name>`, the short one everybody types
 
 7. **Its tunnel**, from a listed box: `tunnels tunnel create <alias>
    --account <acct> --machine <name>`. The new box's agent fetches the
-   connector token with its own API token and starts it; without one, give
-   it the token on its card in the web UI. Routes: `tunnels route add`.
+   connector token with its own API token and starts it; without one, it
+   asks the boxes on `remote_from` for it, which give it only to the box the
+   fleet assigns that tunnel to (0.25.2). A box that is not on `remote_from`
+   itself (doug-mini, sara) is refused: give it the token on its card in the
+   web UI. Routes: `tunnels route add`.
 
 8. **The root watchdog**, so stranded user agents are started after a
    reboot. Needs the password, on the box or over `ssh <name>`:
