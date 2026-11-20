@@ -6,9 +6,12 @@
 #   address  fixed, on 192.168.2.0/24 — the subnet macOS Internet Sharing
 #            hands out, and .1 is the box that would do the sharing
 #
-# The cable is a chain, not a switch: mac2019 — dorkyrobot1 — dorkyrobot2 —
-# mini. Each Mac bridges its Thunderbolt ports, so the ends reach each other
-# through the middle two, and a middle box that is off splits the chain.
+# Since 2026-11-20 (Felix rearranged the boxes) the cable joins dorkyrobot1,
+# dorkyrobot2 and dorkyrobot3, the Mac Studio. The mini and mac2019 are off it,
+# so they have no -tb name: a job that used one falls back to the plain name.
+# (Before: a chain, mac2019 — dorkyrobot1 — dorkyrobot2 — mini.) Each Mac
+# bridges its Thunderbolt ports, so a box in the middle that is off splits it.
+# Pings are dropped on the bridge (stealth firewall): test a path with ssh.
 #
 # The address is not installed from here; it is set once on the machine:
 #
@@ -20,5 +23,4 @@
 # name       address
 dorkyrobot2  192.168.2.1
 dorkyrobot1  192.168.2.11
-mini         192.168.2.12
-mac2019      192.168.2.19
+dorkyrobot3  192.168.2.4
