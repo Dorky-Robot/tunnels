@@ -41,3 +41,8 @@ dorkyrobot2  dorkyrobot2          dorkyrobot2  100.97.227.67   ssh-dorkyrobot2.f
 # One way: the mesh reaches it, it reaches nothing (keys/sara.none).
 # Host keys were read over the tailnet and matched by fingerprint from mac2024.
 sara         saras-mac            sarameiggs   100.68.208.6    -                                  5907  -
+# The Mac Studio (arrived 2026-11-20), for the heavy video and model work:
+# Alex's analyzer, dog tracking, call transcription. Its account is
+# dorkyrobot3, as dr2's is dorkyrobot2. Joined by mesh/join at its screen; the
+# host key that arrived matched the one it showed mac2024 over the tailnet.
+dorkyrobot3  dorkyrobot3          dorkyrobot3  100.96.143.112  ssh-dorkyrobot3.felixflor.es       5908  felixflores  dr3
