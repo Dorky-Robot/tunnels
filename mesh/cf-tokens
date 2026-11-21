@@ -14,7 +14,8 @@ prints a token's value, and a manager token never leaves this box.
 
   cf-tokens receive <login>        [this Mac; reads cloudflare] keep a manager token, typed at a hidden prompt
   cf-tokens list [<login>]         [read-only] every token of the login, and which box runs on each
-  cf-tokens delete <login> <id>    [cloudflare] delete a token no box runs on (previewed until --yes)
+  cf-tokens delete <login> <id>    [cloudflare] delete a token no box runs on and nothing has used for 30 days
+                                   (previewed until --yes; --although-used for one something still uses)
   cf-tokens roll <login> <box>     [cloudflare + that box] give a box's token a new value and hand it over
                                    (previewed until --yes); the old value is dead from that moment
   cf-tokens roll <login> --all     the same for every box in turn, stopping at the first that fails
@@ -23,17 +24,29 @@ prints a token's value, and a manager token never leaves this box.
 <login> is the fleet's account alias: dorkyrobot (the company's Cloudflare login) or felixflor (Felix's own).
 <id> is a token's id or its first letters, from `list`. Runbook: docs/runbooks/roll-an-api-token.md.
 """
-import getpass, json, os, re, socket, subprocess, sys, urllib.error, urllib.request
+import datetime, getpass, json, os, re, socket, subprocess, sys, urllib.error, urllib.request
 
 API = "https://api.cloudflare.com/client/v4"
 HOME = os.path.expanduser("~")
 DIR = os.path.join(HOME, ".config", "cf-tokens")
 LOGINS = {"dorkyrobot": "the company's Cloudflare login", "felixflor": "Felix's own Cloudflare login"}
-# the boxes that keep an API token of their own, by their mesh names (mesh/mesh.conf); dorkyrobot3 and
-# sara keep none (dorkyrobot3 asks dorkyrobot1). "mini" is this box.
+# the boxes this one can ask which token they run on, by their mesh names (mesh/mesh.conf). "mini" is
+# this box; dorkyrobot3 keeps no token (it asks dorkyrobot1). Sara's Mac has a token of its own in the
+# dashboard ("Tunnel CLI Mac Sara") and is not ours to ssh into, so a token no box here runs on is not
+# thereby unused: `delete` also reads when Cloudflare last saw it.
 BOXES = ["mini", "dorkyrobot1", "dorkyrobot2", "mac2019", "mac2024", "doug-mini"]
 SSH = {"mini": None, "dorkyrobot1": "dorkyrobot1", "dorkyrobot2": "dorkyrobot2", "mac2019": "mac2019", "mac2024": "mac2024", "doug-mini": "doug-mini"}
 PATH = "export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH; "
+QUIET_DAYS = 30  # a token Cloudflare saw more recently than this is in use by something, ours or not
+
+
+def days_since_used(t):
+    """Days since Cloudflare last saw a token used; None if it never was (or the date is unreadable)."""
+    try:
+        used = datetime.datetime.fromisoformat(str(t["last_used_on"]).replace("Z", "+00:00"))
+        return (datetime.datetime.now(datetime.timezone.utc) - used).days
+    except Exception:
+        return None
 
 
 def die(msg, code=1):
@@ -155,13 +168,14 @@ def cmd_list(logins):
             by.setdefault(tid, []).append(box)
         print(f"{login} ({LOGINS[login]}): {len(rows)} tokens")
         for t in sorted(rows, key=lambda t: str(t.get("issued_on"))):
-            who = "this manager" if t["id"] == mine else ("runs " + ", ".join(by[t["id"]]) if t["id"] in by else "NO BOX RUNS ON IT")
+            who = "this manager" if t["id"] == mine else ("runs " + ", ".join(by[t["id"]]) if t["id"] in by else "no box asked runs on it")
             used = str(t.get("last_used_on") or "never")[:10]
             print(f"  {t['id'][:8]}  {t.get('status', '?'):8} made {str(t.get('issued_on'))[:10]}  last used {used:10}  {who:22} {t.get('name', '')}")
         for box in by.get("?", []):
             print(f"  ({box} did not answer, so one token above may be its)")
         if by.get(None):
             print(f"  (no token for this login on: {', '.join(by[None])})")
+        print(f"  (asked: {', '.join(BOXES)}. A token none of them runs on may still serve a machine that is not asked, such as Sara's Mac: read its name and when it was last used)")
 
 
 def pick(login, prefix):
@@ -171,7 +185,7 @@ def pick(login, prefix):
     return hit[0]
 
 
-def cmd_delete(login, prefix, yes):
+def cmd_delete(login, prefix, yes, force=False):
     t = pick(login, prefix)
     if t["id"] == own_id(login):
         die("that is this manager token itself; delete it in the dashboard if you mean to")
@@ -182,7 +196,10 @@ def cmd_delete(login, prefix, yes):
     silent = [b for b, tid in held.items() if tid == "?"]
     if silent:
         die(f"{', '.join(silent)} did not answer, so it cannot be ruled out that it runs on that token; try again when it is up")
-    print(f"delete {t['id'][:8]} \"{t.get('name', '')}\" of {login}: made {str(t.get('issued_on'))[:10]}, last used {str(t.get('last_used_on') or 'never')[:10]}; no box runs on it. This cannot be undone.")
+    quiet = days_since_used(t)
+    if quiet is not None and quiet < QUIET_DAYS and not force:
+        die(f"\"{t.get('name', '')}\" was last used {quiet} days ago, so something runs on it, though none of the boxes asked ({', '.join(BOXES)}) does: a machine that is not asked, such as Sara's Mac, or a script. Delete it only if you know what that is: add --although-used")
+    print(f"delete {t['id'][:8]} \"{t.get('name', '')}\" of {login}: made {str(t.get('issued_on'))[:10]}, last used {str(t.get('last_used_on') or 'never')[:10]}; none of the boxes asked runs on it. This cannot be undone.")
     if not yes:
         print("  (a preview; add --yes to do it)")
         return 2
@@ -259,8 +276,8 @@ def cmd_deliver(login, box):
 
 
 def main(a):
-    yes = "--yes" in a
-    a = [x for x in a if x != "--yes"]
+    yes, force = "--yes" in a, "--although-used" in a
+    a = [x for x in a if x not in ("--yes", "--although-used")]
     if not a or a[0] in ("-h", "--help", "help"):
         print(__doc__.strip())
         return 0
@@ -270,7 +287,7 @@ def main(a):
     if verb == "list" and len(rest) <= 1:
         return cmd_list(rest or list(LOGINS))
     if verb == "delete" and len(rest) == 2:
-        return cmd_delete(rest[0], rest[1], yes)
+        return cmd_delete(rest[0], rest[1], yes, force)
     if verb == "roll" and len(rest) == 2 and rest[1] == "--all":
         for box in BOXES:
             if runs_on(box, rest[0]) is None:

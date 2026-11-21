@@ -20,9 +20,9 @@ token's value. `<login>` is the fleet's account alias, `dorkyrobot` or `felixflo
 ssh macmini cf-tokens list
 ```
 
-One line a token: its id, when it was made and last used, and which box runs on it. **NO BOX RUNS ON
-IT** is a candidate for deleting; read its name and dates first, since a token may serve something
-that is not a box of ours (a CI job, a script of Felix's).
+One line a token: its id, when it was made and last used, and which box runs on it. **no box asked
+runs on it** is only a candidate for deleting: the mini asks our six boxes, not Sara's Mac, which has a
+token of its own ("Tunnel CLI Mac Sara"), nor any script. Read its name and when it was last used.
 
 ## Delete one no box runs on
 
@@ -31,7 +31,9 @@ ssh macmini cf-tokens delete <login> <id>          # a preview
 ssh macmini cf-tokens delete <login> <id> --yes
 ```
 
-It refuses a token a box runs on, the manager itself, and any delete while a box does not answer.
+It refuses a token a box runs on, the manager itself, any delete while a box does not answer, and a
+token Cloudflare saw used in the last 30 days (`--although-used` when you know what uses it and mean to
+cut it off).
 
 ## Roll a box's token
 
@@ -74,5 +76,8 @@ git show main:mesh/cf-tokens | ssh macmini 'cat > ~/.local/bin/cf-tokens.new && 
 
 ## History
 
+- 2026-11-21, the same day: Felix's dashboard showed "Tunnel CLI Mac Sara" among the company login's
+  eight tokens. The script had said Sara's Mac keeps none and would have called hers unused; it now says
+  which boxes it asked and refuses to delete a token used in the last 30 days.
 - 2026-11-21: written with the script. Proved without a manager token: the mini asked all six boxes
   which token each runs on, for both logins, and refused to roll with nothing to roll with.
