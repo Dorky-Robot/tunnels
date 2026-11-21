@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""cf-tokens: Cloudflare's API tokens across the mesh, from the one box that may manage them.
+
+Every box holds its own API token per Cloudflare login, and none of those may list, roll or delete
+tokens (Cloudflare: User > API Tokens). So an old token could only be found and deleted in the
+dashboard, by Felix (the doug-mini token of the 10-13 rotation waited five weeks that way). Felix,
+2026-11-21: "you should be able to use the other machines on the mesh to update the other machines
+and jsut do round robbin", and, asked which box keeps the one token that may manage the others:
+"let's set up felix mac mini".
+
+This runs on that box (the mini). It holds one manager token per Cloudflare login, made by Felix from
+Cloudflare's "Create Additional Tokens" template and typed into `receive` by him; nothing here ever
+prints a token's value, and a manager token never leaves this box.
+
+  cf-tokens receive <login>        [this Mac; reads cloudflare] keep a manager token, typed at a hidden prompt
+  cf-tokens list [<login>]         [read-only] every token of the login, and which box runs on each
+  cf-tokens delete <login> <id>    [cloudflare] delete a token no box runs on (previewed until --yes)
+  cf-tokens roll <login> <box>     [cloudflare + that box] give a box's token a new value and hand it over
+                                   (previewed until --yes); the old value is dead from that moment
+  cf-tokens roll <login> --all     the same for every box in turn, stopping at the first that fails
+  cf-tokens deliver <login> <box>  finish a roll whose hand-over failed (the new value waits here)
+
+<login> is the fleet's account alias: dorkyrobot (the company's Cloudflare login) or felixflor (Felix's own).
+<id> is a token's id or its first letters, from `list`. Runbook: docs/runbooks/roll-an-api-token.md.
+"""
+import getpass, json, os, re, socket, subprocess, sys, urllib.error, urllib.request
+
+API = "https://api.cloudflare.com/client/v4"
+HOME = os.path.expanduser("~")
+DIR = os.path.join(HOME, ".config", "cf-tokens")
+LOGINS = {"dorkyrobot": "the company's Cloudflare login", "felixflor": "Felix's own Cloudflare login"}
+# the boxes that keep an API token of their own, by their mesh names (mesh/mesh.conf); dorkyrobot3 and
+# sara keep none (dorkyrobot3 asks dorkyrobot1). "mini" is this box.
+BOXES = ["mini", "dorkyrobot1", "dorkyrobot2", "mac2019", "mac2024", "doug-mini"]
+SSH = {"mini": None, "dorkyrobot1": "dorkyrobot1", "dorkyrobot2": "dorkyrobot2", "mac2019": "mac2019", "mac2024": "mac2024", "doug-mini": "doug-mini"}
+PATH = "export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH; "
+
+
+def die(msg, code=1):
+    sys.stderr.write(f"✗ {msg}\n")
+    sys.exit(code)
+
+
+def token_file(login):
+    return os.path.join(DIR, f"{login}.token")
+
+
+def manager(login):
+    if login not in LOGINS:
+        die(f"no login called {login!r}: one of {', '.join(LOGINS)}")
+    try:
+        return open(token_file(login)).read().strip()
+    except FileNotFoundError:
+        die(f"no manager token for {login} here ({token_file(login)}): Felix makes one in the dashboard and types it into `cf-tokens receive {login}`", 3)
+
+
+def call(token, method, path, body=None):
+    """-> (http status, the parsed answer). Never raises on an HTTP refusal."""
+    req = urllib.request.Request(API + path, method=method, data=None if body is None else json.dumps(body).encode(),
+                                 headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.load(e)
+        except Exception:
+            return e.code, {"success": False, "errors": [{"message": "an answer that is not JSON"}]}
+    except Exception as e:
+        return 0, {"success": False, "errors": [{"message": f"Cloudflare was not reached: {e}"}]}
+
+
+def why(ans):
+    return "; ".join(str(e.get("message")) for e in (ans.get("errors") or [])) or "no reason given"
+
+
+def on(box, script, stdin=None, timeout=60):
+    """Run a shell line on a box (here, for the mini) -> (exit code, stdout, stderr)."""
+    host = SSH[box]
+    argv = ["sh", "-c", PATH + script] if host is None else ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, PATH + script]
+    try:
+        r = subprocess.run(argv, input=stdin, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", f"no answer from {box} in {timeout} s"
+
+
+def runs_on(box, login):
+    """The id of the token a box uses for a login, None if it has none, "?" if the box did not answer."""
+    code, out, err = on(box, f"tunnels cf get /user/tokens/verify --account {login} 2>&1")
+    m = re.search(r'"id":\s*"([0-9a-f]{32})"', out)
+    if m and '"active"' in out:
+        return m.group(1)
+    if code in (124, 255):
+        return "?"
+    return None
+
+
+def all_tokens(login):
+    tok = manager(login)
+    rows, page = [], 1
+    while True:
+        status, ans = call(tok, "GET", f"/user/tokens?per_page=50&page={page}")
+        if not ans.get("success"):
+            die(f"Cloudflare refused the list for {login} ({status}): {why(ans)}")
+        rows += ans.get("result") or []
+        info = ans.get("result_info") or {}
+        if page >= (info.get("total_pages") or 1):
+            return rows
+        page += 1
+
+
+def own_id(login):
+    status, ans = call(manager(login), "GET", "/user/tokens/verify")
+    return (ans.get("result") or {}).get("id")
+
+
+def holders(login):
+    return {box: runs_on(box, login) for box in BOXES}
+
+
+def cmd_receive(login):
+    if login not in LOGINS:
+        die(f"no login called {login!r}: one of {', '.join(LOGINS)}")
+    print(f"The manager token for {LOGINS[login]}, from Cloudflare's \"Create Additional Tokens\" template.")
+    tok = (getpass.getpass("Paste it here (nothing is shown) and press Return: ") if sys.stdin.isatty() else sys.stdin.readline()).strip()
+    if not tok:
+        die("nothing was typed; nothing kept")
+    status, ans = call(tok, "GET", "/user/tokens/verify")
+    if not ans.get("success") or (ans.get("result") or {}).get("status") != "active":
+        die(f"Cloudflare does not take that token ({status}): {why(ans)}; nothing kept")
+    status, lst = call(tok, "GET", "/user/tokens?per_page=5")
+    if not lst.get("success"):
+        die(f"that token is real but may not list tokens ({status}): it needs User > API Tokens > Edit; nothing kept")
+    os.makedirs(DIR, mode=0o700, exist_ok=True)
+    os.chmod(DIR, 0o700)
+    tmp = token_file(login) + ".new"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(tok + "\n")
+    os.replace(tmp, token_file(login))
+    print(f"✓ kept for {login} on {socket.gethostname().split('.')[0]}, readable by this account only; it may list, roll and delete that login's tokens")
+
+
+def cmd_list(logins):
+    for login in logins:
+        if login not in LOGINS:
+            die(f"no login called {login!r}: one of {', '.join(LOGINS)}")
+        if not os.path.exists(token_file(login)):
+            print(f"{login} ({LOGINS[login]}): no manager token here yet")
+            continue
+        rows, mine, held = all_tokens(login), own_id(login), holders(login)
+        by = {}
+        for box, tid in held.items():
+            by.setdefault(tid, []).append(box)
+        print(f"{login} ({LOGINS[login]}): {len(rows)} tokens")
+        for t in sorted(rows, key=lambda t: str(t.get("issued_on"))):
+            who = "this manager" if t["id"] == mine else ("runs " + ", ".join(by[t["id"]]) if t["id"] in by else "NO BOX RUNS ON IT")
+            used = str(t.get("last_used_on") or "never")[:10]
+            print(f"  {t['id'][:8]}  {t.get('status', '?'):8} made {str(t.get('issued_on'))[:10]}  last used {used:10}  {who:22} {t.get('name', '')}")
+        for box in by.get("?", []):
+            print(f"  ({box} did not answer, so one token above may be its)")
+        if by.get(None):
+            print(f"  (no token for this login on: {', '.join(by[None])})")
+
+
+def pick(login, prefix):
+    hit = [t for t in all_tokens(login) if t["id"].startswith(prefix.lower())]
+    if len(hit) != 1:
+        die(f"{prefix!r} names {len(hit)} tokens of {login}; give more of the id from `cf-tokens list {login}`")
+    return hit[0]
+
+
+def cmd_delete(login, prefix, yes):
+    t = pick(login, prefix)
+    if t["id"] == own_id(login):
+        die("that is this manager token itself; delete it in the dashboard if you mean to")
+    held = holders(login)
+    users = [b for b, tid in held.items() if tid == t["id"]]
+    if users:
+        die(f"{', '.join(users)} runs on that token; roll it instead (`cf-tokens roll {login} {users[0]}`)")
+    silent = [b for b, tid in held.items() if tid == "?"]
+    if silent:
+        die(f"{', '.join(silent)} did not answer, so it cannot be ruled out that it runs on that token; try again when it is up")
+    print(f"delete {t['id'][:8]} \"{t.get('name', '')}\" of {login}: made {str(t.get('issued_on'))[:10]}, last used {str(t.get('last_used_on') or 'never')[:10]}; no box runs on it. This cannot be undone.")
+    if not yes:
+        print("  (a preview; add --yes to do it)")
+        return 2
+    status, ans = call(manager(login), "DELETE", f"/user/tokens/{t['id']}")
+    if not ans.get("success"):
+        die(f"Cloudflare refused ({status}): {why(ans)}")
+    print("✓ deleted")
+    return 0
+
+
+def pending_file(login, box):
+    return os.path.join(DIR, "pending", f"{login}--{box}")
+
+
+def deliver(login, box, value):
+    """Hand a new value to a box: its tunnels keeps it and forgets the one before. The value goes over
+    ssh's stdin, never in a command line of ours. -> None, or what went wrong."""
+    code, out, err = on("mini", "tunnels fleet show --json")
+    try:
+        acct = json.loads(out)["accounts"][login]["id"]
+    except Exception:
+        return f"this box's fleet file names no account {login}"
+    code, out, err = on(box, "tunnels token list --json")
+    try:
+        old = [r["index"] for r in json.loads(out) if any(a.get("account_id") == acct for a in r.get("reach") or [])]
+    except Exception:
+        return f"{box} did not list its tokens: {(err or out).strip()[:200]}"
+    if len(old) > 1:
+        return f"{box} holds {len(old)} tokens for {login} already; sort that out there first (`tunnels token list`)"
+    forget = f" && tunnels token rm {old[0]} >/dev/null" if old else ""
+    code, out, err = on(box, f'IFS= read -r V && tunnels token add "$V" >/dev/null{forget} && tunnels cf get /user/tokens/verify --account {login}', stdin=value + "\n", timeout=90)
+    if code != 0 or '"active"' not in out:
+        return f"{box} did not take it: {(err or out).strip()[:300]}"
+    return None
+
+
+def cmd_roll(login, box, yes):
+    if box not in BOXES:
+        die(f"no box called {box!r}: one of {', '.join(BOXES)}")
+    if os.path.exists(pending_file(login, box)):
+        die(f"a new value for {box} is already waiting here from a roll that was not handed over; `cf-tokens deliver {login} {box}`")
+    tid = runs_on(box, login)
+    if tid == "?":
+        die(f"{box} did not answer; nothing rolled")
+    if tid is None:
+        die(f"{box} has no working token for {login}; nothing to roll (give it one with `tunnels token add` there)")
+    t = pick(login, tid)
+    print(f"roll {tid[:8]} \"{t.get('name', '')}\", the token {box} runs on for {login}: its value changes now, the old one stops working at once, and {box} is handed the new one.")
+    if not yes:
+        print("  (a preview; add --yes to do it)")
+        return 2
+    status, ans = call(manager(login), "PUT", f"/user/tokens/{tid}/value", {})
+    value = ans.get("result")
+    if not ans.get("success") or not isinstance(value, str):
+        die(f"Cloudflare refused the roll ({status}): {why(ans)}; nothing changed")
+    os.makedirs(os.path.dirname(pending_file(login, box)), mode=0o700, exist_ok=True)
+    fd = os.open(pending_file(login, box), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(value + "\n")
+    return cmd_deliver(login, box)
+
+
+def cmd_deliver(login, box):
+    try:
+        value = open(pending_file(login, box)).read().strip()
+    except FileNotFoundError:
+        die(f"nothing waits here for {box} on {login}")
+    problem = deliver(login, box, value)
+    if problem:
+        die(f"rolled, but not handed over: {problem}. The new value waits here; when {box} is reachable: `cf-tokens deliver {login} {box}`", 4)
+    os.remove(pending_file(login, box))
+    print(f"✓ {box} runs on the new value; the old one is dead")
+    return 0
+
+
+def main(a):
+    yes = "--yes" in a
+    a = [x for x in a if x != "--yes"]
+    if not a or a[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    verb, rest = a[0], a[1:]
+    if verb == "receive" and len(rest) == 1:
+        return cmd_receive(rest[0])
+    if verb == "list" and len(rest) <= 1:
+        return cmd_list(rest or list(LOGINS))
+    if verb == "delete" and len(rest) == 2:
+        return cmd_delete(rest[0], rest[1], yes)
+    if verb == "roll" and len(rest) == 2 and rest[1] == "--all":
+        for box in BOXES:
+            if runs_on(box, rest[0]) is None:
+                print(f"- {box}: no token for {rest[0]}, skipped")
+                continue
+            code = cmd_roll(rest[0], box, yes)
+            if code not in (0, 2):
+                return code
+        return 0 if yes else 2
+    if verb == "roll" and len(rest) == 2:
+        return cmd_roll(rest[0], rest[1], yes)
+    if verb == "deliver" and len(rest) == 2:
+        return cmd_deliver(rest[0], rest[1])
+    die("usage: cf-tokens receive|list|delete|roll|deliver … (cf-tokens --help)", 2)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]) or 0)

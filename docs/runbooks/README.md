@@ -10,6 +10,7 @@ plan behind them is [`../agent-operations.md`](../agent-operations.md),
 |---|---|
 | [after-a-power-cut.md](after-a-power-cut.md) | a box (or the house) lost power or rebooted, and you need it back and proven |
 | [rotate-a-leaked-token.md](rotate-a-leaked-token.md) | a tunnel's connector token was seen somewhere it shouldn't be |
+| [roll-an-api-token.md](roll-an-api-token.md) | a Cloudflare API token leaked or is due a new value, an old one must be deleted, or you want to know which box runs on which |
 | [add-a-machine.md](add-a-machine.md) | a new Mac joins the mesh |
 | [retire-a-hostname.md](retire-a-hostname.md) | a public hostname should stop existing |
 | [revive-a-claude-session.md](revive-a-claude-session.md) | a Claude lead or worker is gone, or stuck on "connecting…" |

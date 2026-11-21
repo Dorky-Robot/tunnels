@@ -3,10 +3,8 @@
 **Use when:** a tunnel's connector token (the long `eyJ…` string cloudflared
 runs with) was seen somewhere it shouldn't be: a transcript, a paste, `ps`
 output, a plist in a backup.
-**Don't use when:** it was a Cloudflare **API** token (`cfut_…`). Roll that
-in the Cloudflare dashboard, then give each box the new one from the web
-UI (the account card's **rotate**), or `tunnels token add <new>` and
-`tunnels token rm <n>` on each box that had it.
+**Don't use when:** it was a Cloudflare **API** token (`cfut_…`). That is
+`roll-an-api-token.md`: the mini rolls it and hands the box the new one.
 **Scope:** [this Mac + cloudflare]. **No preview, no undo:** from the moment
 `rotate` returns, every token issued before it is dead, everywhere.
 **Needs:** the tunnel's owner reachable over the tailnet, holding an API
