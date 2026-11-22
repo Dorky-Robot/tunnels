@@ -23,6 +23,7 @@
 #                                       tunnels too old to have an agent, the old
 #                                       tunnel-watchdog.sh does that last part instead.
 #   com.dorkyrobot.taildrop-inbox       files sent by `tailscale file cp` land in ~/Projects/inbox
+#   com.dorkyrobot.claude-update        Claude Code's weekly update, Sunday ~04:30 (install-claude-update.sh)
 #   ~/.claude/CLAUDE.md                 nothing: it only removes the old mesh block
 #
 # What it does NOT do, because it cannot be done from one machine:
@@ -175,6 +176,10 @@ if ! cmp -s "$here/com.dorkyrobot.taildrop-inbox.plist" "$P" || ! launchctl prin
   cp "$here/com.dorkyrobot.taildrop-inbox.plist" "$P"
   launchctl bootstrap "gui/$(id -u)" "$P"
 fi
+
+# Claude Code's weekly update, the only thing that updates it (our boxes
+# only; the script says so and does nothing on doug-mini or Sara's Mac).
+sh "$here/install-claude-update.sh" || echo "install: install-claude-update.sh failed; the update job is as it was" >&2
 
 # ---- 6. Claude: no block of ours in ~/.claude/CLAUDE.md --------------------
 # Every box's global instructions come from ecosystem-log's claude/global.md

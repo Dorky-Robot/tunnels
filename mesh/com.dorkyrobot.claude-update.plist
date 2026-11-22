@@ -2,25 +2,29 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>com.dorkyrobot.claude-update</string>
-  <!-- Claude Code's update, once a week and on purpose, now that
-       auto-update is off: docs/lead-keeper.md. A user LaunchAgent on
-       dorkyrobot2, beside lead-keeper, for the same reason: the install,
-       the supervisor and the sessions are all this user's. -->
+  <!-- A TEMPLATE: mesh/install-claude-update.sh fills in __HOME__ and the
+       Minute and writes it to ~/Library/LaunchAgents. Claude Code's
+       update, once a week and on purpose, on every box of ours (Felix,
+       11-22): docs/lead-keeper.md. It runs a copy of the scripts the
+       installer puts in ~/.local/libexec/claude-update, never a checkout,
+       so a branch or a stale clone on a box cannot change what runs. A user
+       LaunchAgent, because the install, the supervisor and the sessions are
+       all this user's. -->
   <key>ProgramArguments</key><array>
     <string>/usr/bin/python3</string>
-    <string>/Users/dorkyrobot2/Projects/dorky_robot/tunnels/scripts/claude-update.py</string>
+    <string>__HOME__/.local/libexec/claude-update/scripts/claude-update.py</string>
   </array>
   <key>EnvironmentVariables</key><dict>
-    <key>HOME</key><string>/Users/dorkyrobot2</string>
+    <key>HOME</key><string>__HOME__</string>
   </dict>
-  <!-- Sunday 04:31 local: nobody is working, and it sits between
-       lead-keeper's passes at :29 and :34, which pause for as long as the
-       update holds its lock anyway. -->
+  <!-- Sunday 04:31 here; the installer sets each box its own minute, staggered a few minutes per box. A Mac
+       asleep then runs it when it wakes; the script itself does nothing
+       outside 04:00-06:00, so that is a missed week, not a late run. -->
   <key>StartCalendarInterval</key><dict>
     <key>Weekday</key><integer>0</integer>
     <key>Hour</key><integer>4</integer>
     <key>Minute</key><integer>31</integer>
   </dict>
-  <key>StandardOutPath</key><string>/Users/dorkyrobot2/Library/Logs/claude-update.log</string>
-  <key>StandardErrorPath</key><string>/Users/dorkyrobot2/Library/Logs/claude-update.log</string>
+  <key>StandardOutPath</key><string>__HOME__/Library/Logs/claude-update.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/Library/Logs/claude-update.log</string>
 </dict></plist>

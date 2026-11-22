@@ -13,7 +13,7 @@ auto-update. Two jobs cover this:
 | job | what | when |
 |---|---|---|
 | `scripts/lead-keeper.py` | brings back dead leads and workers, with their conversation and Remote Control | every 5 min, `mesh/com.dorkyrobot.lead-keeper.plist` |
-| `scripts/claude-update.py` | updates Claude Code, proves the new binary, respawns onto it | Sunday 04:31, `mesh/com.dorkyrobot.claude-update.plist` |
+| `scripts/claude-update.py` | updates Claude Code, proves the new binary, respawns onto it | Sunday 04:30-04:45 on every box of ours, only inside 04:00-06:00, `mesh/com.dorkyrobot.claude-update.plist` |
 
 Both are user LaunchAgents, because the supervisor, the install and the
 sessions all belong to dorkyrobot2's user and its login session. Both only
@@ -161,8 +161,16 @@ dropped from the state.
 
 ## claude-update
 
-Auto-update is off (`DISABLE_AUTOUPDATER=1`, Felix's decision, set by hand
-in settings). Instead, once a week:
+Auto-update is off (`DISABLE_AUTOUPDATER=1` in `~/.claude/settings.json`,
+Felix's decision 10-07; the installer sets it). Instead, on every box of
+ours (dr3, dr2, dr1, the mini, mac2024, mac2019; Felix, 11-22: "i think its
+probably safe to auto update if its like 4 am"), once a week:
+
+0. **Only at that hour.** launchd runs a missed calendar job when the Mac
+   wakes, and mac2024 sleeps at night. Started outside 04:00-06:00 local
+   (`CLAUDE_UPDATE_WINDOW`), the script logs "missed this week", writes its
+   heartbeat and does nothing else; the third miss in a row is one alert.
+   `--any-hour` runs it by hand.
 
 1. `claude update`. If the version is unchanged, that is one log line and
    the run is over. If it fails two weeks in a row, Felix hears once.
@@ -196,25 +204,27 @@ lead-keeper pauses while claude-update holds
 by the Remote Control daemon, not by the supervisor, so `respawn` does not
 move it to the new version; it keeps its version until it restarts.
 
-## Install (not done)
+## Install
 
-On dorkyrobot2, as dorkyrobot2, once Felix says so:
+On each of our boxes, from a tunnels checkout (`sh mesh/install.sh` runs it
+too):
 
-    cp mesh/com.dorkyrobot.lead-keeper.plist mesh/com.dorkyrobot.claude-update.plist ~/Library/LaunchAgents/
-    launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.dorkyrobot.lead-keeper.plist
-    launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.dorkyrobot.claude-update.plist
+    sh mesh/install-claude-update.sh
 
-Before that:
+It copies `scripts/claude-update.py`, `scripts/claude_bg.py` and
+`mesh/leads.conf` to `~/.local/libexec/claude-update`, writes the plist with
+this box's minute (dr3 :30, dr2 :33, dr1 :36, mini :39, mac2024 :42, mac2019
+:45) and loads it, and sets `env.DISABLE_AUTOUPDATER=1` if missing, touching
+no other setting. The job runs that copy, never a checkout, so a box's stale
+clone or open branch cannot change what runs; a change to the script reaches
+a box when the installer runs there again. It does nothing on doug-mini or
+Sara's Mac. This job carries no connection, so reloading it over ssh is safe.
 
-- `scripts/lead-keeper.py --dry-run` and `scripts/claude-update.py
-  --dry-run` should both read sensibly.
-- `~/.config/mesh-watch/env` should hold `MESH_WATCH_NTFY`.
-- Auto-update should be off.
-
-Both jobs run the scripts from the main checkout, so landing on main
-updates them. To run one now:
-`launchctl kickstart gui/$UID/com.dorkyrobot.lead-keeper`. This does not
-restart anything that carries ssh.
+Alerts are an ntfy push to `MESH_WATCH_NTFY` in `~/.config/mesh-watch/env`
+(mode 600, the same topic on every box); the installer says when it is
+missing. Prove a box with `~/.local/libexec/claude-update/scripts/claude-update.py
+--dry-run`. To run one now, by hand, at a quiet moment:
+`claude-update.py --any-hour`; it respawns idle background sessions.
 
 ## Test
 
