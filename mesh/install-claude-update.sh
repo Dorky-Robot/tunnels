@@ -5,6 +5,9 @@
 # how/claude-code-updates.md.
 #
 #   sh mesh/install-claude-update.sh     install, or bring this box up to date
+#   CLAUDE_UPDATE_NOT_BEFORE=2026-11-29 sh mesh/install-claude-update.sh
+#                                        the same, but runs before that date do
+#                                        nothing (a box that joins later)
 #
 # It does three things and nothing else:
 #   1. copies scripts/claude-update.py, scripts/claude_bg.py and
@@ -40,13 +43,17 @@ chmod 755 "$dest/scripts/claude-update.py"
 
 P=$HOME/Library/LaunchAgents/$L.plist
 new=$(mktemp)
-sed -e "s#__HOME__#$HOME#g" -e "s#<key>Minute</key><integer>31</integer>#<key>Minute</key><integer>$m</integer>#" "$here/$L.plist" > "$new"
+nb=${CLAUDE_UPDATE_NOT_BEFORE:-}
+case "$nb" in ""|[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;; *) echo "install-claude-update: CLAUDE_UPDATE_NOT_BEFORE is YYYY-MM-DD" >&2; exit 1 ;; esac
+nbline=; [ -n "$nb" ] && nbline="<key>CLAUDE_UPDATE_NOT_BEFORE</key><string>$nb</string>"
+sed -e "s#<key>HOME</key><string>__HOME__</string>#<key>HOME</key><string>__HOME__</string>$nbline#" \
+    -e "s#__HOME__#$HOME#g" -e "s#<key>Minute</key><integer>31</integer>#<key>Minute</key><integer>$m</integer>#" "$here/$L.plist" > "$new"
 plutil -lint -s "$new"
 if ! cmp -s "$new" "$P" || ! launchctl print "gui/$(id -u)/$L" >/dev/null 2>&1; then
   launchctl bootout "gui/$(id -u)/$L" 2>/dev/null || true
   cp "$new" "$P"
   launchctl bootstrap "gui/$(id -u)" "$P"
-  echo "· $L: loaded, Sunday 04:$m"
+  echo "· $L: loaded, Sunday 04:$m${nb:+, not before $nb}"
 fi
 rm -f "$new"
 

@@ -55,11 +55,29 @@ LSOF = os.environ.get("CLAUDE_UPDATE_LSOF", "/usr/sbin/lsof")
 FAIL_WEEKS = int(os.environ.get("CLAUDE_UPDATE_FAIL_RUNS", "2"))
 WINDOW = tuple(int(h) for h in os.environ.get("CLAUDE_UPDATE_WINDOW", "4-6").split("-"))
 MISS_WEEKS = int(os.environ.get("CLAUDE_UPDATE_MISS_RUNS", "3"))
+# A box that joins later: before this local date (YYYY-MM-DD) a run is one
+# log line and nothing else. The installer writes it into the plist; once the
+# date has passed it does nothing.
+NOT_BEFORE = os.environ.get("CLAUDE_UPDATE_NOT_BEFORE", "")
+
+
+def too_early():
+    return bool(NOT_BEFORE) and time.strftime("%Y-%m-%d") < NOT_BEFORE
 
 
 def in_window(t=None):
     t = t or time.localtime()
     return WINDOW[0] <= t.tm_hour < WINDOW[1]
+
+
+def heartbeat(st, path):
+    os.makedirs(STATE, exist_ok=True)
+    st["pending"], _ = flush(st["pending"], False)
+    st["last_run"] = stamp()
+    save_json(path, st)
+    with open(os.path.join(STATE, "last-run"), "w") as f:
+        f.write(stamp() + "\n")
+    return 0
 
 
 def missed(st, path):
@@ -74,13 +92,7 @@ def missed(st, path):
                               "%02d:00, and %s was not awake then %d Sundays in a row. To update it by hand "
                               "when nobody is at it: claude-update.py --any-hour"
                               % (WINDOW[0], WINDOW[1], box(), MISS_WEEKS)})
-    os.makedirs(STATE, exist_ok=True)
-    st["pending"], _ = flush(st["pending"], False)
-    st["last_run"] = stamp()
-    save_json(path, st)
-    with open(os.path.join(STATE, "last-run"), "w") as f:
-        f.write(stamp() + "\n")
-    return 0
+    return heartbeat(st, path)
 
 
 def log(msg):
@@ -227,12 +239,18 @@ def main():
             else "the version file itself, so every version needs its own grant"))
         print("window: %02d:00-%02d:00 local; now %s, so a scheduled run would %s" % (
             WINDOW[0], WINDOW[1], time.strftime("%H:%M"), "go ahead" if in_window() else "do nothing (missed week)"))
+        if NOT_BEFORE:
+            print("not before %s: %s" % (NOT_BEFORE, "a run today does nothing" if too_early()
+                                          else "passed, so it no longer holds anything back"))
         print("would run: %s update" % CLAUDE)
         print("if the version changes:")
         probe(old_real, True, st)
         respawn_all(sessions(), old, True)
         print("then check each is running, on the new version, with its RC link if it had one")
         return 0
+    if not any_hour and too_early():
+        log("not before %s: this box joins the weekly update then; nothing done" % NOT_BEFORE)
+        return heartbeat(st, path)
     if not any_hour and not in_window():
         return missed(st, path)
     st["missed"] = 0

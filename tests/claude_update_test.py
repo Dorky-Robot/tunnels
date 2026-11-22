@@ -166,6 +166,14 @@ class ClaudeUpdate(unittest.TestCase):
         self.assertEqual(len(Ntfy.alerts), 1)
         self.assertIn("missed its update 3 weeks", Ntfy.alerts[0]["title"])
 
+    def test_before_its_start_date_a_box_does_nothing_and_after_it_runs(self):
+        out = self.run_(CLAUDE_UPDATE_NOT_BEFORE="2999-01-01")
+        self.assertIn("not before 2999-01-01", out)
+        self.assertEqual(self.calls(["update"]), [])
+        self.assertTrue(os.path.exists(os.path.join(self.d, "state/last-run")))
+        out = self.run_(CLAUDE_UPDATE_NOT_BEFORE="2000-01-01")
+        self.assertIn("updated 2.1.285 -> 2.1.290", out)
+
     def test_any_hour_runs_by_hand_outside_the_window_and_resets_the_misses(self):
         self.run_(CLAUDE_UPDATE_WINDOW="0-0")
         out = self.run_("--any-hour", CLAUDE_UPDATE_WINDOW="0-0")
