@@ -150,11 +150,28 @@ class ClaudeUpdate(unittest.TestCase):
                  CLAUDE_UPDATE_STATE=os.path.join(t, "state"), CLAUDE_UPDATE_LOCK=os.path.join(t, "state/running"),
                  CLAUDE_JOBS=os.path.join(t, "jobs"), CLAUDE_BUNDLE=os.path.join(t, "ClaudeCode.app"),
                  CLAUDE_UPDATE_PROBE_CWD=os.path.join(t, "Projects"), CLAUDE_UPDATE_LSOF=os.path.join(t, "lsof"),
-                 CLAUDE_UPDATE_PROBE_WAIT="0", LEAD_KEEPER_CONF=os.path.join(t, "no-leads.conf"), CLAUDE_UPDATE_RC_WAIT="0", CLAUDE_UPDATE_BUSY_WAIT="0")
+                 CLAUDE_UPDATE_PROBE_WAIT="0", LEAD_KEEPER_CONF=os.path.join(t, "no-leads.conf"), CLAUDE_UPDATE_RC_WAIT="0", CLAUDE_UPDATE_BUSY_WAIT="0",
+                 CLAUDE_UPDATE_WINDOW="0-24")
         e.update(env)
         p = subprocess.run(["/usr/bin/python3", SCRIPT] + list(args), env=e, capture_output=True, text=True, timeout=60)
         self.assertEqual(p.returncode, 0, p.stderr)
         return p.stdout
+
+    def test_outside_the_window_it_updates_nothing_and_alerts_only_on_the_third_miss(self):
+        for week in range(4):
+            out = self.run_(CLAUDE_UPDATE_WINDOW="0-0")
+            self.assertIn("missed this week", out)
+        self.assertEqual(self.calls(["update"]) + self.calls(["--bg"]) + self.calls(["respawn"]), [])
+        self.assertTrue(os.path.exists(os.path.join(self.d, "state/last-run")))
+        self.assertEqual(len(Ntfy.alerts), 1)
+        self.assertIn("missed its update 3 weeks", Ntfy.alerts[0]["title"])
+
+    def test_any_hour_runs_by_hand_outside_the_window_and_resets_the_misses(self):
+        self.run_(CLAUDE_UPDATE_WINDOW="0-0")
+        out = self.run_("--any-hour", CLAUDE_UPDATE_WINDOW="0-0")
+        self.assertIn("updated 2.1.285 -> 2.1.290", out)
+        st = json.load(open(os.path.join(self.d, "state/state.json")))
+        self.assertEqual(st["missed"], 0)
 
     def test_no_new_version_is_one_line_and_nothing_else(self):
         self.world(next=None)

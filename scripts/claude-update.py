@@ -4,6 +4,7 @@ background sessions come back from it. docs/lead-keeper.md.
 
     claude-update.py              update; if the version changed, probe and respawn
     claude-update.py --dry-run    say what it would do; update nothing, restart nothing
+    claude-update.py --any-hour   run now, by hand, outside the 04:00-06:00 window
 
 Auto-update is off (DISABLE_AUTOUPDATER=1, Felix's call), because on
 2026-09-29 an auto-update restarted the background service from a binary
@@ -25,6 +26,13 @@ order:
   4. Each respawned session must be alive again, on the new version, and
      show its RC link if it had one before. Any that do not are one alert.
 
+Only at that hour. It runs on every box of ours (Felix, 11-22: "i think its
+probably safe to auto update if its like 4 am"), and launchd fires a missed
+calendar job when a Mac wakes, so a laptop asleep at 04:30 would update and
+respawn its sessions at breakfast, with Felix at it. Started outside
+WINDOW (local hours, default 4-6), it does nothing: a missed week is one
+log line, and MISS_WEEKS of them in a row are one alert.
+
 lead-keeper.py pauses while this holds its lock, so a lead in the middle
 of a respawn is not mistaken for a dead one.
 """
@@ -45,6 +53,34 @@ RC_WAIT = float(os.environ.get("CLAUDE_UPDATE_RC_WAIT", "90"))
 BUSY_WAIT = float(os.environ.get("CLAUDE_UPDATE_BUSY_WAIT", "1800"))
 LSOF = os.environ.get("CLAUDE_UPDATE_LSOF", "/usr/sbin/lsof")
 FAIL_WEEKS = int(os.environ.get("CLAUDE_UPDATE_FAIL_RUNS", "2"))
+WINDOW = tuple(int(h) for h in os.environ.get("CLAUDE_UPDATE_WINDOW", "4-6").split("-"))
+MISS_WEEKS = int(os.environ.get("CLAUDE_UPDATE_MISS_RUNS", "3"))
+
+
+def in_window(t=None):
+    t = t or time.localtime()
+    return WINDOW[0] <= t.tm_hour < WINDOW[1]
+
+
+def missed(st, path):
+    """Started outside the window (a Mac waking up late): a log line and the
+    heartbeat, never an update."""
+    log("missed this week: started at %s, outside %02d:00-%02d:00 (asleep at the hour?); "
+        "nothing updated, next Sunday tries again" % (time.strftime("%H:%M"), WINDOW[0], WINDOW[1]))
+    st["missed"] = st.get("missed", 0) + 1
+    if st["missed"] == MISS_WEEKS:       # once: a box that is never awake at 4 is news
+        st["pending"].append({"at": stamp(), "title": "%s: Claude Code has missed its update %d weeks running"
+                              % (box(), MISS_WEEKS), "body": "The weekly update only runs between %02d:00 and "
+                              "%02d:00, and %s was not awake then %d Sundays in a row. To update it by hand "
+                              "when nobody is at it: claude-update.py --any-hour"
+                              % (WINDOW[0], WINDOW[1], box(), MISS_WEEKS)})
+    os.makedirs(STATE, exist_ok=True)
+    st["pending"], _ = flush(st["pending"], False)
+    st["last_run"] = stamp()
+    save_json(path, st)
+    with open(os.path.join(STATE, "last-run"), "w") as f:
+        f.write(stamp() + "\n")
+    return 0
 
 
 def log(msg):
@@ -177,6 +213,7 @@ def respawn_all(before, version, dry):
 
 def main():
     dry = "--dry-run" in sys.argv[1:] or "--dry" in sys.argv[1:]
+    any_hour = "--any-hour" in sys.argv[1:]
     load_env()
     path = os.path.join(STATE, "state.json")
     st = load_json(path, {})
@@ -188,12 +225,17 @@ def main():
         print("Full Disk Access belongs to %s (%s)" % (
             g, "an app bundle hard-linked to the version, so the grant carries" if carries
             else "the version file itself, so every version needs its own grant"))
+        print("window: %02d:00-%02d:00 local; now %s, so a scheduled run would %s" % (
+            WINDOW[0], WINDOW[1], time.strftime("%H:%M"), "go ahead" if in_window() else "do nothing (missed week)"))
         print("would run: %s update" % CLAUDE)
         print("if the version changes:")
         probe(old_real, True, st)
         respawn_all(sessions(), old, True)
         print("then check each is running, on the new version, with its RC link if it had one")
         return 0
+    if not any_hour and not in_window():
+        return missed(st, path)
+    st["missed"] = 0
     os.makedirs(STATE, exist_ok=True)
     with open(LOCK, "w") as f:
         f.write("%d\n" % os.getpid())
