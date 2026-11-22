@@ -10,6 +10,7 @@ from a JSON file, and ntfy is a server on 127.0.0.1.
 import http.server
 import json
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -183,7 +184,7 @@ class ClaudeUpdate(unittest.TestCase):
         first = self.calls(["--bg"])[0]["argv"]
         self.assertNotIn("--resume", first)
         # the probe's conversation exists, so next time it is resumed, not made anew
-        tdir = os.path.join(self.d, ".claude/projects", os.path.join(self.d, "Projects").replace("/", "-"))
+        tdir = os.path.join(self.d, ".claude/projects", re.sub(r"[^A-Za-z0-9]", "-", os.path.join(self.d, "Projects")))
         os.makedirs(tdir)
         open(os.path.join(tdir, "b0be0000-new.jsonl"), "w").write("{}\n")
         self.world(next="2.1.291")
